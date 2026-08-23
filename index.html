@@ -3537,6 +3537,34 @@ html, body{
   font-size:18px;
   font-weight:900;
 }
+.order-submit-summary{
+  grid-column:1 / -1;
+  padding:4px 8px 0;
+  color:#92400e;
+  font-size:15px;
+  font-weight:900;
+  text-align:right;
+}
+.order-milk-coupon-info{
+  margin-top:8px;
+  padding:8px 10px;
+  border-radius:12px;
+  background:#eff6ff;
+  color:#1d4ed8;
+  font-size:12px;
+  font-weight:900;
+}
+body.order-keyboard-submit-active{
+  padding-bottom:var(--order-keyboard-body-padding, 0px) !important;
+}
+#order-screen.active .order-submit-actions.order-keyboard-fixed{
+  position:fixed !important;
+  left:max(8px, env(safe-area-inset-left));
+  right:max(8px, env(safe-area-inset-right));
+  bottom:calc(var(--order-keyboard-bottom, 0px) + max(6px, env(safe-area-inset-bottom))) !important;
+  z-index:10020;
+  margin:0 !important;
+}
 @media (max-width:420px){
   .order-submit-actions{
     grid-template-columns:minmax(78px,.58fr) minmax(0,1.9fr);
@@ -11086,6 +11114,37 @@ html, body{
   #order-screen.active .order-item-summary-text{font-size:12.5px}
   #order-screen.active .order-item-card.is-collapsed{min-height:48px}
 }
+#order-screen.active .order-item-main-row{
+  grid-template-columns:minmax(0,1fr) !important;
+}
+#order-screen.active .order-drink-options{
+  display:flex;
+  align-items:flex-start;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:8px;
+}
+#order-screen.active .order-drink-options .order-temp-stack{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(78px,1fr));
+  grid-template-rows:1fr;
+  gap:6px;
+}
+#order-screen.active .order-drink-options .order-temp-stack .seg-btn{
+  min-height:38px !important;
+}
+#order-screen.active .order-drink-options .order-menu-options-slot{
+  margin-top:0;
+}
+@media (min-width:900px){
+  #order-screen.active .order-item-wide-grid{
+    grid-template-columns:minmax(0,1fr) !important;
+    grid-template-areas:
+      "menu"
+      "request"
+      "cup" !important;
+  }
+}
 </style>
 </head>
 <body>
@@ -11875,31 +11934,46 @@ window.HaetsalCloudStore = (function(){
     };
   }
 
-  function save(key, value){
+  function save(key, value, options){
+    const opts = options || {};
+    const returnResult = opts.returnResult === true;
     if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('cloud-store-save-' + String(key || ''))){
       blockedKeys.add(key);
       setSyncStatus(key, 'error', '장시간 미사용으로 저장 정지');
-      return clone(caches[key] == null ? value : caches[key]);
+      const blockedValue = clone(caches[key] == null ? value : caches[key]);
+      return returnResult
+        ? Promise.resolve({ key, skipped:true, reason:'runtime-stopped', actualAggregateWriteCompleted:false })
+        : blockedValue;
     }
     const nextValue = setCache(key, value, true);
     if(saveHandler){
       blockedKeys.delete(key);
       setSyncStatus(key, 'saving', `저장 중 ${formatStatusTime(new Date())}`);
-      Promise.resolve(saveHandler(key, clone(nextValue))).then(() => {
-        setSyncStatus(key, 'synced', `동기화 완료 ${formatStatusTime(new Date())}`);
+      const savePromise = Promise.resolve(saveHandler(key, clone(nextValue))).then(result => {
+        if(result && result.skipped === true){
+          setSyncStatus(key, 'pending', `저장 보류 ${formatStatusTime(new Date())}`);
+        }else{
+          setSyncStatus(key, 'synced', `동기화 완료 ${formatStatusTime(new Date())}`);
+        }
+        return result;
       }).catch(error => {
         if(window.HaetsalFirestoreQuotaGuard && typeof window.HaetsalFirestoreQuotaGuard.mark === 'function'){
           window.HaetsalFirestoreQuotaGuard.mark(error, 'cloud-store-save-' + String(key || ''));
         }
         console.error('Firestore 저장 실패', key, error);
         setSyncStatus(key, 'error', formatCloudStoreError(error));
+        if(returnResult) throw error;
       });
+      if(returnResult) return savePromise;
     }else{
       pendingWrites[key] = clone(nextValue);
       if(blockedKeys.has(key)){
         setSyncStatus(key, 'error', getSyncStatus(key).text || '클라우드 연결 실패');
       }else{
         setSyncStatus(key, 'pending', `연결 대기 중 ${formatStatusTime(new Date())}`);
+      }
+      if(returnResult){
+        return Promise.resolve({ key, skipped:true, reason:'save-handler-pending', actualAggregateWriteCompleted:false });
       }
     }
     return clone(nextValue);
@@ -11960,6 +12034,7 @@ window.HaetsalCloudStore = (function(){
     subscribeShared: function(listener){ return subscribe('shared', listener); },
     getOrderData: function(fallbackFactory){ return getCache('order', fallbackFactory); },
     saveOrderData: function(value){ return save('order', value); },
+    saveOrderDataWithResult: function(value){ return save('order', value, { returnResult:true }); },
     subscribeOrderData: function(listener){ return subscribe('order', listener); },
     getTumblerData: function(fallbackFactory){ return getCache('tumbler', fallbackFactory); },
     saveTumblerData: function(value){ return save('tumbler', value); },
@@ -12853,6 +12928,9 @@ window.HaetsalSharedStore = (function(){
     const ORDER_REVIVED_STALE_OPEN_MIN_MS = 24 * 60 * 60 * 1000;
     const ORDER_REVIVED_REFUND_CORRECTION_SOURCE = 'revived-order-refund-correction';
     const ORDER_REVIVED_REFUND_CORRECTION_MAX_PER_RUN = 10;
+    const HISTORICAL_COMPLETION_TARGET_DATE = '2026-08-21';
+    const HISTORICAL_COMPLETION_PREVIEW_LIMIT = 100;
+    const historicalCompletionAllowedOrderIds = new Set();
     const ORDER_COMPLETED_FOLLOWUP_QUEUE_LOCAL_KEY = 'haetsalmaru_order_completed_followup_queue_v1';
     const ORDER_COMPLETED_FOLLOWUP_QUEUE_MAX_COUNT = 500;
     const ORDER_COMPLETED_FOLLOWUP_RETRY_BATCH_LIMIT = 2;
@@ -12919,6 +12997,7 @@ window.HaetsalSharedStore = (function(){
     let firestoreQuotaRetryBlockedAt = 0;
     let firestoreQuotaRetryProbeAfter = 0;
     let revivedOrderSafetySweepPromise = null;
+    let orderAppUiReady = false;
     const revivedOrderRefundCorrectionInFlightByOrder = new Set();
 
     function isFirestoreQuotaExceededError(error){
@@ -13540,6 +13619,13 @@ window.HaetsalSharedStore = (function(){
         carryoverOrderHasMore: false,
         carryoverOrderScannedCount: 0,
         carryoverOrderBlockedCount: 0,
+        historicalCompletionLoading: false,
+        historicalCompletionRunning: false,
+        historicalCompletionStatus: '',
+        historicalCompletionError: '',
+        historicalCompletionGeneratedAt: '',
+        historicalCompletionRows: [],
+        historicalCompletionSelectedIds: [],
         pendingVisibleCount: 6,
         orderQueueFilter: 'ALL',
         deliveryQueueViewMode: 'LOCATION',
@@ -20891,7 +20977,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         return {
           reason:String(parsed.reason || 'important-order-change'),
           queuedAt:String(parsed.queuedAt || new Date().toISOString()),
-          updatedAt:String(parsed.updatedAt || parsed.queuedAt || new Date().toISOString())
+          updatedAt:String(parsed.updatedAt || parsed.queuedAt || new Date().toISOString()),
+          queueIdentity:raw
         };
       }catch(error){
         console.warn('important full backup queue read failed', error);
@@ -20903,6 +20990,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       const text = String(reason || '').toLowerCase();
       return text.includes('order-completed')
         || text.includes('completed-followup')
+        || text === 'completed-important-backup'
         || text.includes('order-cancelled')
         || text.includes('cancelled-followup');
     }
@@ -20923,22 +21011,51 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       }
     }
 
-    function clearImportantFullBackupPending(){
+    function clearImportantFullBackupPending(options){
       try{
-        if(window.localStorage) window.localStorage.removeItem(ORDER_IMPORTANT_FULL_BACKUP_QUEUE_LOCAL_KEY);
+        if(!window.localStorage) return false;
+        const currentQueue = readImportantFullBackupQueueLocal();
+        if(!currentQueue) return false;
+        if(!isOrderLifecycleFullBackupReason(currentQueue.reason)){
+          const opts = options || {};
+          const expectedQueueIdentity = String(opts.expectedQueueIdentity || '');
+          if(opts.importantRetrySuccess !== true
+            || !expectedQueueIdentity
+            || expectedQueueIdentity !== String(currentQueue.queueIdentity || '')){
+            return false;
+          }
+        }
+        window.localStorage.removeItem(ORDER_IMPORTANT_FULL_BACKUP_QUEUE_LOCAL_KEY);
+        return true;
       }catch(error){
         console.warn('important full backup queue clear failed', error);
+        return false;
       }
     }
 
-    function retryImportantFullBackupQueue(){
+    async function retryImportantFullBackupQueue(){
       const queue = readImportantFullBackupQueueLocal();
       if(!queue || orderFullBackupSaveInFlight) return;
       if(isOrderLifecycleFullBackupReason(queue.reason)){
         clearImportantFullBackupPending();
         return;
       }
-      saveData({ reason:queue.reason + '-retry', forceFullBackup:true });
+      const queueIdentity = String(queue.queueIdentity || '');
+      try{
+        const result = await saveData({
+          reason:queue.reason + '-retry',
+          forceFullBackup:true,
+          saveShared:false,
+          returnFullBackupResult:true
+        });
+        if(!(result && result.actualAggregateWriteCompleted === true)) return;
+        clearImportantFullBackupPending({
+          importantRetrySuccess:true,
+          expectedQueueIdentity:queueIdentity
+        });
+      }catch(error){
+        console.error('important full backup queue retry failed', error);
+      }
     }
 
     function getCouponPreserveProfileKey(user){
@@ -21096,7 +21213,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         };
         if(window.HaetsalSharedStore && window.HaetsalSharedStore.syncOrderData){
           const localUsersBeforeSync = Array.isArray(state.users) ? state.users : [];
-          payload = window.HaetsalSharedStore.syncOrderData(payload, preserveAutomaticCoupons ? { couponMode:'preserve-shared' } : undefined);
+          payload = window.HaetsalSharedStore.syncOrderData(payload, preserveAutomaticCoupons
+            ? { couponMode:'preserve-shared', saveShared:opts.saveShared !== false }
+            : { saveShared:opts.saveShared !== false });
           if(hasOrderUsersForRemoteOverwriteProtection(localUsersBeforeSync) && !hasOrderUsersForRemoteOverwriteProtection(payload.users)){
             payload.users = localUsersBeforeSync;
           }
@@ -21200,6 +21319,16 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           state.saveState = 'pending';
           state.saveStateText = `전체 백업 저장 중 ${formatAMPM(new Date())}`;
           refreshOrderSaveStatusChips();
+          if(opts.returnFullBackupResult === true){
+            if(typeof window.HaetsalCloudStore.saveOrderDataWithResult !== 'function'){
+              window.HaetsalCloudStore.saveOrderData(fullBackupData);
+              return Promise.resolve({ skipped:true, reason:'result-api-unavailable', actualAggregateWriteCompleted:false });
+            }
+            return Promise.resolve(window.HaetsalCloudStore.saveOrderDataWithResult(fullBackupData)).then(result => ({
+              ...(result && typeof result === 'object' ? result : {}),
+              actualAggregateWriteCompleted:!!(result && result.actualAggregateWriteCompleted === true)
+            }));
+          }
           window.HaetsalCloudStore.saveOrderData(fullBackupData);
         }else{
           saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-no-cloud');
@@ -21422,6 +21551,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
     }
 
     function refreshOrderSaveStatusChips(){
+      if(!orderAppUiReady) return;
       try{
         if(!app || !app.querySelectorAll) return;
         app.querySelectorAll('[data-order-save-status-chip]').forEach(node => {
@@ -22422,7 +22552,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
 
     function createDefaultOrderItem(){
       return {
-        temp:'ICE', menuName:'', cupType:'TUMBLER', quantity:1, itemMemo:'', whippedCreamAdded:false, shotAdjustAllowed:false, defaultShotCount:0, shotCount:0, shotCountTouched:false, shotMenuName:'', tumblerInfo:'',
+        temp:'ICE', menuName:'', menuQuery:'', selectedMenuName:'', cupType:'TUMBLER', quantity:1, itemMemo:'', whippedCreamAdded:false, shotAdjustAllowed:false, defaultShotCount:0, shotCount:0, shotCountTouched:false, shotMenuName:'', tumblerInfo:'',
         assignedTumblerId:'', assignedTumblerLabel:'', assignedTumblerType:'', assignedTumblerNumber:'', assignedTumblerKind:'', assignedTumblerCustomInfo:'',
         showPersonalTumblerEdit:false, assignedTumblerAutoRent:false, assignedTumblerReservationSessionId:'', assignedTumblerReservedUntil:'',
         groupedCupSelection:false
@@ -22581,6 +22711,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         const normalized = {
           temp: String((item && item.temp) || 'ICE').toUpperCase() === 'HOT' ? 'HOT' : 'ICE',
           menuName: String((item && item.menuName) || ''),
+          menuQuery: String((item && item.menuQuery != null ? item.menuQuery : item && item.menuName) || ''),
+          selectedMenuName: String((item && item.selectedMenuName != null ? item.selectedMenuName : item && item.menuName) || ''),
           cupType: getValidOrderCupType((item && item.cupType) || '', 'TUMBLER'),
           quantity: Math.max(1, Number((item && item.quantity) || 1)),
           itemMemo: String((item && (item.itemMemo || item.memo || item.requestMemo || item.request)) || ''),
@@ -22762,6 +22894,43 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         .filter(Boolean);
     }
 
+    function getActiveOrderMenuCatalogItem(name){
+      const item = findOrderMenuCatalogItem(name);
+      return item && getMenuStatusValue(item) === 'ACTIVE' ? item : null;
+    }
+
+    function isOrderItemMenuSelectionValid(item){
+      if(!item || typeof item !== 'object') return false;
+      const selected = String(item.selectedMenuName || '').trim();
+      const stored = String(item.menuName || '').trim();
+      return !!selected && selected === stored && !!getActiveOrderMenuCatalogItem(selected);
+    }
+
+    function clearOrderItemMenuSelection(item, query){
+      if(!item) return;
+      item.menuQuery = String(query == null ? '' : query);
+      item.selectedMenuName = '';
+      item.menuName = '';
+      syncOrderItemWhippedCreamAvailability(item);
+    }
+
+    function confirmOrderItemMenuSelection(item, menuName){
+      if(!item) return false;
+      const selected = String(menuName || '').trim();
+      if(!getActiveOrderMenuCatalogItem(selected)) return false;
+      item.menuQuery = selected;
+      item.selectedMenuName = selected;
+      item.menuName = selected;
+      syncOrderItemWhippedCreamAvailability(item);
+      return true;
+    }
+
+    function renderOrderMilkCouponInfo(item){
+      return isOrderItemMenuSelectionValid(item) && isMenuUsesMilk(item.menuName)
+        ? '<div class="order-milk-coupon-info">우유 사용 메뉴 · 쿠폰 1장 추가</div>'
+        : '';
+    }
+
 
     function getVisibleOrderMenuCatalogForInput(){
       return getOrderMenuCatalog().filter(item => getMenuStatusValue(item) !== 'HIDDEN');
@@ -22868,8 +23037,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       if(action !== 'select-edit-order-menu') return false;
       ensureEditOrderItemsRuntime();
       if(state.editOrderData.items[idx]){
-        state.editOrderData.items[idx].menuName = selectedMenuName;
-        syncOrderItemWhippedCreamAvailability(state.editOrderData.items[idx]);
+        confirmOrderItemMenuSelection(state.editOrderData.items[idx], selectedMenuName);
       }
       const inputEl = document.getElementById(`editOrderMenuInput-${idx}`);
       if(inputEl) inputEl.value = selectedMenuName;
@@ -22909,7 +23077,16 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       if(!lock || Number(lock.index) !== Number(index)) return false;
       const incomingValue = String(value || '');
       const lockedMenuName = String(lock.menuName || '');
-      if(incomingValue === lockedMenuName) return false;
+      if(incomingValue === lockedMenuName){
+        ensureOrderItemsRuntime();
+        if(state.orderItems[lock.index]) confirmOrderItemMenuSelection(state.orderItems[lock.index], lockedMenuName);
+        if(inputEl && inputEl.value !== lockedMenuName) inputEl.value = lockedMenuName;
+        hideOrderMenuSuggestions(lock.index);
+        updateOrderWhippedCreamOptionSlot(lock.index);
+        updateOrderMenuDependentInfo(lock.index);
+        updateOrderSubmitButtonView();
+        return true;
+      }
 
       const elapsed = Date.now() - Number(lock.appliedAt || 0);
       const incomingNormalized = normalizeOrderMenuSearchText(incomingValue);
@@ -22919,12 +23096,12 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       if(elapsed < 380 || looksLikeDelayedOldInput){
         ensureOrderItemsRuntime();
         if(state.orderItems[lock.index]){
-          state.orderItems[lock.index].menuName = lockedMenuName;
-          syncOrderItemWhippedCreamAvailability(state.orderItems[lock.index]);
+          confirmOrderItemMenuSelection(state.orderItems[lock.index], lockedMenuName);
         }
         if(inputEl && inputEl.value !== lockedMenuName) inputEl.value = lockedMenuName;
         hideOrderMenuSuggestions(lock.index);
         updateOrderWhippedCreamOptionSlot(lock.index);
+        updateOrderSubmitButtonView();
         return true;
       }
 
@@ -22979,8 +23156,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       setOrderMenuSelectionLock(idx, selectedMenuName, previousInputValue);
       ensureOrderItemsRuntime();
       if(state.orderItems[idx]){
-        state.orderItems[idx].menuName = selectedMenuName;
-        syncOrderItemWhippedCreamAvailability(state.orderItems[idx]);
+        confirmOrderItemMenuSelection(state.orderItems[idx], selectedMenuName);
       }
 
       if(inputEl){
@@ -22990,6 +23166,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
 
       hideOrderMenuSuggestions(idx);
       updateOrderWhippedCreamOptionSlot(idx);
+      updateOrderMenuDependentInfo(idx);
+      updateOrderSubmitButtonView();
 
       // 모바일 터치 흐름 보호: 선택 직후 전체 render()를 바로 호출하지 않습니다.
       // 전체 렌더링은 입력창/검색 목록 DOM을 즉시 교체해 터치 선택을 취소시키는 원인이 될 수 있습니다.
@@ -23001,9 +23179,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
         ensureOrderItemsRuntime();
         if(state.orderItems[idx] && state.orderItems[idx].menuName !== selectedMenuName){
-          state.orderItems[idx].menuName = selectedMenuName;
-          syncOrderItemWhippedCreamAvailability(state.orderItems[idx]);
+          confirmOrderItemMenuSelection(state.orderItems[idx], selectedMenuName);
           updateOrderWhippedCreamOptionSlot(idx);
+          updateOrderMenuDependentInfo(idx);
+          updateOrderSubmitButtonView();
         }
       }, 80);
 
@@ -24319,7 +24498,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       if(id === 'searchTerm') return String(state.searchTerm || '');
       if(id.startsWith('orderMenuInput-')){
         const idx = Number(id.split('-').pop() || 0);
-        return String((state.orderItems && state.orderItems[idx] && state.orderItems[idx].menuName) || '');
+        return String((state.orderItems && state.orderItems[idx] && state.orderItems[idx].menuQuery) || '');
       }
       if(id.startsWith('orderItemMemo-')){
         const idx = Number(id.split('-').pop() || 0);
@@ -24343,13 +24522,14 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         const idx = Number(id.split('-').pop() || 0);
         ensureOrderItemsRuntime();
         if(state.orderItems[idx]){
-          state.orderItems[idx].menuName = nextValue;
-          syncOrderItemWhippedCreamAvailability(state.orderItems[idx]);
+          clearOrderItemMenuSelection(state.orderItems[idx], nextValue);
         }
         const el = document.getElementById(id);
         if(el) el.value = nextValue;
         updateOrderMenuSuggestions(idx, nextValue);
         updateOrderWhippedCreamOptionSlot(idx);
+        updateOrderMenuDependentInfo(idx);
+        updateOrderSubmitButtonView();
       }else if(id.startsWith('orderItemMemo-')){
         const idx = Number(id.split('-').pop() || 0);
         ensureOrderItemsRuntime();
@@ -24888,6 +25068,13 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       slot.classList.toggle('has-two-options', !!parts.cream && !!parts.shot);
     }
 
+    function updateOrderMenuDependentInfo(index){
+      const item = state.orderItems && state.orderItems[index] ? state.orderItems[index] : null;
+      const host = app.querySelector(`.order-menu-dependent-info[data-index="${index}"]`);
+      if(host) host.innerHTML = renderOrderMilkCouponInfo(item);
+      updateOrderItemCompactSummaryView(index);
+    }
+
     function renderOrderItemQuantityInline(item, index){
       return `
         <div class="order-item-inline-qty-row" aria-label="메뉴 수량 선택">
@@ -24916,6 +25103,12 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         cupCounts.DISPOSABLE ? `일회용 ${cupCounts.DISPOSABLE}` : ''
       ].filter(Boolean).join(' · ');
       return `${orderTempLabel(source.temp)} ${menuName} · ${quantity}잔${cups ? ` · ${cups}` : ''}`;
+    }
+
+    function updateOrderItemCompactSummaryView(index){
+      const item = state.orderItems && state.orderItems[index] ? state.orderItems[index] : null;
+      const summary = app.querySelector(`.order-item-card[data-order-item-card="true"][data-index="${index}"] .order-item-summary-text`);
+      if(item && summary) summary.textContent = getOrderItemCompactSummary(item);
     }
 
     function adjustOrderItemShotCount(index, delta){
@@ -24949,22 +25142,32 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           <div class="order-item-wide-grid">
             <div class="order-item-wide-menu">
               <div class="order-item-main-row">
-                <div class="order-temp-stack">
-                  <button class="seg-btn ${item.temp === 'ICE' ? 'active blue' : ''}" data-action="set-order-item-temp" data-index="${index}" data-value="ICE">🧊 ICE</button>
-                  <button class="seg-btn ${item.temp === 'HOT' ? 'active rose' : ''}" data-action="set-order-item-temp" data-index="${index}" data-value="HOT">🔥 HOT</button>
-                </div>
                 <div class="order-item-menu-search-wrap">
                   <div class="order-item-menu-input-line">
-                    <input id="orderMenuInput-${index}" class="order-item-menu-input" type="text" autocomplete="off" placeholder="메뉴명 입력" value="${escapeHtml(item.menuName || '')}" data-order-item-field="menuName" data-index="${index}">
-                    ${renderOrderMenuSuggestions(index, item.menuName)}
+                    <input id="orderMenuInput-${index}" class="order-item-menu-input" type="text" autocomplete="off" placeholder="메뉴명 입력" value="${escapeHtml(item.menuQuery || '')}" data-order-item-field="menuName" data-index="${index}">
+                    ${renderOrderMenuSuggestions(index, item.menuQuery)}
                   </div>
                   ${renderOrderItemQuantityInline(item, index)}
                 </div>
               </div>
+              <div class="order-drink-options">
+                <div class="order-temp-stack">
+                  <button class="seg-btn ${item.temp === 'ICE' ? 'active blue' : ''}" data-action="set-order-item-temp" data-index="${index}" data-value="ICE">🧊 ICE</button>
+                  <button class="seg-btn ${item.temp === 'HOT' ? 'active rose' : ''}" data-action="set-order-item-temp" data-index="${index}" data-value="HOT">🔥 HOT</button>
+                </div>
+                ${renderOrderWhippedCreamOptionSlot(item, index)}
+                <div class="order-menu-dependent-info" data-index="${index}">${renderOrderMilkCouponInfo(item)}</div>
+              </div>
+            </div>
+
+            <div class="order-item-wide-detail-grid">
+              <div class="order-item-request-field">
+                <label>음료 별 요청사항</label>
+                <div class="pos-keyboard-wrap"><input id="orderItemMemo-${index}" class="order-item-request-input" type="text" autocomplete="off" placeholder="이 음료에 대한 요청사항을 입력하세요. 예: 연하게, 얼음 적게" value="${escapeHtml(item.itemMemo || '')}" data-order-item-field="itemMemo" data-index="${index}"></div>
+              </div>
             </div>
 
             <div class="section order-item-wide-cup" style="margin-top:12px;padding-top:12px">
-              ${renderOrderWhippedCreamOptionSlot(item, index)}
               ${isGroupedCupSelection ? '' : `
                 <div class="order-cup-choice-layout">
                   <div class="btn-grid order-cup-buttons">
@@ -24980,13 +25183,6 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
               ${item.cupType === 'STORE_CUP' && Number(item.quantity || 1) <= 1 ? `
                 <div class="hint-box order-cup-follow-info">💡 컵은 매장 내에서만 이용 가능하며, 분실 예방을 위해 외부 반출을 금합니다. 컵 대여가 필요하신 경우 텀블러 대여 학생 또는 담당 교사에게 직접 문의해 주세요.</div>
               ` : ''}
-            </div>
-
-            <div class="order-item-wide-detail-grid">
-              <div class="order-item-request-field">
-                <label>음료 별 요청사항</label>
-                <div class="pos-keyboard-wrap"><input id="orderItemMemo-${index}" class="order-item-request-input" type="text" autocomplete="off" placeholder="이 음료에 대한 요청사항을 입력하세요. 예: 연하게, 얼음 적게" value="${escapeHtml(item.itemMemo || '')}" data-order-item-field="itemMemo" data-index="${index}"></div>
-              </div>
             </div>
           </div>
           </div>` : ''}
@@ -25012,9 +25208,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
     }
 
     function updateOrderSubmitButtonView(){
-      const submitBtn = app.querySelector('.order-submit-btn[data-action="submit-order"]');
-      if(!submitBtn) return;
-      submitBtn.textContent = `✈️ ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감 후 주문 접수하기!`;
+      const summary = app.querySelector('#orderSubmitSummary');
+      if(!summary) return;
+      summary.textContent = `총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감`;
     }
 
     function updateOrderReceiveSectionView(){
@@ -30244,7 +30440,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
     }
 
-    function handleSelfRegister(){
+    let selfRegistrationSaveInFlight = false;
+
+    async function handleSelfRegister(){
+      if(selfRegistrationSaveInFlight || orderFullBackupSaveInFlight) return;
       const inputName = state.selfRegData.name.trim();
       const inputDept = state.selfRegData.dept.trim();
       if(!inputName){ showMessage('이름을 입력해주세요.'); return; }
@@ -30257,8 +30456,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return;
       }
 
+      const requestId = uid('req');
       state.registrationRequests.push({
-        id: uid('req'),
+        id: requestId,
         name: inputName,
         dept: inputDept,
         defaultLocation: state.selfRegData.defaultLocation.trim(),
@@ -30272,15 +30472,36 @@ body.mobile-tablet-device .pos-keyboard-btn{
       });
       addAuditLog('REGISTRATION_REQUEST_SUBMITTED', {
         requestedName: inputName,
-        requestedDept: inputDept
+        requestedDept: inputDept,
+        requestId
       });
-      saveData();
-      state.showSelfRegModal = false;
-      state.selfRegStep = 'INPUT';
-      state.duplicateUserIds = [];
-      state.selfRegData = { name:'', dept:'', defaultLocation:'', tumblerInfo:'', isStaffMember:true };
-      render();
-      showMessage('등록 신청이 접수되었습니다.\n관리자 검토 후 이용 가능합니다.');
+      selfRegistrationSaveInFlight = true;
+      try{
+        const result = await saveData({
+          reason: 'registration-request-submitted',
+          forceFullBackup: true,
+          saveShared: false,
+          returnFullBackupResult: true
+        });
+        if(!(result && result.actualAggregateWriteCompleted === true)){
+          state.registrationRequests = state.registrationRequests.filter(request => String(request && request.id || '') !== requestId);
+          state.logs = state.logs.filter(log => !(log && log.action === 'REGISTRATION_REQUEST_SUBMITTED' && String(log.requestId || '') === requestId));
+          render();
+          return;
+        }
+        state.showSelfRegModal = false;
+        state.selfRegStep = 'INPUT';
+        state.duplicateUserIds = [];
+        state.selfRegData = { name:'', dept:'', defaultLocation:'', tumblerInfo:'', isStaffMember:true };
+        render();
+        showMessage('등록 신청이 접수되었습니다.\n관리자 검토 후 이용 가능합니다.');
+      }catch(error){
+        state.registrationRequests = state.registrationRequests.filter(request => String(request && request.id || '') !== requestId);
+        state.logs = state.logs.filter(log => !(log && log.action === 'REGISTRATION_REQUEST_SUBMITTED' && String(log.requestId || '') === requestId));
+        render();
+      }finally{
+        selfRegistrationSaveInFlight = false;
+      }
     }
 
     async function handleFinalOrder(userId, qty, memoText, proxyMode=false){
@@ -30306,6 +30527,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return;
       }
       ensureOrderItemsRuntime();
+      const unconfirmedMenuIndex = state.orderItems.findIndex(item => !isOrderItemMenuSelectionValid(item));
+      if(unconfirmedMenuIndex >= 0){
+        showMessage('검색 결과에서 판매 중인 메뉴를 선택해주세요.');
+        return;
+      }
       autoAssignOrderItemTumblers();
       const orderItems = normalizeOrderItemsForStorage(state.orderItems);
       const permanentTumblerInfoCandidate = getOrderPermanentTumblerInfoCandidate(orderItems, user);
@@ -32215,6 +32441,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const normalized = {
           temp: String((item && item.temp) || 'ICE').toUpperCase() === 'HOT' ? 'HOT' : 'ICE',
           menuName: String((item && item.menuName) || ''),
+          menuQuery: String((item && item.menuQuery != null ? item.menuQuery : item && item.menuName) || ''),
+          selectedMenuName: String((item && item.selectedMenuName != null ? item.selectedMenuName : item && item.menuName) || ''),
           cupType: ['TUMBLER','STORE_CUP','DISPOSABLE'].includes(String((item && item.cupType) || '').toUpperCase()) ? String(item.cupType).toUpperCase() : 'TUMBLER',
           quantity: Math.max(1, Number((item && item.quantity) || 1)),
           itemMemo: String((item && (item.itemMemo || item.memo || item.requestMemo || item.request)) || ''),
@@ -32250,14 +32478,36 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return index > -1 && index < 5;
     }
 
+    const ORDER_EDIT_MEMO_ONLY_MESSAGE = '현재는 주문 메모만 수정할 수 있습니다. 메뉴·수량·옵션·컵·배달 정보 변경은 쿠폰 잔액 전환과 안전검증 후 다시 제공됩니다.';
+
     function getOrderEditComparableSnapshot(editData){
       const source = editData && typeof editData === 'object' ? editData : {};
       return JSON.stringify({
+        quantity:Number(source.quantity || 0),
+        couponPolicyVersion:Number(source.couponPolicyVersion || 0),
+        couponCostTotal:Number(source.couponCostTotal || 0),
         deliveryType:String(source.deliveryType || 'PICKUP'),
         deliveryLocation:String(source.deliveryLocation || ''),
+        cupType:String(source.cupType || ''),
         tumblerInfo:String(source.tumblerInfo || ''),
         memo:String(source.memo || ''),
         items:Array.isArray(source.items) ? source.items : []
+      });
+    }
+
+    function getOrderEditProtectedContentSnapshot(editData){
+      const source = editData && typeof editData === 'object' ? editData : {};
+      const items = normalizeOrderItemsForStorage(safeJsonClone(Array.isArray(source.items) ? source.items : []));
+      const firstItem = items[0] || createDefaultOrderItem();
+      return JSON.stringify({
+        items,
+        quantity:Number(source.quantity || getOrderTotalQuantityFromItems(items) || 0),
+        couponPolicyVersion:Number(source.couponPolicyVersion || 0),
+        couponCostTotal:Number(source.couponCostTotal || 0),
+        deliveryType:String(source.deliveryType || 'PICKUP').toUpperCase() === 'DELIVERY' ? 'DELIVERY' : 'PICKUP',
+        deliveryLocation:String(source.deliveryLocation || '').trim(),
+        cupType:String(source.cupType || firstItem.cupType || 'TUMBLER'),
+        tumblerInfo:String(source.tumblerInfo || '').trim()
       });
     }
 
@@ -32360,6 +32610,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.editingOrderId = order.id;
       state.editOrderData = {
         quantity: Number(getOrderTotalQuantity(order) || order.quantity || 1),
+        couponPolicyVersion: Number(order.couponPolicyVersion || 0),
+        couponCostTotal: Number(getOrderCouponCost(order) || 0),
         deliveryType: order.deliveryType || 'PICKUP',
         deliveryLocation: order.deliveryLocation || '',
         cupType: order.cupType || 'TUMBLER',
@@ -32405,6 +32657,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const normalized = {
           temp: String((item && item.temp) || 'ICE').toUpperCase() === 'HOT' ? 'HOT' : 'ICE',
           menuName: String((item && item.menuName) || ''),
+          menuQuery: String((item && item.menuQuery != null ? item.menuQuery : item && item.menuName) || ''),
+          selectedMenuName: String((item && item.selectedMenuName != null ? item.selectedMenuName : item && item.menuName) || ''),
           cupType: ['TUMBLER','STORE_CUP','DISPOSABLE'].includes(String((item && item.cupType) || '').toUpperCase()) ? String(item.cupType).toUpperCase() : 'TUMBLER',
           quantity: Math.max(1, Number((item && item.quantity) || 1)),
           itemMemo: String((item && (item.itemMemo || item.memo || item.requestMemo || item.request)) || ''),
@@ -32884,7 +33138,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             ${itemCount > 1 ? `<button type="button" class="btn btn-outline" style="padding:7px 10px;font-size:12px;color:#be123c;border-color:#fecdd3" data-action="edit-order-remove-item" data-index="${index}" ${state.editOrderSaveInFlight ? 'disabled' : ''}>삭제</button>` : ''}
           </div>
           <div class="edit-order-item-main-row">
-            <div class="field"><label>메뉴명</label><div class="order-item-menu-search-wrap"><div class="order-item-menu-input-line"><input id="editOrderMenuInput-${index}" class="input order-item-menu-input" type="text" autocomplete="off" value="${escapeHtml(item.menuName || '')}" placeholder="메뉴명을 입력하세요" data-edit-order-item-field="menuName" data-index="${index}">${renderEditOrderMenuSuggestions(index, item.menuName)}</div></div>${renderOrderEditInlineError('menu', index)}</div>
+            <div class="field"><label>메뉴명</label><div class="order-item-menu-search-wrap"><div class="order-item-menu-input-line"><input id="editOrderMenuInput-${index}" class="input order-item-menu-input" type="text" autocomplete="off" value="${escapeHtml(item.menuQuery || '')}" placeholder="메뉴명을 입력하세요" data-edit-order-item-field="menuName" data-index="${index}">${renderEditOrderMenuSuggestions(index, item.menuQuery)}</div></div>${renderOrderEditInlineError('menu', index)}</div>
             <div class="edit-order-item-qty-compact">
               <div class="label">☕ 수량</div>
               <div class="qty-control">
@@ -32898,6 +33152,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
             <button type="button" class="seg-btn ${item.temp === 'ICE' ? 'active blue' : ''}" data-action="edit-order-set-temp" data-index="${index}" data-value="ICE" aria-pressed="${item.temp === 'ICE' ? 'true' : 'false'}">🧊 ICE</button>
             <button type="button" class="seg-btn ${item.temp === 'HOT' ? 'active rose' : ''}" data-action="edit-order-set-temp" data-index="${index}" data-value="HOT" aria-pressed="${item.temp === 'HOT' ? 'true' : 'false'}">🔥 HOT</button>
           </div>
+          ${renderEditOrderWhippedCreamOption(item, index)}
+          ${renderOrderMilkCouponInfo(item)}
+          <div class="order-item-request-field">
+            <label>음료 별 요청사항</label>
+            <input class="order-item-request-input" type="text" autocomplete="off" placeholder="이 음료에 대한 요청사항을 입력하세요. 예: 연하게, 얼음 적게" value="${escapeHtml(item.itemMemo || '')}" data-edit-order-item-field="itemMemo" data-index="${index}">
+          </div>
           ${qty > 1 ? `
             ${renderEditOrderItemUnitCupSelector(item, index)}
           ` : `
@@ -32910,11 +33170,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
           `}
           ${deliveryCupConflict ? `<div class="edit-order-inline-error" role="alert">매장용 컵은 배달로 선택할 수 없습니다. 픽업으로 바꾸거나 컵 종류를 변경해주세요.</div>` : renderOrderEditInlineError('cup', index)}
           ${renderOrderEditInlineError('tumbler', index)}
-          ${renderEditOrderWhippedCreamOption(item, index)}
-          <div class="order-item-request-field">
-            <label>음료 별 요청사항</label>
-            <input class="order-item-request-input" type="text" autocomplete="off" placeholder="이 음료에 대한 요청사항을 입력하세요. 예: 연하게, 얼음 적게" value="${escapeHtml(item.itemMemo || '')}" data-edit-order-item-field="itemMemo" data-index="${index}">
-          </div>
         </div>
       `;
     }
@@ -33001,12 +33256,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const user = getUserById(order.userId);
       if(!user){ showMessage('사용자를 찾을 수 없습니다.'); return; }
+      const initialEditData = getOrderEditInitialComparableData();
+      if(!initialEditData || getOrderEditProtectedContentSnapshot(state.editOrderData) !== getOrderEditProtectedContentSnapshot(initialEditData)){
+        showOrderEditValidation(ORDER_EDIT_MEMO_ONLY_MESSAGE, '', -1);
+        return;
+      }
       ensureEditOrderItemsRuntime();
       autoAssignEditOrderItemTumblers();
 
-      const missingMenuIndex = state.editOrderData.items.findIndex(item => !String(item.menuName || '').trim());
-      if(missingMenuIndex >= 0){
-        showOrderEditValidation('메뉴명을 입력해주세요.', 'menu', missingMenuIndex);
+      const unconfirmedMenuIndex = state.editOrderData.items.findIndex(item => !isOrderItemMenuSelectionValid(item));
+      if(unconfirmedMenuIndex >= 0){
+        showOrderEditValidation('검색 결과에서 판매 중인 메뉴를 선택해주세요.', 'menu', unconfirmedMenuIndex);
         return;
       }
       const newItems = normalizeOrderItemsForStorage(state.editOrderData.items);
@@ -36549,6 +36809,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     // =========================================================
     const root = document.getElementById('order-module');
     const app = root.querySelector('.order-app');
+    orderAppUiReady = true;
     const modalRoot = root.querySelector('.order-modal-root');
     let autoReturnTimer = null;
     let autoReturnInterval = null;
@@ -37279,8 +37540,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
 
                     <div class="order-submit-actions">
+                      <div id="orderSubmitSummary" class="order-submit-summary" aria-live="polite" aria-atomic="true">총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감</div>
                       <button class="btn btn-gray order-cancel-btn" data-action="cancel-selected-user">접수 취소</button>
-                      <button class="btn btn-amber order-submit-btn" data-action="submit-order">✈️ ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감 후 주문 접수하기!</button>
+                      <button class="btn btn-amber order-submit-btn" data-action="submit-order" aria-describedby="orderSubmitSummary">주문 접수</button>
                     </div>
 
                     ${renderUserCouponLedgerPanel(user, 5, { title:'최근 쿠폰 변동 내역', collapsible:true, tall:true, publicView:true })}
@@ -37482,6 +37744,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(typeof state.completedOrderRecoveryLegacyCursor !== 'string') state.completedOrderRecoveryLegacyCursor = '';
       if(typeof state.completedOrderRecoveryLegacyScanned !== 'number') state.completedOrderRecoveryLegacyScanned = 0;
       if(typeof state.completedOrderRecoveryLegacyDone !== 'boolean') state.completedOrderRecoveryLegacyDone = false;
+      if(typeof state.historicalCompletionLoading !== 'boolean') state.historicalCompletionLoading = false;
+      if(typeof state.historicalCompletionRunning !== 'boolean') state.historicalCompletionRunning = false;
+      if(typeof state.historicalCompletionStatus !== 'string') state.historicalCompletionStatus = '';
+      if(typeof state.historicalCompletionError !== 'string') state.historicalCompletionError = '';
+      if(typeof state.historicalCompletionGeneratedAt !== 'string') state.historicalCompletionGeneratedAt = '';
+      if(!Array.isArray(state.historicalCompletionRows)) state.historicalCompletionRows = [];
+      if(!Array.isArray(state.historicalCompletionSelectedIds)) state.historicalCompletionSelectedIds = [];
       if(typeof state.carryoverOrderCursor !== 'string') state.carryoverOrderCursor = '';
       if(typeof state.carryoverOrderHasMore !== 'boolean') state.carryoverOrderHasMore = false;
       if(typeof state.carryoverOrderScannedCount !== 'number') state.carryoverOrderScannedCount = 0;
@@ -37713,8 +37982,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       let completeAction = 'complete-order';
       let baseCompleteLabel = '제작완료';
       if(workStage === 'MEASURE_WAITING'){
-        completeAction = 'measure-complete-order';
-        baseCompleteLabel = '계량완료';
+        if(activeFilter === 'MEASURE'){
+          completeAction = 'measure-complete-order';
+          baseCompleteLabel = '계량완료';
+        }else if(isDelivery){
+          completeAction = 'delivery-production-complete-order';
+        }
       }else if(isDelivery && (workStage === 'PRODUCTION_WAITING' || (workStage === 'DELIVERY_WAITING' && !hasConfirmedDeliveryProductionCompletion(order)))){
         completeAction = 'delivery-production-complete-order';
       }
@@ -37781,7 +38054,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const totalQty = Number(getOrderTotalQuantity(order) || 0);
       const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const ready = isDeliveryDashboardOrderReady(order);
-      const completionStatus = getOrderCompletionRequestStatus(order);
+      const completionStatus = String(order.completionRequestStatus || '');
       const completionBusy = completionStatus === 'pending' || completionStatus === 'retrying';
       const completionNeedsCheck = completionStatus === 'needs-check';
       const completeAction = completionNeedsCheck ? 'check-order-completion-status' : 'delivery-record-complete';
@@ -37839,6 +38112,338 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
     function getCompletedOrderRecoveryDate(){
       return String(state.completedOrderRecoveryDate || state.completedFilterDate || getTodayString()).trim() || getTodayString();
+    }
+
+    function isHistoricalCompletionAdminAuthorized(){
+      return state.appRole === 'ADMIN' && isFirebaseAdminVerified();
+    }
+
+    function getHistoricalCompletionSequenceNumber(order){
+      const direct = Number(order && order.seq);
+      if(Number.isInteger(direct) && direct >= 0) return direct;
+      const match = String(order && order.orderNumber || '').match(/(\d+)$/);
+      return match ? Number(match[1]) : NaN;
+    }
+
+    function getHistoricalCompletionDecision(row){
+      const order = row && row.order && typeof row.order === 'object' ? row.order : null;
+      const actual = row && row.actual && typeof row.actual === 'object' ? row.actual : {};
+      if(!order || !String(row && row.orderId || '').trim()) return { kind:'BLOCKED', selectable:false, reason:'실제 live 주문을 확인할 수 없습니다.' };
+      if(String(actual.businessDate || '') !== HISTORICAL_COMPLETION_TARGET_DATE) return { kind:'BLOCKED', selectable:false, reason:'2026-08-21 주문이 아닙니다.' };
+      if(String(row.liveOrderDocId || '') !== `live_order_${String(row.orderId || '')}`) return { kind:'BLOCKED', selectable:false, reason:'live 문서 ID와 orderId가 일치하지 않습니다.' };
+      const rawStatus = String(actual.status || '').toUpperCase();
+      const sequenceNumber = getHistoricalCompletionSequenceNumber(order);
+      if(sequenceNumber === 16 || sequenceNumber === 19) return { kind:'BLOCKED', selectable:false, reason:`취소 제외 주문 #${sequenceNumber}은 처리할 수 없습니다.` };
+      if(rawStatus === 'CANCELLED') return { kind:'BLOCKED', selectable:false, reason:'취소 주문은 처리할 수 없습니다.' };
+      if(['PICKUP_DONE','DELIVERY_DONE','COMPLETED','DONE'].includes(rawStatus)) return { kind:'ALREADY_DONE', selectable:false, reason:'이미 완료된 주문입니다.' };
+      if(rawStatus !== 'PENDING') return { kind:'BLOCKED', selectable:false, reason:`지원하지 않는 현재 상태입니다: ${rawStatus || '없음'}` };
+      if(actual.completionCommitted === true) return { kind:'BLOCKED', selectable:false, reason:'PENDING인데 completionCommitted=true인 모순 상태입니다.' };
+      if(row.closedGuardExists) return { kind:'BLOCKED', selectable:false, reason:'완료·취소 closed guard가 존재합니다.' };
+      if(row.completionEventExists) return { kind:'BLOCKED', selectable:false, reason:'PENDING 주문에 기존 completion event가 존재합니다.' };
+      const cycle = actual.productionCycle;
+      const statusRevision = actual.statusRevision;
+      const stageRevision = actual.stageRevision;
+      if(typeof cycle !== 'number' || !Number.isInteger(cycle) || cycle < 1) return { kind:'BLOCKED', selectable:false, reason:'productionCycle을 안전하게 판정할 수 없습니다.' };
+      if(typeof statusRevision !== 'number' || !Number.isInteger(statusRevision) || statusRevision < 0) return { kind:'BLOCKED', selectable:false, reason:'statusRevision을 안전하게 판정할 수 없습니다.' };
+      if(typeof stageRevision !== 'number' || !Number.isInteger(stageRevision) || stageRevision < 0) return { kind:'BLOCKED', selectable:false, reason:'stageRevision을 안전하게 판정할 수 없습니다.' };
+      if(actual.isOpen !== true){
+        const validQuarantine = actual.isOpen === false
+          && actual.isRevivedQuarantined === true
+          && actual.reason === 'revived-order-quarantine'
+          && row.revivedGuardExists;
+        if(!validQuarantine) return { kind:'BLOCKED', selectable:false, reason:'열린 주문도, 검증된 revived quarantine 주문도 아닙니다.' };
+      }
+      if(row.completionRequestExists){
+        const request = row.completionRequest || {};
+        const requestStatus = String(request.status || '').toUpperCase();
+        if(String(request.orderId || '') !== String(row.orderId || '')
+          || Number(request.productionCycle) !== cycle
+          || String(request.completionEventId || '') !== makeOrderCompletionEventId(row.orderId, cycle)){
+          return { kind:'BLOCKED', selectable:false, reason:'기존 completion request가 현재 주문 cycle과 일치하지 않습니다.' };
+        }
+        if(requestStatus === 'COMPLETED') return { kind:'BLOCKED', selectable:false, reason:'완료 요청은 COMPLETED인데 live 주문은 PENDING입니다.' };
+        if(!['PENDING','PROCESSING','NEEDS_CHECK'].includes(requestStatus)) return { kind:'BLOCKED', selectable:false, reason:`지원하지 않는 completion request 상태입니다: ${requestStatus || '없음'}` };
+        const leaseUntil = Number(request.processingLeaseUntilMs || 0);
+        const leaseOwner = String(request.processingOwnerSessionId || '');
+        if(requestStatus === 'PROCESSING' && leaseOwner && leaseOwner !== String(state.clientSessionId || '') && leaseUntil > Date.now()){
+          return { kind:'BLOCKED', selectable:false, reason:'다른 관리자 세션이 현재 완료 요청을 처리 중입니다.' };
+        }
+      }
+      const deliveryType = String(order.deliveryType || '').toUpperCase();
+      const stage = String(actual.workStage || '').toUpperCase();
+      if(deliveryType !== 'DELIVERY'){
+        if(!['MEASURE_WAITING','PRODUCTION_WAITING'].includes(stage)) return { kind:'BLOCKED', selectable:false, reason:`픽업 주문의 workStage를 안전하게 처리할 수 없습니다: ${stage || '없음'}` };
+        return { kind:'READY', selectable:true, requiresDeliveryPreparation:false, reason:stage === 'MEASURE_WAITING' ? '계량 대기 픽업 · 기존 완료 transaction 직접 처리' : '픽업 완료 처리 가능' };
+      }
+      if(row.deliveryRecordExists && !row.deliveryRecord) return { kind:'BLOCKED', selectable:false, reason:'delivery record 형식이 유효하지 않습니다.' };
+      if(stage === 'DELIVERING'){
+        return row.deliveryRecordExists
+          ? { kind:'READY', selectable:true, requiresDeliveryPreparation:false, reason:'배달완료 처리 가능' }
+          : { kind:'BLOCKED', selectable:false, reason:'DELIVERING 주문의 delivery record가 없습니다.' };
+      }
+      if(stage === 'DELIVERY_WAITING' && actual.productionCompleted === true){
+        return row.deliveryRecordExists
+          ? { kind:'READY', selectable:true, requiresDeliveryPreparation:false, reason:'제작완료 확인 · 배달완료 처리 가능' }
+          : { kind:'BLOCKED', selectable:false, reason:'제작완료 주문의 delivery record가 없습니다.' };
+      }
+      if(['MEASURE_WAITING','PRODUCTION_WAITING','DELIVERY_WAITING'].includes(stage)){
+        return { kind:'READY', selectable:true, requiresDeliveryPreparation:true, reason:'기존 stage transaction으로 배달 제작완료 준비 후 처리' };
+      }
+      return { kind:'BLOCKED', selectable:false, reason:`배달 주문의 workStage를 안전하게 준비할 수 없습니다: ${stage || '없음'}` };
+    }
+
+    function withHistoricalCompletionDecision(row){
+      const next = row && typeof row === 'object' ? row : {};
+      return { ...next, decision:getHistoricalCompletionDecision(next) };
+    }
+
+    async function runHistoricalCompletionPreview(){
+      if(!isHistoricalCompletionAdminAuthorized()){
+        showMessage('최고 관리자 인증 후에만 2026-08-21 과거 주문을 확인할 수 있습니다.');
+        return;
+      }
+      if(state.historicalCompletionLoading || state.historicalCompletionRunning) return;
+      const cloud = window.HaetsalHistoricalCompletion;
+      if(!cloud || typeof cloud.readByDate !== 'function'){
+        showMessage('과거 주문 상태 확인 모듈이 준비되지 않았습니다.');
+        return;
+      }
+      historicalCompletionAllowedOrderIds.clear();
+      state.historicalCompletionLoading = true;
+      state.historicalCompletionStatus = '2026-08-21 실제 live 주문과 guard·완료 기록을 읽는 중입니다.';
+      state.historicalCompletionError = '';
+      state.historicalCompletionRows = [];
+      state.historicalCompletionSelectedIds = [];
+      render();
+      try{
+        const result = await cloud.readByDate(HISTORICAL_COMPLETION_TARGET_DATE);
+        state.historicalCompletionRows = (Array.isArray(result && result.rows) ? result.rows : [])
+          .map(withHistoricalCompletionDecision)
+          .sort((left, right) => getHistoricalCompletionSequenceNumber(left.order) - getHistoricalCompletionSequenceNumber(right.order));
+        state.historicalCompletionGeneratedAt = new Date().toISOString();
+        state.historicalCompletionStatus = `미리보기 완료: 실제 조회 ${Number(result && result.scannedCount || 0)}건 · 처리 가능 ${state.historicalCompletionRows.filter(row => row.decision && row.decision.selectable).length}건`;
+        if(result && result.limitReached) state.historicalCompletionError = `조회 상한 ${Number(result.limit || HISTORICAL_COMPLETION_PREVIEW_LIMIT)}건에 도달했습니다. 실행 전에 범위를 다시 확인하세요.`;
+      }catch(error){
+        state.historicalCompletionError = String(error && error.message || error || '과거 주문을 확인하지 못했습니다.');
+        state.historicalCompletionStatus = '미리보기 실패';
+      }finally{
+        state.historicalCompletionLoading = false;
+        render();
+      }
+    }
+
+    function toggleHistoricalCompletionSelection(orderId, checked){
+      const id = String(orderId || '').trim();
+      const row = (Array.isArray(state.historicalCompletionRows) ? state.historicalCompletionRows : []).find(item => String(item && item.orderId || '') === id);
+      if(!id || !row || !(row.decision && row.decision.selectable) || state.historicalCompletionRunning) return;
+      const selected = new Set(Array.isArray(state.historicalCompletionSelectedIds) ? state.historicalCompletionSelectedIds : []);
+      if(checked) selected.add(id); else selected.delete(id);
+      state.historicalCompletionSelectedIds = Array.from(selected);
+      render();
+    }
+
+    function buildHistoricalCompletionRequest(row){
+      const existing = row && row.completionRequestExists && row.completionRequest ? row.completionRequest : {};
+      const cycle = Number(row && row.actual && row.actual.productionCycle);
+      const orderId = String(row && row.orderId || '');
+      return {
+        orderId,
+        productionCycle:cycle,
+        completionEventId:makeOrderCompletionEventId(orderId, cycle),
+        completionOperationId:String(existing.completionOperationId || makeCompletionOperationId(orderId, cycle)),
+        requestedAt:String(existing.requestedAt || new Date().toISOString()),
+        requestedBy:String(existing.requestedBy || getCurrentActorLabel()),
+        baseStatusRevision:Number(row && row.actual && row.actual.statusRevision),
+        status:'PENDING',
+        attemptCount:Math.max(0, Number(existing.attemptCount || 0)),
+        lastAttemptAt:String(existing.lastAttemptAt || ''),
+        lastError:''
+      };
+    }
+
+    function hasPreservedHistoricalOrderIdentity(beforeRow, afterRow){
+      const before = beforeRow && beforeRow.order || {};
+      const after = afterRow && afterRow.order || {};
+      return String(afterRow && afterRow.actual && afterRow.actual.businessDate || '') === HISTORICAL_COMPLETION_TARGET_DATE
+        && String(after.createdAt || '') === String(before.createdAt || '')
+        && String(after.timestamp || '') === String(before.timestamp || '')
+        && String(after.orderNumber || '') === String(before.orderNumber || '')
+        && String(after.seq == null ? '' : after.seq) === String(before.seq == null ? '' : before.seq)
+        && String(after.sequenceDate || '') === String(before.sequenceDate || '');
+    }
+
+    async function executeOneHistoricalCompletion(initialRow){
+      const cloud = window.HaetsalHistoricalCompletion;
+      const liveDocs = window.HaetsalLiveOrderDocs;
+      const orderId = String(initialRow && initialRow.orderId || '').trim();
+      if(!historicalCompletionAllowedOrderIds.has(orderId)) throw new Error('현재 세션의 과거 주문 완료 allow-list에 없습니다.');
+      let row = withHistoricalCompletionDecision(await cloud.readOne(orderId));
+      if(!row || String(row.actual && row.actual.businessDate || '') !== HISTORICAL_COMPLETION_TARGET_DATE) throw new Error('2026-08-21 exact live 주문을 다시 확인하지 못했습니다.');
+      if(row.decision.kind === 'ALREADY_DONE') return { state:'ALREADY_DONE', message:'이미 완료되어 건너뜀', row };
+      if(!row.decision.selectable) return { state:'BLOCKED', message:row.decision.reason, row };
+      if(row.decision.requiresDeliveryPreparation){
+        const stageResult = await liveDocs.updateStage({
+          orderId,
+          order:safeJsonClone(row.order),
+          targetStage:'DELIVERY_WAITING',
+          productionCompleted:true,
+          actor:getCurrentActorLabel(),
+          baseStageRevision:Number(row.actual.stageRevision)
+        });
+        if(!(stageResult && (stageResult.ok || ['stage-updated','already-stage','already-advanced'].includes(String(stageResult.status || ''))))){
+          return { state:'BLOCKED', message:`배달 제작완료 준비 실패: ${String(stageResult && stageResult.status || 'unknown')}`, row };
+        }
+        row = withHistoricalCompletionDecision(await cloud.readOne(orderId));
+        if(!row || !row.decision.selectable || row.decision.requiresDeliveryPreparation || !row.deliveryRecordExists){
+          return { state:'BLOCKED', message:row && row.decision ? row.decision.reason : '배달 readiness 재검증 실패', row:row || initialRow };
+        }
+      }
+      if(!historicalCompletionAllowedOrderIds.has(orderId)) throw new Error('과거 주문 완료 allow-list가 실행 중 해제되었습니다.');
+      const request = buildHistoricalCompletionRequest(row);
+      await liveDocs.saveCompletionRequest({ ...request, status:'PENDING' });
+      const claim = await liveDocs.claimCompletionRequest({
+        ...request,
+        clientSessionId:String(state.clientSessionId || ''),
+        leaseDurationMs:ORDER_COMPLETION_PROCESSING_LEASE_MS
+      });
+      if(!(claim && (claim.ok || claim.status === 'already-completed'))){
+        return { state:'BLOCKED', message:`완료 요청 점유 실패: ${String(claim && claim.status || 'unknown')}`, row };
+      }
+      let completed;
+      try{
+        completed = await liveDocs.completeOrder({
+          ...request,
+          actor:getCurrentActorLabel(),
+          clientSessionId:String(state.clientSessionId || ''),
+          order:safeJsonClone(row.order),
+          legacyCompletionNormalize:shouldUseLegacyCompletionCompatibility(row.order),
+          currentAppVersion:ORDER_APP_VERSION
+        });
+      }catch(error){
+        const errorText = String((error && (error.code || error.message)) || error || 'needs-check');
+        await saveCompletionRequestCloudState(request, 'NEEDS_CHECK', errorText).catch(recoveryError => {
+          console.warn('historical completion request needs-check cloud save failed', recoveryError);
+        });
+        throw error;
+      }
+      const verified = await liveDocs.verifyCompletion(request);
+      const afterRow = withHistoricalCompletionDecision(await cloud.readOne(orderId));
+      const requestCompleted = !!(afterRow && afterRow.completionRequestExists && String(afterRow.completionRequest && afterRow.completionRequest.status || '').toUpperCase() === 'COMPLETED');
+      const eventMatches = !!(afterRow && afterRow.completionEventExists
+        && String(afterRow.completionEvent && afterRow.completionEvent.orderId || '') === orderId
+        && Number(afterRow.completionEvent && afterRow.completionEvent.productionCycle) === Number(request.productionCycle));
+      const done = !!(afterRow && afterRow.decision && afterRow.decision.kind === 'ALREADY_DONE');
+      if(!(completed && completed.ok && verified && verified.confirmed === true && done && requestCompleted && eventMatches)){
+        return { state:'FAILED', message:`완료 검증 실패: ${String(verified && verified.status || completed && completed.status || 'unknown')}`, row:afterRow || row };
+      }
+      if(!hasPreservedHistoricalOrderIdentity(row, afterRow)){
+        return { state:'FAILED', message:'완료됐지만 원래 날짜·접수 식별자 보존 확인에 실패했습니다.', row:afterRow };
+      }
+      return { state:'COMPLETED', message:'완료 request/event 및 live 상태 확인', row:afterRow };
+    }
+
+    async function runSelectedHistoricalCompletions(){
+      if(!isHistoricalCompletionAdminAuthorized()){
+        showMessage('최고 관리자 인증 후에만 과거 주문을 완료할 수 있습니다.');
+        return;
+      }
+      if(state.historicalCompletionLoading || state.historicalCompletionRunning) return;
+      const selectedIds = Array.from(new Set(Array.isArray(state.historicalCompletionSelectedIds) ? state.historicalCompletionSelectedIds : [])).filter(Boolean);
+      if(!selectedIds.length){
+        showMessage('완료할 2026-08-21 주문을 선택하세요.');
+        return;
+      }
+      if(!(window.HaetsalHistoricalCompletion && window.HaetsalLiveOrderDocs)){
+        showMessage('과거 주문 완료 모듈이 준비되지 않았습니다.');
+        return;
+      }
+      state.historicalCompletionRunning = true;
+      state.historicalCompletionError = '';
+      state.historicalCompletionStatus = `선택 주문 ${selectedIds.length}건을 순차 처리합니다.`;
+      historicalCompletionAllowedOrderIds.clear();
+      selectedIds.forEach(id => historicalCompletionAllowedOrderIds.add(id));
+      render();
+      let completedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
+      try{
+        for(let index = 0; index < selectedIds.length; index += 1){
+          const orderId = selectedIds[index];
+          const rowIndex = state.historicalCompletionRows.findIndex(row => String(row && row.orderId || '') === orderId);
+          state.historicalCompletionStatus = `과거 주문 완료 처리 ${index + 1}/${selectedIds.length}`;
+          if(rowIndex >= 0) state.historicalCompletionRows[rowIndex] = { ...state.historicalCompletionRows[rowIndex], executionState:'RUNNING', executionMessage:'처리 중' };
+          render();
+          try{
+            const initialRow = rowIndex >= 0 ? state.historicalCompletionRows[rowIndex] : { orderId };
+            const result = await executeOneHistoricalCompletion(initialRow);
+            if(result.state === 'COMPLETED') completedCount += 1;
+            else if(result.state === 'ALREADY_DONE') skippedCount += 1;
+            else failedCount += 1;
+            if(rowIndex >= 0){
+              state.historicalCompletionRows[rowIndex] = withHistoricalCompletionDecision({
+                ...(result.row || state.historicalCompletionRows[rowIndex]),
+                executionState:result.state,
+                executionMessage:result.message
+              });
+            }
+          }catch(error){
+            failedCount += 1;
+            if(rowIndex >= 0){
+              state.historicalCompletionRows[rowIndex] = {
+                ...state.historicalCompletionRows[rowIndex],
+                executionState:'FAILED',
+                executionMessage:String(error && error.message || error || '처리 실패')
+              };
+            }
+          }finally{
+            historicalCompletionAllowedOrderIds.delete(orderId);
+          }
+        }
+        state.historicalCompletionSelectedIds = [];
+        state.historicalCompletionStatus = `처리 완료: 성공 ${completedCount}건 · 이미 완료 ${skippedCount}건 · 차단/실패 ${failedCount}건`;
+      }finally{
+        historicalCompletionAllowedOrderIds.clear();
+        state.historicalCompletionRunning = false;
+        render();
+      }
+    }
+
+    function renderHistoricalCompletionValue(value){
+      if(value === true) return 'true';
+      if(value === false) return 'false';
+      if(value === null || value === undefined || value === '') return '없음';
+      return String(value);
+    }
+
+    function renderHistoricalCompletionPanel(){
+      if(!isHistoricalCompletionAdminAuthorized()) return '';
+      const rows = Array.isArray(state.historicalCompletionRows) ? state.historicalCompletionRows : [];
+      const selected = new Set(Array.isArray(state.historicalCompletionSelectedIds) ? state.historicalCompletionSelectedIds : []);
+      const selectedCount = rows.filter(row => selected.has(String(row && row.orderId || '')) && row.decision && row.decision.selectable).length;
+      return `
+        <details class="hint-box" style="margin-bottom:14px" data-historical-completion-panel="true" ${rows.length || state.historicalCompletionStatus ? 'open' : ''}>
+          <summary style="cursor:pointer;list-style:none"><div><div style="font-weight:900">2026-08-21 과거 주문 상태 정리</div><div class="table-sub">최고 관리자가 실제 live·guard·완료 기록을 미리 확인하고 선택한 주문만 기존 완료 transaction으로 처리합니다.</div></div></summary>
+          <div style="display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap;margin-top:10px">
+            <button class="btn btn-outline" data-action="preview-historical-completion" ${state.historicalCompletionLoading || state.historicalCompletionRunning ? 'disabled' : ''}>${state.historicalCompletionLoading ? '확인 중' : '미리보기'}</button>
+            <button class="btn btn-primary" data-action="run-historical-completion" ${state.historicalCompletionLoading || state.historicalCompletionRunning || !selectedCount ? 'disabled' : ''}>${state.historicalCompletionRunning ? '순차 처리 중' : `선택 ${selectedCount}건 완료`}</button>
+          </div>
+          ${state.historicalCompletionStatus ? `<div class="help-note" style="margin-top:10px">${escapeHtml(state.historicalCompletionStatus)}${state.historicalCompletionGeneratedAt ? ` · ${escapeHtml(formatAMPM(state.historicalCompletionGeneratedAt))}` : ''}</div>` : ''}
+          ${state.historicalCompletionError ? `<div class="notice" style="margin-top:10px"><div class="notice-title">확인 필요</div><div class="notice-text">${escapeHtml(state.historicalCompletionError)}</div></div>` : ''}
+          ${rows.length ? `<div class="list-stack" style="margin-top:10px;max-height:560px;overflow:auto">${rows.map(row => {
+            const order = row.order || {};
+            const actual = row.actual || {};
+            const decision = row.decision || { kind:'BLOCKED', selectable:false, reason:'판정 없음' };
+            const checked = selected.has(String(row.orderId || ''));
+            const requestText = row.completionRequestExists ? String(row.completionRequest && row.completionRequest.status || '존재') : '없음';
+            const eventText = row.completionEventExists ? '존재' : '없음';
+            const guardText = `revived ${row.revivedGuardExists ? '있음' : '없음'} / closed ${row.closedGuardExists ? '있음' : '없음'}`;
+            const deliveryText = String(order.deliveryType || '').toUpperCase() === 'DELIVERY'
+              ? `${row.deliveryRecordExists ? '있음' : '없음'} / productionCompleted ${renderHistoricalCompletionValue(actual.productionCompleted)}`
+              : '해당 없음';
+            return `<div class="done-item" style="align-items:flex-start"><div style="padding-top:3px"><input type="checkbox" data-historical-completion-id="${escapeHtml(row.orderId)}" ${checked ? 'checked' : ''} ${!decision.selectable || state.historicalCompletionRunning ? 'disabled' : ''}></div><div class="done-left"><div class="done-main"><div class="name">#${escapeHtml(String(order.orderNumber || order.seq || '-'))} · ${escapeHtml(order.userNameDisplay || order.userName || '사용자 확인 필요')} <span class="status-chip ${decision.kind === 'READY' ? 'green' : decision.kind === 'ALREADY_DONE' ? 'blue' : 'red'}">${escapeHtml(decision.kind)}</span></div><div class="sub" style="word-break:break-all">${escapeHtml(row.orderId || '')}</div><div class="table-sub" style="margin-top:6px;line-height:1.7">${escapeHtml(String(order.deliveryType || 'PICKUP'))} · status ${escapeHtml(renderHistoricalCompletionValue(actual.status))} · workStage ${escapeHtml(renderHistoricalCompletionValue(actual.workStage))}<br>isOpen ${escapeHtml(renderHistoricalCompletionValue(actual.isOpen))} · revivedQuarantined ${escapeHtml(renderHistoricalCompletionValue(actual.isRevivedQuarantined))}<br>cycle ${escapeHtml(renderHistoricalCompletionValue(actual.productionCycle))} · statusRevision ${escapeHtml(renderHistoricalCompletionValue(actual.statusRevision))} · stageRevision ${escapeHtml(renderHistoricalCompletionValue(actual.stageRevision))}<br>completionCommitted ${escapeHtml(renderHistoricalCompletionValue(actual.completionCommitted))} · request ${escapeHtml(requestText)} · event ${escapeHtml(eventText)}<br>${escapeHtml(guardText)} · delivery record ${escapeHtml(deliveryText)}</div><div class="help-note" style="margin-top:7px">${escapeHtml(decision.reason || '')}</div>${row.executionMessage ? `<div class="help-note" style="margin-top:5px">결과 ${escapeHtml(row.executionState || '')}: ${escapeHtml(row.executionMessage)}</div>` : ''}</div></div></div>`;
+          }).join('')}</div>` : (!state.historicalCompletionLoading ? '<div class="table-sub" style="margin-top:10px">미리보기를 실행하면 실제 2026-08-21 live 주문만 표시됩니다.</div>' : '')}
+        </details>
+      `;
     }
 
     async function loadCarryoverOrderCandidates(options){
@@ -38773,7 +39378,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
                 </div>
 
                 <div class="main-col">
-                  ${renderCarryoverOrderRecoverySection()}
+                  ${renderHistoricalCompletionPanel()}
+                  ${isHistoricalCompletionAdminAuthorized() ? renderCarryoverOrderRecoverySection() : ''}
                   <div class="main-card">
                     <div class="section-head order-queue-head">
                       <h2>${activeOrderFilter === 'DELIVERY' ? '🚚 배달 현황' : '🔔 제작 대기중'} <span class="pill rose">${visibleActiveOrders.length}건</span></h2>
@@ -40538,22 +41144,24 @@ body.mobile-tablet-device .pos-keyboard-btn{
           <div class="modal-head"><h3>✏️ 주문 정보 수정</h3><button type="button" class="modal-close" data-action="close-edit-order" ${state.editOrderSaveInFlight ? 'disabled' : ''}>❌</button></div>
           <div class="edit-order-modal-body">
             ${state.editOrderValidation && state.editOrderValidation.message ? `<div class="edit-order-global-error" role="alert">${escapeHtml(state.editOrderValidation.message)}</div>` : ''}
-            ${state.editOrderData.editStartedByUser ? `<div class="user-order-edit-note">제작 대기 순서가 5개 이내가 아닌 주문만 직접 수정할 수 있습니다. 수정 후 잔 수가 바뀌면 쿠폰도 자동으로 다시 계산됩니다.</div>` : ''}
+            <div class="user-order-edit-note">${escapeHtml(ORDER_EDIT_MEMO_ONLY_MESSAGE)}</div>
             ${editingOrder ? `<div class="help-note" style="margin-bottom:12px">주문번호: ${escapeHtml(editingOrder.orderNumber || editingOrder.id)} · ${escapeHtml(editingOrder.userNameDisplay || editingOrder.userName || '')}(${escapeHtml(editingOrder.userDept || '소속없음')})</div>` : ''}
-            ${renderEditOrderItemsSection()}
-            <div class="row">
-              <div class="field">
-                <label>수령방법</label>
-                <div class="edit-order-receive-buttons">
-                  <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}">픽업</button>
-                  <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}">배달</button>
+            <fieldset disabled style="border:0;padding:0;margin:0;min-width:0" aria-label="수정할 수 없는 주문 정보">
+              ${renderEditOrderItemsSection()}
+              <div class="row">
+                <div class="field">
+                  <label>수령방법</label>
+                  <div class="edit-order-receive-buttons">
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}">픽업</button>
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}">배달</button>
+                  </div>
+                  ${renderOrderEditInlineError('deliveryType', -1)}
                 </div>
-                ${renderOrderEditInlineError('deliveryType', -1)}
+                ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}">${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
               </div>
-              ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}">${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
-            </div>
-            ${state.editOrderData.items.some(item => item.cupType === 'TUMBLER') ? `<div class="field"><label>공통 텀블러 정보</label><input id="editOrderTumblerInfo" class="input" type="text" placeholder="예: 개인 텀블러 또는 추가 설명" value="${escapeHtml(state.editOrderData.tumblerInfo)}"></div>` : ''}
-            <div class="field"><label>요청사항</label><input id="editOrderMemo" class="input" type="text" placeholder="주문 전체에 적용되는 요청사항" value="${escapeHtml(state.editOrderData.memo)}"></div>
+              ${state.editOrderData.items.some(item => item.cupType === 'TUMBLER') ? `<div class="field"><label>공통 텀블러 정보</label><input id="editOrderTumblerInfo" class="input" type="text" placeholder="예: 개인 텀블러 또는 추가 설명" value="${escapeHtml(state.editOrderData.tumblerInfo)}"></div>` : ''}
+            </fieldset>
+            <div class="field"><label>주문 전체 메모</label><input id="editOrderMemo" class="input" type="text" placeholder="주문 전체에 적용되는 요청사항" value="${escapeHtml(state.editOrderData.memo)}"></div>
           </div>
           <div class="modal-actions edit-order-modal-actions">
             <div class="edit-order-save-summary">${renderOrderEditSaveSummary()}</div>
@@ -40696,14 +41304,85 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }, 0);
     }
 
+    const orderKeyboardSubmitState = {
+      active:false,
+      baselineHeight:0,
+      updateTimer:0
+    };
+
+    function isTouchOrderDevice(){
+      return Number(navigator.maxTouchPoints || 0) > 0 || !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    }
+
+    function getFocusedOrderKeyboardInput(){
+      const target = document.activeElement;
+      if(!target || !app.contains(target) || !target.closest('.selected-card')) return null;
+      return ['INPUT','TEXTAREA'].includes(target.tagName) ? target : null;
+    }
+
+    function clearOrderKeyboardSubmitPosition(){
+      orderKeyboardSubmitState.active = false;
+      const actions = app.querySelector('.order-submit-actions');
+      if(actions) actions.classList.remove('order-keyboard-fixed');
+      document.body.classList.remove('order-keyboard-submit-active');
+      document.documentElement.style.removeProperty('--order-keyboard-bottom');
+      document.documentElement.style.removeProperty('--order-keyboard-body-padding');
+    }
+
+    function updateOrderKeyboardSubmitPosition(){
+      const actions = app.querySelector('.order-submit-actions');
+      const focusedInput = getFocusedOrderKeyboardInput();
+      const viewport = window.visualViewport;
+      if(!actions || !focusedInput || !viewport || !isTouchOrderDevice()){
+        clearOrderKeyboardSubmitPosition();
+        return;
+      }
+
+      const layoutHeight = Math.max(Number(window.innerHeight || 0), Number(document.documentElement.clientHeight || 0));
+      if(!orderKeyboardSubmitState.active){
+        orderKeyboardSubmitState.baselineHeight = Math.max(orderKeyboardSubmitState.baselineHeight, layoutHeight, Number(viewport.height || 0));
+      }
+      const baselineHeight = Math.max(orderKeyboardSubmitState.baselineHeight, layoutHeight);
+      const shrinkAmount = baselineHeight - Number(viewport.height || 0);
+      const shouldActivate = orderKeyboardSubmitState.active ? shrinkAmount > 70 : shrinkAmount > 120;
+      if(!shouldActivate){
+        clearOrderKeyboardSubmitPosition();
+        return;
+      }
+
+      orderKeyboardSubmitState.active = true;
+      const keyboardBottom = Math.max(0, layoutHeight - (Number(viewport.offsetTop || 0) + Number(viewport.height || 0)));
+      const actionHeight = Math.ceil(actions.getBoundingClientRect().height || 0);
+      document.documentElement.style.setProperty('--order-keyboard-bottom', `${keyboardBottom}px`);
+      document.documentElement.style.setProperty('--order-keyboard-body-padding', `${actionHeight + 24}px`);
+      document.body.classList.add('order-keyboard-submit-active');
+      actions.classList.add('order-keyboard-fixed');
+      keepInputVisible(focusedInput);
+    }
+
+    function scheduleOrderKeyboardSubmitPosition(delay=0){
+      window.clearTimeout(orderKeyboardSubmitState.updateTimer);
+      orderKeyboardSubmitState.updateTimer = window.setTimeout(updateOrderKeyboardSubmitPosition, delay);
+    }
+
+    function resetOrderKeyboardViewportBaseline(){
+      orderKeyboardSubmitState.baselineHeight = Math.max(Number(window.innerHeight || 0), Number(document.documentElement.clientHeight || 0), Number(window.visualViewport && window.visualViewport.height || 0));
+      clearOrderKeyboardSubmitPosition();
+      scheduleOrderKeyboardSubmitPosition(120);
+    }
+
     function keepInputVisible(element){
       if(!element) return;
       window.setTimeout(() => {
         try{
           const rect = element.getBoundingClientRect();
-          const visualHeight = (window.visualViewport && window.visualViewport.height) || window.innerHeight || document.documentElement.clientHeight || 0;
-          const topLimit = 24;
-          const bottomLimit = Math.max(topLimit + 120, visualHeight - 72);
+          const viewport = window.visualViewport;
+          const visualHeight = (viewport && viewport.height) || window.innerHeight || document.documentElement.clientHeight || 0;
+          const visualOffsetTop = Number(viewport && viewport.offsetTop || 0);
+          const fixedActions = app.querySelector('.order-submit-actions.order-keyboard-fixed');
+          const fixedHeight = fixedActions ? Math.ceil(fixedActions.getBoundingClientRect().height || 0) + 16 : 72;
+          const topLimit = visualOffsetTop + 24;
+          const bottomLimit = Math.max(topLimit + 120, visualOffsetTop + visualHeight - fixedHeight);
           if(rect.top < topLimit || rect.bottom > bottomLimit){
             element.scrollIntoView({ behavior:'smooth', block:'center', inline:'nearest' });
           }
@@ -40762,6 +41441,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!(app.contains(t) || modalRoot.contains(t))) return;
       if(!t || !['INPUT','TEXTAREA','SELECT'].includes(t.tagName)) return;
       keepInputVisible(t);
+      scheduleOrderKeyboardSubmitPosition(80);
       if(t.dataset && t.dataset.orderItemField === 'menuName'){
         const idx = Number(t.dataset.index || 0);
         updateOrderMenuSuggestions(idx, t.value);
@@ -40775,6 +41455,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('focusout', (event) => {
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
+      scheduleOrderKeyboardSubmitPosition(160);
       if(t.dataset && t.dataset.orderItemField === 'menuName'){
         const idx = Number(t.dataset.index || 0);
         window.setTimeout(() => {
@@ -40794,6 +41475,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
     });
 
+    if(window.visualViewport){
+      window.visualViewport.addEventListener('resize', () => scheduleOrderKeyboardSubmitPosition(0));
+      window.visualViewport.addEventListener('scroll', () => scheduleOrderKeyboardSubmitPosition(0));
+    }
+    window.addEventListener('resize', () => scheduleOrderKeyboardSubmitPosition(60));
+    window.addEventListener('orientationchange', resetOrderKeyboardViewportBaseline);
+
     // =========================================================
     // [6] 이벤트 연결
     // =========================================================
@@ -40805,11 +41493,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(shouldIgnoreOrderMenuInputAfterSuggestion(idx, t.value, t)) return;
         ensureOrderItemsRuntime();
         if(state.orderItems[idx]){
-          state.orderItems[idx].menuName = t.value;
-          syncOrderItemWhippedCreamAvailability(state.orderItems[idx]);
+          clearOrderItemMenuSelection(state.orderItems[idx], t.value);
         }
         updateOrderMenuSuggestions(idx, t.value);
         updateOrderWhippedCreamOptionSlot(idx);
+        updateOrderMenuDependentInfo(idx);
+        updateOrderSubmitButtonView();
         return;
       }
       if(t.dataset && t.dataset.orderItemField === 'assignedTumblerCustomInfo'){
@@ -40848,8 +41537,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         ensureEditOrderItemsRuntime();
         clearOrderEditValidation();
         if(state.editOrderData.items[index] && field === 'menuName'){
-          state.editOrderData.items[index].menuName = t.value;
-          syncOrderItemWhippedCreamAvailability(state.editOrderData.items[index]);
+          clearOrderItemMenuSelection(state.editOrderData.items[index], t.value);
           updateEditOrderMenuSuggestions(index, t.value);
         }
         if(state.editOrderData.items[index] && field === 'assignedTumblerCustomInfo'){
@@ -41013,11 +41701,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(shouldIgnoreOrderMenuInputAfterSuggestion(idx, t.value, t)) return;
         ensureOrderItemsRuntime();
         if(state.orderItems[idx]){
-          state.orderItems[idx].menuName = t.value;
-          syncOrderItemWhippedCreamAvailability(state.orderItems[idx]);
+          clearOrderItemMenuSelection(state.orderItems[idx], t.value);
         }
         updateOrderMenuSuggestions(idx, t.value);
         updateOrderWhippedCreamOptionSlot(idx);
+        updateOrderMenuDependentInfo(idx);
+        updateOrderSubmitButtonView();
       }
       if(t.id === 'adminUserSearch'){
         adminUserSearchIsComposing = false;
@@ -41120,6 +41809,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(t.id === 'carryoverOrderDate'){ state.carryoverOrderDate = t.value || getYesterdayDateKey(); state.carryoverOrderCandidates = []; state.carryoverOrderError = ''; state.carryoverOrderCursor = ''; state.carryoverOrderHasMore = false; state.carryoverOrderScannedCount = 0; state.carryoverOrderBlockedCount = 0; return; }
       if(t.id === 'completedOrderRecoveryDate'){ state.completedOrderRecoveryDate = t.value || getTodayString(); clearCompletedOrderRecoveryPreviewState(); render(); return; }
       if(t.dataset && t.dataset.completedOrderRecoveryId){ toggleCompletedOrderRecoverySelection(t.dataset.completedOrderRecoveryId, t.checked); return; }
+      if(t.dataset && t.dataset.historicalCompletionId){ toggleHistoricalCompletionSelection(t.dataset.historicalCompletionId, t.checked); return; }
       if(t.id === 'rejectReasonPreset'){ state.rejectReasonPreset = t.value; return; }
       if(t.id === 'statsPeriodType'){ state.statsPeriodType = t.value; render(); return; }
       if(t.id === 'statsStartDate'){ state.statsStartDate = t.value; return; }
@@ -41442,6 +42132,175 @@ body.mobile-tablet-device .pos-keyboard-btn{
     });
 
     document.addEventListener('click', handleOrderGroupCupButtonEvent, true);
+
+    const COMPLETION_SCROLL_GUARD_ACTIONS = new Set([
+      'complete-order',
+      'measure-complete-order',
+      'delivery-production-complete-order',
+      'delivery-record-complete',
+      'delivery-complete-order'
+    ]);
+    const COMPLETION_SCROLL_GUARD_DISTANCE = 10;
+    let completionScrollGesture = null;
+    let completionBlockedClick = null;
+
+    function getCompletionScrollGuardButton(target){
+      if(!(target && target.closest)) return null;
+      const btn = target.closest('[data-action]');
+      if(!btn || !app.contains(btn)) return null;
+      return COMPLETION_SCROLL_GUARD_ACTIONS.has(String(btn.dataset.action || '')) ? btn : null;
+    }
+
+    function getCompletionScrollContainer(){
+      const dashboardBody = app.querySelector('.dashboard-body');
+      if(dashboardBody){
+        const style = window.getComputedStyle(dashboardBody);
+        const overflowY = String(style.overflowY || '');
+        if(/auto|scroll|overlay/i.test(overflowY) && dashboardBody.scrollHeight > dashboardBody.clientHeight){
+          return dashboardBody;
+        }
+      }
+      return document.scrollingElement || document.documentElement;
+    }
+
+    function getCompletionScrollTop(container){
+      return Number(container && container.scrollTop || 0);
+    }
+
+    function completionGestureMoved(gesture, clientX, clientY){
+      if(!gesture) return false;
+      const distance = Math.hypot(Number(clientX || 0) - gesture.startX, Number(clientY || 0) - gesture.startY);
+      const scrollChanged = getCompletionScrollTop(gesture.scrollContainer) !== gesture.startScrollTop;
+      return gesture.moved || distance >= COMPLETION_SCROLL_GUARD_DISTANCE || scrollChanged;
+    }
+
+    function rememberCompletionBlockedClick(gesture){
+      if(!gesture) return;
+      completionBlockedClick = {
+        button:gesture.button,
+        action:gesture.action,
+        orderId:gesture.orderId,
+        until:Date.now() + 900
+      };
+    }
+
+    function handleCompletionGuardClick(event){
+      const btn = getCompletionScrollGuardButton(event.target);
+      const blocked = completionBlockedClick;
+      if(!btn || !blocked) return;
+      if(Date.now() > Number(blocked.until || 0)){
+        completionBlockedClick = null;
+        return;
+      }
+      const sameButton = blocked.button === btn;
+      const sameActionTarget = blocked.action === String(btn.dataset.action || '')
+        && blocked.orderId === String(btn.dataset.orderId || '');
+      if(!sameButton && !sameActionTarget) return;
+      completionBlockedClick = null;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+
+    function startCompletionPointerGesture(event){
+      const btn = getCompletionScrollGuardButton(event.target);
+      if(!btn || event.isPrimary === false) return;
+      const scrollContainer = getCompletionScrollContainer();
+      completionScrollGesture = {
+        pointerId:event.pointerId,
+        button:btn,
+        action:String(btn.dataset.action || ''),
+        orderId:String(btn.dataset.orderId || ''),
+        startX:Number(event.clientX || 0),
+        startY:Number(event.clientY || 0),
+        startScrollTop:getCompletionScrollTop(scrollContainer),
+        scrollContainer,
+        moved:false
+      };
+    }
+
+    function moveCompletionPointerGesture(event){
+      const gesture = completionScrollGesture;
+      if(!gesture || gesture.pointerId !== event.pointerId) return;
+      gesture.moved = completionGestureMoved(gesture, event.clientX, event.clientY);
+    }
+
+    function endCompletionPointerGesture(event){
+      const gesture = completionScrollGesture;
+      if(!gesture || gesture.pointerId !== event.pointerId) return;
+      if(completionGestureMoved(gesture, event.clientX, event.clientY)) rememberCompletionBlockedClick(gesture);
+      completionScrollGesture = null;
+    }
+
+    function cancelCompletionPointerGesture(event){
+      const gesture = completionScrollGesture;
+      if(!gesture || (event.pointerId != null && gesture.pointerId !== event.pointerId)) return;
+      rememberCompletionBlockedClick(gesture);
+      completionScrollGesture = null;
+    }
+
+    function getTrackedCompletionTouch(event, identifier){
+      const lists = [event.changedTouches, event.touches];
+      for(const list of lists){
+        if(!list) continue;
+        for(let index = 0; index < list.length; index += 1){
+          if(Number(list[index].identifier) === Number(identifier)) return list[index];
+        }
+      }
+      return null;
+    }
+
+    function startCompletionTouchGesture(event){
+      const btn = getCompletionScrollGuardButton(event.target);
+      const touch = event.changedTouches && event.changedTouches[0];
+      if(!btn || !touch) return;
+      const scrollContainer = getCompletionScrollContainer();
+      completionScrollGesture = {
+        touchIdentifier:touch.identifier,
+        button:btn,
+        action:String(btn.dataset.action || ''),
+        orderId:String(btn.dataset.orderId || ''),
+        startX:Number(touch.clientX || 0),
+        startY:Number(touch.clientY || 0),
+        startScrollTop:getCompletionScrollTop(scrollContainer),
+        scrollContainer,
+        moved:false
+      };
+    }
+
+    function moveCompletionTouchGesture(event){
+      const gesture = completionScrollGesture;
+      if(!gesture || gesture.touchIdentifier == null) return;
+      const touch = getTrackedCompletionTouch(event, gesture.touchIdentifier);
+      if(!touch) return;
+      gesture.moved = completionGestureMoved(gesture, touch.clientX, touch.clientY);
+    }
+
+    function endCompletionTouchGesture(event){
+      const gesture = completionScrollGesture;
+      if(!gesture || gesture.touchIdentifier == null) return;
+      const touch = getTrackedCompletionTouch(event, gesture.touchIdentifier);
+      if(!touch || completionGestureMoved(gesture, touch.clientX, touch.clientY)) rememberCompletionBlockedClick(gesture);
+      completionScrollGesture = null;
+    }
+
+    function cancelCompletionTouchGesture(){
+      if(!completionScrollGesture || completionScrollGesture.touchIdentifier == null) return;
+      rememberCompletionBlockedClick(completionScrollGesture);
+      completionScrollGesture = null;
+    }
+
+    if(window.PointerEvent){
+      document.addEventListener('pointerdown', startCompletionPointerGesture, true);
+      document.addEventListener('pointermove', moveCompletionPointerGesture, true);
+      document.addEventListener('pointerup', endCompletionPointerGesture, true);
+      document.addEventListener('pointercancel', cancelCompletionPointerGesture, true);
+    }else{
+      document.addEventListener('touchstart', startCompletionTouchGesture, true);
+      document.addEventListener('touchmove', moveCompletionTouchGesture, true);
+      document.addEventListener('touchend', endCompletionTouchGesture, true);
+      document.addEventListener('touchcancel', cancelCompletionTouchGesture, true);
+    }
+    document.addEventListener('click', handleCompletionGuardClick, true);
 
 
     function getOrderUserSearchButton(event){
@@ -42646,6 +43505,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       else if(action === 'check-order-completion-status'){
         handleCheckOrderCompletionStatus(btn.dataset.orderId);
+      }
+      else if(action === 'preview-historical-completion'){
+        runHistoricalCompletionPreview();
+      }
+      else if(action === 'run-historical-completion'){
+        runSelectedHistoricalCompletions();
       }
       else if(action === 'load-carryover-orders'){
         loadCarryoverOrderCandidates();
@@ -54009,7 +54874,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
                 console.error('Firestore 주문별 실시간 저장 실패:', error);
               })
             : Promise.resolve();
-          return Promise.all([liveOrderDocsSave, liveQueueSave, safetySave]).then(() => setDoc(ref, buildPayload(value)));
+          return Promise.all([liveOrderDocsSave, liveQueueSave, safetySave])
+            .then(() => setDoc(ref, buildPayload(value)))
+            .then(() => ({ key:'order', actualAggregateWriteCompleted:true, aggregateWriteCompletedAt:new Date().toISOString() }));
         }
         return setDoc(ref, buildPayload(value));
       });
@@ -54276,6 +55143,115 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return checked.filter(Boolean);
     }
 
+    const HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE = '2026-08-21';
+    const HISTORICAL_COMPLETION_FIRESTORE_PREVIEW_LIMIT = 100;
+
+    function requireHistoricalCompletionAdmin(){
+      const orderState = window.OrderModule && window.OrderModule.state;
+      const verified = !!(window.HaetsalAdminAuth
+        && typeof window.HaetsalAdminAuth.isVerified === 'function'
+        && window.HaetsalAdminAuth.isVerified());
+      if(!orderState || orderState.appRole !== 'ADMIN' || !verified){
+        throw new Error('최고 관리자 인증 후에만 2026-08-21 과거 주문을 확인할 수 있습니다.');
+      }
+    }
+
+    function getHistoricalCompletionActualValue(liveData, rawOrder, key, fallback){
+      if(liveData && Object.prototype.hasOwnProperty.call(liveData, key)) return liveData[key];
+      if(rawOrder && Object.prototype.hasOwnProperty.call(rawOrder, key)) return rawOrder[key];
+      return fallback;
+    }
+
+    async function readHistoricalCompletionCandidateBySnapshot(liveSnapshot){
+      if(!liveSnapshot || !liveSnapshot.exists()) return null;
+      const liveData = getPayloadData(liveSnapshot.data());
+      const rawOrder = liveData && liveData.order && typeof liveData.order === 'object' ? liveData.order : {};
+      const order = getOfficialLiveOrderFromData(liveSnapshot.data());
+      const orderId = String(order && order.id || liveData && liveData.orderId || '').trim();
+      if(!order || !orderId || String(rawOrder.businessDate || order.businessDate || '') !== HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE) return null;
+      const productionCycleValue = getHistoricalCompletionActualValue(liveData, rawOrder, 'productionCycle', null);
+      const productionCycle = Number(productionCycleValue);
+      const completionEventId = makeCompletionEventDocId(orderId, Number.isInteger(productionCycle) && productionCycle >= 1 ? productionCycle : 1);
+      const isDelivery = String(getHistoricalCompletionActualValue(liveData, rawOrder, 'deliveryType', order.deliveryType || '')).toUpperCase() === 'DELIVERY';
+      const refs = {
+        completionRequest:getCompletionRequestRef(completionEventId),
+        completionEvent:getCompletionEventRef(completionEventId),
+        revivedGuard:doc(revivedOrderGuardCollectionRef, makeRevivedOrderGuardDocId(orderId)),
+        closedGuard:doc(closedOrderGuardCollectionRef, makeClosedOrderGuardDocId(orderId)),
+        deliveryRecord:isDelivery ? getDeliveryRecordRef(orderId) : null
+      };
+      const [requestSnapshot, eventSnapshot, revivedSnapshot, closedSnapshot, deliverySnapshot] = await Promise.all([
+        getDocFromServer(refs.completionRequest),
+        getDocFromServer(refs.completionEvent),
+        getDocFromServer(refs.revivedGuard),
+        getDocFromServer(refs.closedGuard),
+        refs.deliveryRecord ? getDocFromServer(refs.deliveryRecord) : Promise.resolve(null)
+      ]);
+      const deliveryRecordExists = !!(deliverySnapshot && deliverySnapshot.exists());
+      return {
+        orderId,
+        liveOrderDocId:String(liveSnapshot.id || ''),
+        order:JSON.parse(JSON.stringify(order)),
+        actual:{
+          businessDate:String(rawOrder.businessDate || order.businessDate || ''),
+          status:String(getHistoricalCompletionActualValue(liveData, rawOrder, 'status', '')),
+          workStage:String(getHistoricalCompletionActualValue(liveData, rawOrder, 'workStage', '')),
+          isOpen:getHistoricalCompletionActualValue(liveData, rawOrder, 'isOpen', null),
+          isRevivedQuarantined:getHistoricalCompletionActualValue(liveData, rawOrder, 'isRevivedQuarantined', false) === true,
+          productionCycle:productionCycleValue,
+          statusRevision:getHistoricalCompletionActualValue(liveData, rawOrder, 'statusRevision', null),
+          stageRevision:getHistoricalCompletionActualValue(liveData, rawOrder, 'stageRevision', null),
+          completionCommitted:getHistoricalCompletionActualValue(liveData, rawOrder, 'completionCommitted', false) === true,
+          completionEventId:String(getHistoricalCompletionActualValue(liveData, rawOrder, 'completionEventId', '')),
+          productionCompleted:getHistoricalCompletionActualValue(liveData, rawOrder, 'productionCompleted', false) === true,
+          reason:String(liveData && liveData.reason || '')
+        },
+        completionRequestExists:requestSnapshot.exists(),
+        completionRequest:requestSnapshot.exists() ? getPayloadData(requestSnapshot.data()) : null,
+        completionEventExists:eventSnapshot.exists(),
+        completionEvent:eventSnapshot.exists() ? getPayloadData(eventSnapshot.data()) : null,
+        revivedGuardExists:revivedSnapshot.exists(),
+        revivedGuard:revivedSnapshot.exists() ? normalizeRevivedOrderGuardCloudPayload({ ...getPayloadData(revivedSnapshot.data()), guardId:String(revivedSnapshot.id || '') }) : null,
+        closedGuardExists:closedSnapshot.exists(),
+        closedGuard:closedSnapshot.exists() ? normalizeClosedOrderGuardCloudPayload({ ...getPayloadData(closedSnapshot.data()), guardId:String(closedSnapshot.id || '') }) : null,
+        deliveryRecordExists,
+        deliveryRecord:deliveryRecordExists ? normalizeDeliveryRecordCloudPayload(getPayloadData(deliverySnapshot.data())) : null
+      };
+    }
+
+    async function readHistoricalCompletionCandidateById(orderId){
+      requireHistoricalCompletionAdmin();
+      const id = String(orderId || '').trim();
+      if(!id) throw new Error('과거 주문 ID가 없습니다.');
+      return readHistoricalCompletionCandidateBySnapshot(await getDocFromServer(getLiveOrderRef(id)));
+    }
+
+    async function readHistoricalCompletionCandidatesByDate(dateKey){
+      requireHistoricalCompletionAdmin();
+      if(String(dateKey || '') !== HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE){
+        throw new Error('2026-08-21 주문만 확인할 수 있습니다.');
+      }
+      const snapshot = await getDocsFromServer(query(
+        liveOrderCollectionRef,
+        where(documentId(), '>=', liveOrderDocPrefix),
+        where(documentId(), '<', liveOrderDocPrefix + '\uf8ff'),
+        where('data.order.businessDate', '==', HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE),
+        limit(HISTORICAL_COMPLETION_FIRESTORE_PREVIEW_LIMIT)
+      ));
+      const rows = [];
+      for(let index = 0; index < snapshot.docs.length; index += 8){
+        const page = await Promise.all(snapshot.docs.slice(index, index + 8).map(readHistoricalCompletionCandidateBySnapshot));
+        rows.push(...page.filter(Boolean));
+      }
+      return {
+        dateKey:HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE,
+        rows,
+        scannedCount:snapshot.docs.length,
+        limit:HISTORICAL_COMPLETION_FIRESTORE_PREVIEW_LIMIT,
+        limitReached:snapshot.docs.length >= HISTORICAL_COMPLETION_FIRESTORE_PREVIEW_LIMIT
+      };
+    }
+
     function buildCarryoverOpenOrderQueryRef(businessDate, requestedLimit, startAfterDocId){
       const safeLimit = Math.max(1, Math.min(20, Number(requestedLimit || 20)));
       const cursor = String(startAfterDocId || '').trim();
@@ -54368,6 +55344,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     window.HaetsalCarryoverOrders = {
       readByDate:readCarryoverOrdersByDate,
       verifyOne:verifyCarryoverOrder
+    };
+
+    window.HaetsalHistoricalCompletion = {
+      readByDate:readHistoricalCompletionCandidatesByDate,
+      readOne:readHistoricalCompletionCandidateById
     };
 
     function syncOrderGuardVerifications(wanted){
