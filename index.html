@@ -21711,11 +21711,24 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       return '';
     }
 
+    function getActualOverdueTumblerSnapshot(userId){
+      const fallback = { dataReady:false, hasOverdue:false, overdueDays:0, earliestDueDate:'', rentedTumbler:'', overdueItems:[] };
+      try{
+        if(!(window.TumblerModule && typeof window.TumblerModule.getUserOverdueRentalSnapshot === 'function')) return fallback;
+        const snapshot = window.TumblerModule.getUserOverdueRentalSnapshot(userId);
+        return snapshot && typeof snapshot === 'object' ? snapshot : fallback;
+      }catch(error){
+        return fallback;
+      }
+    }
+
     function renderOverdueTumblerResponseBox(user){
       if(!user) return '';
-      const overdueDays = getOverdueDays(user.tumblerDueDate);
+      const actualSnapshot = getActualOverdueTumblerSnapshot(user.id);
+      if(!actualSnapshot.dataReady || !actualSnapshot.hasOverdue) return '';
+      const overdueDays = Math.max(0, Number(actualSnapshot.overdueDays || 0));
       if(overdueDays <= 0) return '';
-      const rentedLabel = user.rentedTumbler || '확인필요';
+      const rentedLabel = actualSnapshot.rentedTumbler || '확인필요';
       const currentAction = String(state.overdueTumblerAction || '');
       return `
         <div class="overdue-tumbler-response-box">
@@ -30623,9 +30636,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!couponBalancePrepared) return;
       const firstItem = orderItems[0] || createDefaultOrderItem();
       const orderIdentity = getNextSafeOrderIdentity(now, orderId);
-      const overdueDays = getOverdueDays(user.tumblerDueDate);
+      const actualOverdueSnapshot = getActualOverdueTumblerSnapshot(user.id);
+      if(!actualOverdueSnapshot.dataReady){
+        showMessage('텀블러 데이터를 아직 불러오지 못했습니다.');
+        return;
+      }
+      const overdueDays = actualOverdueSnapshot.hasOverdue
+        ? Math.max(0, Number(actualOverdueSnapshot.overdueDays || 0))
+        : 0;
       const overdueTumblerAction = overdueDays > 0 ? String(state.overdueTumblerAction || '').trim() : '';
       if(overdueDays > 0 && !proxyMode && !isValidOverdueTumblerAction(overdueTumblerAction)){
+        render();
         showMessage('대여기간을 초과한 텀블러 안내를 확인하고 버튼을 선택해주세요.');
         return;
       }
@@ -39237,11 +39258,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         <div class="help-note">목록은 Firestore 사용량 보호를 위해 실시간 구독 없이 최대 30건만 불러옵니다. 상세 항목은 신청서를 펼칠 때만 조회합니다.</div>
         ${state.milkSupportQueueError ? `<div class="notice"><div class="notice-text">${escapeHtml(state.milkSupportQueueError)}</div></div>` : ''}
         <div class="list-stack" style="margin-top:14px">${queue.length ? queue.map(row => `<div class="request-card"><div class="section-head"><div><b>${escapeHtml(row.userName || '')}</b> (${escapeHtml(row.userDept || '소속없음')})<div class="table-sub">신청번호 ${escapeHtml(row.requestId || '')} · ${Number(row.requestedTotal || 0)}개 · ${escapeHtml(row.status === 'RETURNED_TO_MANAGER' ? '관리자 재검토 요청' : row.status === 'PAYMENT_PENDING' ? '쿠폰 지급 대기' : '신청 검토 대기')}</div></div><button class="btn btn-outline" data-action="open-milk-support-request" data-request-id="${escapeHtml(row.requestId || '')}">${String(state.milkSupportActiveRequestId || '') === String(row.requestId || '') ? '열림' : '상세 확인'}</button></div></div>`).join('') : `<div class="center muted" style="padding:36px">처리할 우유 후원 신청이 없습니다.</div>`}</div>
-        ${request ? `<div class="main-card" style="margin-top:16px"><div class="section-head"><h3>${escapeHtml(request.userName || '')} 신청 상세</h3><span class="pill gray">${items.length}개 소비기한 그룹</span></div>${state.milkSupportDetailLoading ? `<div class="center muted">상세 항목을 불러오는 중입니다.</div>` : adminMode ? `
+        ${request ? `<div class="main-card" style="margin-top:16px"><div class="section-head"><h3>${escapeHtml(request.userName || '')} 신청 상세</h3><span class="pill gray">${items.length}개 소비기한 그룹</span></div>${state.milkSupportDetailLoading ? `<div class="center muted">상세 항목을 불러오는 중입니다.</div>` : adminMode ? (String(request.status || '') === 'PAYMENT_PENDING' ? `
           <div class="list-stack">${items.map(item => `<div class="request-card"><b>소비기한 ${escapeHtml(item.verifiedExpiryDate || item.expiryDate || '')}</b><div class="table-sub">${item.managerDecision === 'APPROVED' ? '승인' : '반려'} · 신청 ${Number(item.quantity || 0)}개 · 확인 ${Number(item.verifiedQuantity || 0)}개 · 승인 ${Number(item.approvedQuantity || 0)}개 · ${escapeHtml(item.eligibilityStatus || '')} · ${escapeHtml(item.eligibilityReason || '')}</div></div>`).join('')}</div>
           <div class="summary-box" style="position:sticky;bottom:0;z-index:2;margin-top:14px"><div class="summary-row"><div class="k">현재 잔여쿠폰</div><div class="v">${user ? Number(user.coupons || 0) : '확인 필요'}장</div></div><div class="summary-row"><div class="k">승인 지급 수량</div><div class="v">${Number(request.approvedTotal || approvedTotal)}장</div></div><div class="summary-row"><div class="k">지급 후 예상</div><div class="v">${user ? Number(user.coupons || 0) + Number(request.approvedTotal || approvedTotal) : '확인 필요'}장</div></div></div>
           <div class="field"><label>매니저 재검토 요청 사유</label><textarea id="milkSupportAdminReturnReason" class="textarea">${escapeHtml(state.milkSupportAdminReturnReason || '')}</textarea></div><div class="modal-actions"><button class="btn btn-outline" data-action="return-milk-support-manager" ${state.milkSupportActionBusy ? 'disabled' : ''}>매니저 재검토 요청</button><button class="btn btn-emerald" data-action="pay-milk-support" ${state.milkSupportActionBusy ? 'disabled' : ''}>쿠폰 ${Number(request.approvedTotal || approvedTotal)}장 최종 지급</button></div>
-        ` : `
+        ` : `<div class="list-stack">${items.map(item => `<div class="request-card"><div class="table-sub">신청 원본 · 소비기한 ${escapeHtml(item.expiryDate || '')} · ${Number(item.quantity || 0)}개</div></div>`).join('')}</div>`) : `
           <div class="field"><label>실제 수령일</label><input id="milkSupportReceivedDate" class="input" type="date" value="${escapeHtml(state.milkSupportReceivedDate || '')}"></div>
           <div class="list-stack">${items.map((item,index) => { const eligibility=getMilkSupportEligibility(state.milkSupportReceivedDate,item.verifiedExpiryDate, item.approvedQuantity); return `<div class="request-card"><div class="table-sub">신청 원본 · 소비기한 ${escapeHtml(item.expiryDate || '')} · ${Number(item.quantity || 0)}개</div><div class="row"><div class="field"><label>확인 소비기한</label><input class="input" type="date" data-milk-review-field="verifiedExpiryDate" data-index="${index}" value="${escapeHtml(item.verifiedExpiryDate || '')}"></div><div class="field"><label>확인 수량</label><input class="input" type="number" min="1" data-milk-review-field="verifiedQuantity" data-index="${index}" value="${Number(item.verifiedQuantity || 0)}"></div><div class="field"><label>검토 결과</label><select class="select" data-milk-review-field="managerDecision" data-index="${index}"><option value="APPROVED" ${item.managerDecision === 'APPROVED' ? 'selected' : ''}>승인</option><option value="REJECTED" ${item.managerDecision === 'REJECTED' ? 'selected' : ''}>반려</option></select></div><div class="field"><label>승인 수량</label><input class="input" type="number" min="0" data-milk-review-field="approvedQuantity" data-index="${index}" value="${Number(item.approvedQuantity || 0)}"></div></div><div class="table-sub">쿠폰 지급 적격성: ${escapeHtml(eligibility.status)} · ${escapeHtml(eligibility.reason)} · 사용 가능 운영일 ${eligibility.operatingDays}일</div></div>`; }).join('')}</div>
           <div class="field"><label>검토 메모</label><textarea id="milkSupportReviewNote" class="textarea">${escapeHtml(state.milkSupportReviewNote || '')}</textarea></div><div class="summary-box" style="position:sticky;bottom:0;z-index:2"><div class="summary-row"><div class="k">최종 승인 수량</div><div class="v">${approvedTotal}개</div></div><div class="summary-row"><div class="k">관리자 지급 대기 쿠폰</div><div class="v">${approvedTotal}장</div></div><button class="btn btn-emerald" style="width:100%;margin-top:10px" data-action="finalize-milk-support-review" ${state.milkSupportActionBusy ? 'disabled' : ''}>검토 완료 후 관리자 지급 대기로 저장</button></div>
@@ -45717,6 +45738,39 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       .sort((a,b) => new Date(a.dueDate || 0) - new Date(b.dueDate || 0));
   }
 
+  function getUserOverdueRentalSnapshot(userId){
+    const syncStatus = window.HaetsalCloudStore && typeof window.HaetsalCloudStore.getSyncStatus === 'function'
+      ? window.HaetsalCloudStore.getSyncStatus('tumbler')
+      : null;
+    const cachedData = window.HaetsalCloudStore && typeof window.HaetsalCloudStore.getTumblerData === 'function'
+      ? window.HaetsalCloudStore.getTumblerData(function(){ return null; })
+      : null;
+    const dataReady = !!(syncStatus && syncStatus.phase === 'synced' && cachedData && Array.isArray(cachedData.tumblers) && tState.data && Array.isArray(tState.data.tumblers));
+    if(!dataReady){
+      return { dataReady:false, hasOverdue:false, overdueDays:0, earliestDueDate:'', rentedTumbler:'', overdueItems:[] };
+    }
+    const targetId = String(userId || '');
+    const overdueItems = getUserOverdueRentalItems(targetId);
+    const rentedItems = tumblerList().filter(item => item && item.status === 'rented' && String(item.currentUserId || '') === targetId);
+    const earliestDueDate = overdueItems.length ? String(overdueItems[0].dueDate || '') : '';
+    return {
+      dataReady:true,
+      hasOverdue:overdueItems.length > 0,
+      overdueDays:earliestDueDate ? getDiffDays(earliestDueDate) : 0,
+      earliestDueDate,
+      rentedTumbler:rentedItems.map(item => getCancelCheckLabel(item)).filter(Boolean).join(', '),
+      overdueItems:overdueItems.map(item => ({
+        id:String(item.id || ''),
+        status:'rented',
+        currentUserId:String(item.currentUserId || ''),
+        dueDate:String(item.dueDate || ''),
+        type:String(item.type || ''),
+        number:item.number,
+        label:getCancelCheckLabel(item)
+      }))
+    };
+  }
+
   function recordOverdueOrderResponse(payload){
     const userId = String((payload && payload.userId) || '');
     const action = String((payload && payload.action) || '');
@@ -48176,6 +48230,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     reserveSingleRentOrderTumbler,
     releaseReservedRentOrder,
     completeReservedRentOrder,
+    getUserOverdueRentalSnapshot,
     markRentOrderCancellationForCheck,
     resolveRentOrderCancellationCheck,
     recordOverdueOrderResponse,
@@ -54462,7 +54517,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     await firebaseReadyPromise;
     const adminMode = String(role || '').toUpperCase() === 'ADMIN';
     if(adminMode) await assertMilkSupportAdmin(); else await assertMilkSupportManager();
-    const statuses = adminMode ? ['PAYMENT_PENDING'] : ['SUBMITTED','RETURNED_TO_MANAGER'];
+    const statuses = adminMode ? ['SUBMITTED','RETURNED_TO_MANAGER','PAYMENT_PENDING'] : ['SUBMITTED','RETURNED_TO_MANAGER'];
     const snapshots = [await getDocsFromServer(query(milkSupportCollectionRef, where('status','in',statuses), limit(30)))];
     const rows = [];
     snapshots.forEach(snapshot => snapshot.forEach(docSnap => { const row=normalizeMilkSupportSnapshot(docSnap); if(row) rows.push(row); }));
