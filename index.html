@@ -39247,6 +39247,23 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.milkSupportActionBusy = false; render();
     }
 
+    async function voidMilkSupportDuplicate(requestIdValue){
+      if(state.milkSupportActionBusy || state.appRole !== 'ADMIN') return;
+      const requestId = String(requestIdValue || '').trim();
+      const request = (Array.isArray(state.milkSupportQueue) ? state.milkSupportQueue : []).find(item => String(item && item.requestId || '') === requestId);
+      if(!request || String(request.status || '') !== 'SUBMITTED') return;
+      if(!window.confirm('중복 무효화')) return;
+      const cloud = window.HaetsalMilkSupportCloud;
+      if(!(cloud && typeof cloud.adminVoidDuplicate === 'function')) return;
+      state.milkSupportActionBusy = true; render();
+      try{
+        await cloud.adminVoidDuplicate(requestId);
+        state.milkSupportActiveRequestId = ''; state.milkSupportActiveItems = [];
+        await loadMilkSupportQueue();
+      }catch(error){ showMessage(error && error.message ? error.message : '이미 처리된 신청서입니다. 목록을 새로고침해주세요.'); }
+      state.milkSupportActionBusy = false; render();
+    }
+
     function renderMilkSupportDashboardSection(){
       const adminMode = state.appRole === 'ADMIN';
       const queue = Array.isArray(state.milkSupportQueue) ? state.milkSupportQueue : [];
@@ -39262,7 +39279,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           <div class="list-stack">${items.map(item => `<div class="request-card"><b>소비기한 ${escapeHtml(item.verifiedExpiryDate || item.expiryDate || '')}</b><div class="table-sub">${item.managerDecision === 'APPROVED' ? '승인' : '반려'} · 신청 ${Number(item.quantity || 0)}개 · 확인 ${Number(item.verifiedQuantity || 0)}개 · 승인 ${Number(item.approvedQuantity || 0)}개 · ${escapeHtml(item.eligibilityStatus || '')} · ${escapeHtml(item.eligibilityReason || '')}</div></div>`).join('')}</div>
           <div class="summary-box" style="position:sticky;bottom:0;z-index:2;margin-top:14px"><div class="summary-row"><div class="k">현재 잔여쿠폰</div><div class="v">${user ? Number(user.coupons || 0) : '확인 필요'}장</div></div><div class="summary-row"><div class="k">승인 지급 수량</div><div class="v">${Number(request.approvedTotal || approvedTotal)}장</div></div><div class="summary-row"><div class="k">지급 후 예상</div><div class="v">${user ? Number(user.coupons || 0) + Number(request.approvedTotal || approvedTotal) : '확인 필요'}장</div></div></div>
           <div class="field"><label>매니저 재검토 요청 사유</label><textarea id="milkSupportAdminReturnReason" class="textarea">${escapeHtml(state.milkSupportAdminReturnReason || '')}</textarea></div><div class="modal-actions"><button class="btn btn-outline" data-action="return-milk-support-manager" ${state.milkSupportActionBusy ? 'disabled' : ''}>매니저 재검토 요청</button><button class="btn btn-emerald" data-action="pay-milk-support" ${state.milkSupportActionBusy ? 'disabled' : ''}>쿠폰 ${Number(request.approvedTotal || approvedTotal)}장 최종 지급</button></div>
-        ` : `<div class="list-stack">${items.map(item => `<div class="request-card"><div class="table-sub">신청 원본 · 소비기한 ${escapeHtml(item.expiryDate || '')} · ${Number(item.quantity || 0)}개</div></div>`).join('')}</div>`) : `
+        ` : `<div class="list-stack">${items.map(item => `<div class="request-card"><div class="table-sub">신청 원본 · 소비기한 ${escapeHtml(item.expiryDate || '')} · ${Number(item.quantity || 0)}개</div></div>`).join('')}</div>${String(request.status || '') === 'SUBMITTED' ? `<div class="modal-actions"><button class="btn btn-outline" data-action="void-milk-support-duplicate" data-request-id="${escapeHtml(request.requestId || '')}" ${state.milkSupportActionBusy ? 'disabled' : ''}>중복 무효화</button></div>` : ''}`) : `
           <div class="field"><label>실제 수령일</label><input id="milkSupportReceivedDate" class="input" type="date" value="${escapeHtml(state.milkSupportReceivedDate || '')}"></div>
           <div class="list-stack">${items.map((item,index) => { const eligibility=getMilkSupportEligibility(state.milkSupportReceivedDate,item.verifiedExpiryDate, item.approvedQuantity); return `<div class="request-card"><div class="table-sub">신청 원본 · 소비기한 ${escapeHtml(item.expiryDate || '')} · ${Number(item.quantity || 0)}개</div><div class="row"><div class="field"><label>확인 소비기한</label><input class="input" type="date" data-milk-review-field="verifiedExpiryDate" data-index="${index}" value="${escapeHtml(item.verifiedExpiryDate || '')}"></div><div class="field"><label>확인 수량</label><input class="input" type="number" min="1" data-milk-review-field="verifiedQuantity" data-index="${index}" value="${Number(item.verifiedQuantity || 0)}"></div><div class="field"><label>검토 결과</label><select class="select" data-milk-review-field="managerDecision" data-index="${index}"><option value="APPROVED" ${item.managerDecision === 'APPROVED' ? 'selected' : ''}>승인</option><option value="REJECTED" ${item.managerDecision === 'REJECTED' ? 'selected' : ''}>반려</option></select></div><div class="field"><label>승인 수량</label><input class="input" type="number" min="0" data-milk-review-field="approvedQuantity" data-index="${index}" value="${Number(item.approvedQuantity || 0)}"></div></div><div class="table-sub">쿠폰 지급 적격성: ${escapeHtml(eligibility.status)} · ${escapeHtml(eligibility.reason)} · 사용 가능 운영일 ${eligibility.operatingDays}일</div></div>`; }).join('')}</div>
           <div class="field"><label>검토 메모</label><textarea id="milkSupportReviewNote" class="textarea">${escapeHtml(state.milkSupportReviewNote || '')}</textarea></div><div class="summary-box" style="position:sticky;bottom:0;z-index:2"><div class="summary-row"><div class="k">최종 승인 수량</div><div class="v">${approvedTotal}개</div></div><div class="summary-row"><div class="k">관리자 지급 대기 쿠폰</div><div class="v">${approvedTotal}장</div></div><button class="btn btn-emerald" style="width:100%;margin-top:10px" data-action="finalize-milk-support-review" ${state.milkSupportActionBusy ? 'disabled' : ''}>검토 완료 후 관리자 지급 대기로 저장</button></div>
@@ -42509,6 +42526,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       else if(action === 'return-milk-support-manager'){
         returnMilkSupportToManager();
+      }
+      else if(action === 'void-milk-support-duplicate'){
+        voidMilkSupportDuplicate(btn.dataset.requestId);
       }
       else if(action === 'open-pos-keyboard'){
         openPosKeyboard(btn.dataset.targetId);
@@ -54621,6 +54641,47 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     });
   }
 
+  async function voidMilkSupportRequestAsDuplicate(requestIdValue){
+    await firebaseReadyPromise;
+    await assertMilkSupportAdmin();
+    const requestId = String(requestIdValue || '').trim();
+    if(!requestId) throw new Error('우유 후원 신청서를 찾을 수 없습니다.');
+    const requestRef = doc(db, 'haetsalMilkSupportRequests', requestId);
+    const eventId = 'admin_void_duplicate';
+    const eventRef = doc(db, 'haetsalMilkSupportRequests', requestId, 'events', eventId);
+    const now = new Date().toISOString();
+    return runTransaction(db, async transaction => {
+      const requestSnap = await transaction.get(requestRef);
+      const eventSnap = await transaction.get(eventRef);
+      if(!requestSnap.exists()) throw new Error('우유 후원 신청서를 찾을 수 없습니다.');
+      const requestData = requestSnap.data() || {};
+      const eventData = eventSnap.exists() ? eventSnap.data() || {} : null;
+      const alreadyVoided = String(requestData.status || '') === 'VOIDED'
+        && !!eventData
+        && String(eventData.eventId || '') === eventId
+        && String(eventData.requestId || '') === requestId
+        && String(eventData.type || '') === 'VOIDED_AS_DUPLICATE'
+        && String(eventData.fromStatus || '') === 'SUBMITTED'
+        && String(eventData.toStatus || '') === 'VOIDED'
+        && String(eventData.reason || '') === 'DUPLICATE';
+      if(alreadyVoided) return { ok:true, requestId, status:'VOIDED', idempotent:true };
+      if(String(requestData.status || '') !== 'SUBMITTED' || eventSnap.exists()) throw new Error('이미 처리된 신청서입니다. 목록을 새로고침해주세요.');
+      transaction.update(requestRef, { status:'VOIDED' });
+      transaction.set(eventRef, {
+        eventId,
+        requestId,
+        type:'VOIDED_AS_DUPLICATE',
+        fromStatus:'SUBMITTED',
+        toStatus:'VOIDED',
+        reason:'DUPLICATE',
+        actorUid:String(auth.currentUser && auth.currentUser.uid || ''),
+        createdAtClient:now,
+        serverCreatedAt:serverTimestamp()
+      });
+      return { ok:true, requestId, status:'VOIDED', idempotent:false };
+    });
+  }
+
   async function payMilkSupportRequest(requestIdValue){
     await firebaseReadyPromise;
     await assertMilkSupportAdmin();
@@ -54704,6 +54765,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     readItems:readMilkSupportItems,
     managerFinalize:finalizeMilkSupportReview,
     adminReturn:returnMilkSupportRequest,
+    adminVoidDuplicate:voidMilkSupportRequestAsDuplicate,
     adminPay:payMilkSupportRequest
   };
 
