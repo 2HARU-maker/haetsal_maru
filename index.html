@@ -12954,6 +12954,7 @@ window.HaetsalSharedStore = (function(){
     let completedFollowupRetryRunnerPromise = null;
     let completedFollowupRetryTimer = null;
     let orderStageTransitionRetryRunnerPromise = null;
+    let addUserSaveInFlight = false;
     const ORDER_CANCELLED_FOLLOWUP_QUEUE_LOCAL_KEY = 'haetsalmaru_order_cancelled_followup_queue_v1';
     const ORDER_CANCELLED_FOLLOWUP_QUEUE_MAX_COUNT = 500;
     const ORDER_IMPORTANT_FULL_BACKUP_QUEUE_LOCAL_KEY = 'haetsalmaru_order_important_full_backup_queue_v1';
@@ -13584,6 +13585,7 @@ window.HaetsalSharedStore = (function(){
         userPwInput: '',
         dashboardTab: 'ORDERS',
         adminUserSearch: '',
+        adminUserFilter: 'ALL',
         adminUsersSectionMode: 'MANAGEMENT',
         adminCouponRecalcSearch: '',
         adminCouponRecalcFilter: 'ALL',
@@ -13739,6 +13741,7 @@ window.HaetsalSharedStore = (function(){
         editingOrderId: null,
         editOrderData: { quantity:1, cupType:'TUMBLER', deliveryType:'PICKUP', deliveryLocation:'', tumblerInfo:'', memo:'', items:[], editStartedByUser:false },
         editOrderInitialSnapshot: '',
+        editOrderBaseVersion: { editedAt:'', statusRevision:1, stageRevision:1 },
         editOrderOperationId: '',
         editOrderOperationStartedAt: '',
         editOrderSaveInFlight: false,
@@ -15220,7 +15223,8 @@ window.HaetsalSharedStore = (function(){
       if(!cloud || typeof cloud.saveRecord !== 'function') throw new Error('앱 미사용일 차감 전용 저장소를 사용할 수 없습니다.');
       const savedResult = await cloud.saveRecord(normalized, {
         reason:String(triggerReason || 'offline-coupon-use'),
-        couponMutations:Array.isArray(couponMutations) ? couponMutations : []
+        couponMutations:Array.isArray(couponMutations) ? couponMutations : [],
+        atomicCouponEvent:String(triggerReason || '') === 'offline-coupon-use-create'
       });
       if(savedResult && Array.isArray(savedResult.users)){
         savedResult.users.forEach(serverUser => {
@@ -19003,7 +19007,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       if(currentDayLiveOrderAuthority.hiddenIds.has(id)) return false;
       currentDayLiveOrderAuthority.ids.delete(id);
       currentDayLiveOrderAuthority.hiddenIds.add(id);
-      if(isDashboardView()) renderAfterRemoteOrderSync('완료 주문 실시간 숨김 반영');
+      if(isDashboardView()) renderAfterRemoteOrderSync('완료 주문 실시간 숨김 반영', { orderEditUrgentIds:[id] });
       return true;
     }
 
@@ -20739,8 +20743,73 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       return { added:0, updated:1, count:1, order:merged, sourceLabel };
     }
 
-    function receiveOrderLiveDocuments(values, sourceLabel='주문별 제작대기 저장소'){
+    function getRemoteOrderLifecycleAdvancement(localOrder, remoteOrder){
+      if(!localOrder || !remoteOrder) return null;
+      const localId = String(localOrder.id || '').trim();
+      const remoteId = String(remoteOrder.id || '').trim();
+      if(!localId || localId !== remoteId) return null;
+      if(shouldRejectOpenOrderByClosedLiveGuard(remoteOrder)) return null;
+      const localStageRevision = normalizeOrderStageRevision(localOrder.stageRevision);
+      const remoteStageRevision = normalizeOrderStageRevision(remoteOrder.stageRevision);
+      const localStatusRevision = normalizeOrderStatusRevision(localOrder.statusRevision);
+      const remoteStatusRevision = normalizeOrderStatusRevision(remoteOrder.statusRevision);
+      const localProductionCycle = normalizeOrderProductionCycle(localOrder.productionCycle);
+      const remoteProductionCycle = normalizeOrderProductionCycle(remoteOrder.productionCycle);
+      const revisionAdvanced = remoteStageRevision > localStageRevision
+        || remoteStatusRevision > localStatusRevision
+        || remoteProductionCycle > localProductionCycle;
+      if(!revisionAdvanced) return null;
+      const localStatus = getNormalizedOrderStatus(localOrder);
+      const remoteStatus = getNormalizedOrderStatus(remoteOrder);
+      const localStage = getOrderWorkStage(localOrder);
+      const remoteStage = getOrderWorkStage(remoteOrder);
+      const lifecycleChanged = localStatus !== remoteStatus
+        || localStage !== remoteStage
+        || isOrderOpenStatus(localOrder) !== isOrderOpenStatus(remoteOrder)
+        || (localOrder.productionCompleted === true) !== (remoteOrder.productionCompleted === true)
+        || (localOrder.completionCommitted === true) !== (remoteOrder.completionCommitted === true);
+      if(!lifecycleChanged) return null;
+      const localTimestamp = getOrderLiveQueueTimestamp(localOrder);
+      const remoteTimestamp = getOrderLiveQueueTimestamp(remoteOrder);
+      if(isOrderOpenStatus(remoteOrder) && remoteTimestamp && localTimestamp && remoteTimestamp < localTimestamp) return null;
+      return {
+        orderId:remoteId,
+        localStageRevision,
+        remoteStageRevision,
+        localStatusRevision,
+        remoteStatusRevision,
+        localProductionCycle,
+        remoteProductionCycle,
+        localStatus,
+        remoteStatus,
+        localStage,
+        remoteStage
+      };
+    }
+
+    function prepareRemoteOrderLifecycleScrollPreservation(values, sourceLabel, options){
+      const opts = options || {};
+      if(opts.remoteSnapshot !== true || opts.initialSnapshot === true || opts.hasPendingWrites === true) return [];
       const rows = Array.isArray(values) ? values : [values];
+      const transitions = rows.map(value => {
+        const remoteOrder = getOrderFromLiveDocument(value);
+        if(!remoteOrder || !Array.isArray(state.orders)) return null;
+        const orderId = String(remoteOrder.id || '').trim();
+        const localOrder = state.orders.find(order => String((order && order.id) || '').trim() === orderId);
+        return getRemoteOrderLifecycleAdvancement(localOrder, remoteOrder);
+      }).filter(Boolean);
+      if(transitions.length && !getActiveOrderLifecycleScrollSnapshot()){
+        beginOrderLifecycleScrollPreservation(
+          `remote-order-lifecycle:${String(sourceLabel || 'live-document-sync')}:${transitions.map(item => item.orderId).join(',')}`,
+          getRemoteLifecycleScrollFallback()
+        );
+      }
+      return transitions;
+    }
+
+    function receiveOrderLiveDocuments(values, sourceLabel='주문별 제작대기 저장소', options){
+      const rows = Array.isArray(values) ? values : [values];
+      const remoteLifecycleTransitions = prepareRemoteOrderLifecycleScrollPreservation(rows, sourceLabel, options);
       let added = 0;
       let updated = 0;
       rows.forEach(value => {
@@ -20759,9 +20828,11 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         persistOrderEmergencyBackup('merge-live-documents');
         persistOrderLiveQueueLocal('merge-live-documents');
         applyVerifiedCouponBalancesToStateUsers('live-document-sync');
-        renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync');
+        renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
+          orderEditUrgentIds:remoteLifecycleTransitions.map(item => String(item && item.orderId || '')).filter(Boolean)
+        });
       }
-      return { added, updated, count, sourceLabel };
+      return { added, updated, count, sourceLabel, remoteLifecycleCount:remoteLifecycleTransitions.length };
     }
 
     function mergeLocalLiveQueueIntoData(data){
@@ -21188,6 +21259,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
     function saveData(options){
       const opts = options || {};
       const reason = String(opts.reason || 'saveData');
+      const skipLiveOrderPersistence = opts.skipLiveOrderPersistence === true;
+      const saveLiveOrdersForCurrentSave = (sourceData, liveReason) => skipLiveOrderPersistence
+        ? Promise.resolve({ skipped:true, reason:'lifecycle-live-order-persistence-skipped' })
+        : saveLiveOrderDocumentsFromData(sourceData, liveReason);
       if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('order-saveData-' + reason)){
         state.saveState = 'error';
         state.saveStateText = '장시간 미사용으로 저장 정지';
@@ -21253,7 +21328,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         persistOrderEmergencyBackup(reason);
         persistOrderLiveQueueLocal(reason);
         if(menuCatalogProtection.blockFullBackup){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-menu-catalog-protected-live-only');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-menu-catalog-protected-live-only');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 보류';
           refreshOrderSaveStatusChips();
@@ -21270,7 +21345,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         const signature = getOrderDataSaveSignature(fullBackupData);
 
         if(!fullBackupAllowed){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-only');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-only');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 보류';
           refreshOrderSaveStatusChips();
@@ -21278,7 +21353,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
 
         if(!forceFullBackup && signature && signature === lastOrderFullBackupSavedSignature){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-check');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-check');
           clearImportantFullBackupPending();
           state.saveState = 'saved';
           state.saveStateText = '전체 백업 변경 없음';
@@ -21287,7 +21362,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
 
         if(!forceFullBackup && orderFullBackupSaveInFlight && signature && signature === lastOrderFullBackupAttemptSignature){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-during-full-save');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-during-full-save');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 중';
           refreshOrderSaveStatusChips();
@@ -21295,7 +21370,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
 
         if(!forceFullBackup && orderFullBackupSaveInFlight){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-during-full-save-queued');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-during-full-save-queued');
           scheduleDeferredOrderFullBackupSave(reason + '-queued-after-full-save');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 중';
@@ -21304,7 +21379,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
 
         if(!forceFullBackup && isOrderFullBackupCooldownActive()){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-cooldown');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-cooldown');
           lastOrderFullBackupSkippedAt = Date.now();
           state.saveState = 'pending';
           state.saveStateText = `전체 백업 저장 지연 ${getOrderFullBackupCooldownSeconds()}초`;
@@ -21313,7 +21388,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         }
 
         if(window.HaetsalCloudStore && window.HaetsalCloudStore.saveOrderData){
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-before-light-full-backup');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-before-light-full-backup');
           orderFullBackupSaveInFlight = true;
           lastOrderFullBackupAttemptSignature = signature;
           state.saveState = 'pending';
@@ -21331,7 +21406,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           }
           window.HaetsalCloudStore.saveOrderData(fullBackupData);
         }else{
-          saveLiveOrderDocumentsFromData(normalizedForSave, reason + '-live-no-cloud');
+          saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-no-cloud');
           orderFullBackupSaveInFlight = false;
           lastOrderFullBackupSavedSignature = signature;
           clearImportantFullBackupPending();
@@ -25328,6 +25403,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       state.editingOrderId = null;
       state.editOrderData = { quantity:1, cupType:'TUMBLER', deliveryType:'PICKUP', deliveryLocation:'', tumblerInfo:'', memo:'', items:[], editStartedByUser:false };
       state.editOrderInitialSnapshot = '';
+      state.editOrderBaseVersion = { editedAt:'', statusRevision:1, stageRevision:1 };
       state.editOrderOperationId = '';
       state.editOrderOperationStartedAt = '';
       state.editOrderSaveInFlight = false;
@@ -25449,8 +25525,25 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       });
     }
 
+    function getAdminRechargeNeededUsers(){
+      return getSafeUsers()
+        .filter(user => {
+          const coupons = Number(user && user.coupons);
+          return Number.isFinite(coupons) && coupons <= -5;
+        })
+        .sort((a, b) => {
+          const couponDiff = Number(a.coupons) - Number(b.coupons);
+          if(couponDiff !== 0) return couponDiff;
+          const nameDiff = String(a.name || '').localeCompare(String(b.name || ''), 'ko');
+          if(nameDiff !== 0) return nameDiff;
+          return String(a.dept || a.department || '').localeCompare(String(b.dept || b.department || ''), 'ko');
+        });
+    }
+
     function getAdminUsersForDisplay(){
-      const users = getSafeUsers();
+      const users = state.adminUserFilter === 'RECHARGE_NEEDED'
+        ? getAdminRechargeNeededUsers()
+        : getSafeUsers();
       const term = String(state.adminUserSearch || '').trim().toLowerCase();
 
       if(!term) return users;
@@ -30236,6 +30329,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const approvedCount = getRegistrationRequestsByStatus('APPROVED').length;
         const rejectedCount = getRegistrationRequestsByStatus('REJECTED').length;
         const pendingCount = getRegistrationRequestsByStatus('PENDING').length;
+        const rechargeNeededCount = getAdminRechargeNeededUsers().length;
         const sectionTabs = `<div class="coupon-recalc-work-tabs"><button class="btn btn-outline ${state.adminUsersSectionMode === 'MANAGEMENT' ? 'active' : ''}" data-action="set-admin-users-section-mode" data-value="MANAGEMENT">사용자 관리</button><button class="btn btn-outline ${state.adminUsersSectionMode === 'RECALC' ? 'active' : ''}" data-action="set-admin-users-section-mode" data-value="RECALC">잔여쿠폰 재계산 점검</button></div>`;
         if(state.adminUsersSectionMode === 'RECALC') return sectionTabs + renderAdminCouponRecalcWorkSection();
 
@@ -30272,6 +30366,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
                 <button class="btn btn-rose" data-action="open-coupon-restore">🧯 쿠폰 복구 점검</button>
                 <button class="btn btn-outline" data-action="open-coupon-usage-download">쿠폰 사용기록 다운로드</button>
               </div>
+            </div>
+            <div class="coupon-recalc-work-tabs">
+              <button class="btn btn-outline ${state.adminUserFilter === 'ALL' ? 'active' : ''}" data-action="set-admin-user-filter" data-value="ALL">전체 사용자</button>
+              <button class="btn btn-outline ${state.adminUserFilter === 'RECHARGE_NEEDED' ? 'active' : ''}" data-action="set-admin-user-filter" data-value="RECHARGE_NEEDED">쿠폰 충전 필요 ${rechargeNeededCount}명</button>
             </div>
             <div style="max-width:320px;margin-bottom:14px">
               <input id="adminUserSearch" class="input" type="text" placeholder="이름 또는 부서로 검색" value="${escapeHtml(state.adminUserSearch)}">
@@ -31296,7 +31394,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             const queueItem = readCompletedFollowupQueueLocal().find(item => item && item.orderId === order.id);
             if(queueItem && queueItem.liveSaved === true) removeCompletedFollowupSave(order.id);
             refreshArchivedCompletedOrdersAfterConfirmedSave(order);
-            saveData({ reason:'order-completed-document-confirmed', allowFullBackup:false });
+            saveData({ reason:'order-completed-document-confirmed', allowFullBackup:false, skipLiveOrderPersistence:true });
           }else{
             const resultError = result && result.error;
             if(isFirestorePermissionDeniedError(resultError)){
@@ -31326,9 +31424,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(result && result.order && isOrderClosedStatus(result.order)){
         const appliedOrder = applyCompletedTransactionOrderToState(result.order, sourceLabel || 'order-completed-verified');
         saveCompletedDocumentAfterConfirmedCompletion(appliedOrder, sourceLabel || 'order-completed-verified');
-        saveData({ reason:'order-completed-transaction-confirmed', allowFullBackup:false });
+        saveData({ reason:'order-completed-transaction-confirmed', allowFullBackup:false, skipLiveOrderPersistence:true });
       }
-      render();
+      requestOrderLifecycleRender();
       return result;
     }
 
@@ -31380,7 +31478,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const detail = String((processingSaveResult.error && (processingSaveResult.error.code || processingSaveResult.error.message)) || 'completion-request-save-pending');
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:detail });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '동기화 대기 중');
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return { status:'pending', error:processingSaveResult.error };
         }
         if(window.HaetsalLiveOrderDocs && typeof window.HaetsalLiveOrderDocs.claimCompletionRequest === 'function'){
@@ -31392,7 +31490,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           if(claimResult && claimResult.status === 'processing-by-other'){
             updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'processing-by-other' });
             markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '다른 매니저 기기에서 완료 반영 확인 중');
-            if(!opts.silent) render();
+            if(!opts.silent) requestOrderLifecycleRender();
             return claimResult;
           }
           if(!(claimResult && (claimResult.ok || claimResult.status === 'already-completed'))){
@@ -31413,7 +31511,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(resultStatus === 'processing-by-other'){
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'processing-by-other' });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '다른 매니저 기기에서 완료 반영 확인 중');
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return result;
         }
         if(resultStatus === 'missing-request'){
@@ -31426,7 +31524,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             const detail = String((retrySaveResult.error && (retrySaveResult.error.code || retrySaveResult.error.message)) || 'completion-request-save-pending');
             updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:detail });
             markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '동기화 대기 중');
-            if(!opts.silent) render();
+            if(!opts.silent) requestOrderLifecycleRender();
             return { status:'pending', error:retrySaveResult.error };
           }
           result = await window.HaetsalLiveOrderDocs.completeOrder(completionPayload);
@@ -31443,7 +31541,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(isFirestoreQuotaRetryBlocked()){
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'resource-exhausted' });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '동기화 대기 중');
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return { status:'pending', quotaExceeded:true, verification:verified };
         }
 
@@ -31465,7 +31563,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           saveCompletionRequestCloudState(activeRequest, 'NEEDS_CHECK', detail).catch(error => {
             console.warn('completion request needs-check cloud save failed', error);
           });
-          render();
+          requestOrderLifecycleRender();
           return verified || result;
         }
 
@@ -31475,7 +31573,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         saveCompletionRequestCloudState(activeRequest, 'PENDING', detail).catch(error => {
           console.warn('completion request pending cloud save failed', error);
         });
-        if(!opts.silent) render();
+        if(!opts.silent) requestOrderLifecycleRender();
         return result || verified || { status:'pending' };
       }catch(error){
         await saveOrderLifecycleAttemptSafely({
@@ -31493,7 +31591,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const errorText = String((error && (error.code || error.message)) || error || 'resource-exhausted');
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:errorText });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '동기화 대기 중');
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return { status:'pending', quotaExceeded:true, error };
         }
         const caughtRetryable = isCompletionRetryableError(error);
@@ -31504,7 +31602,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           saveCompletionRequestCloudState(activeRequest, 'NEEDS_CHECK', errorText).catch(cloudError => {
             console.warn('completion request non-retryable state cloud save failed', cloudError);
           });
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return { status:'needs-check', needsCheck:true, error };
         }
         const verified = await verifyCompletionRequestServerState(activeRequest);
@@ -31514,7 +31612,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(isFirestoreQuotaRetryBlocked()){
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'resource-exhausted' });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '동기화 대기 중');
-          if(!opts.silent) render();
+          if(!opts.silent) requestOrderLifecycleRender();
           return { status:'pending', quotaExceeded:true, error, verification:verified };
         }
         const retryable = caughtRetryable && !(verified && verified.needsCheck);
@@ -31529,7 +31627,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         saveCompletionRequestCloudState(activeRequest, retryable ? 'PENDING' : 'NEEDS_CHECK', detail).catch(cloudError => {
           console.warn('completion request failure state cloud save failed', cloudError);
         });
-        if(!opts.silent) render();
+        if(!opts.silent) requestOrderLifecycleRender();
         return { status:nextStatus, needsCheck:!retryable, error, verification:verified };
       }
     }
@@ -31762,7 +31860,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             updateCompletedFollowupSaveState(item.orderId, { liveSaved, documentSaved });
             if(liveSaved && documentSaved){
               removeCompletedFollowupSave(item.orderId);
-              saveData({ reason:'completed-followup-restored', allowFullBackup:false });
+              saveData({ reason:'completed-followup-restored', allowFullBackup:false, skipLiveOrderPersistence:true });
             }
             processed += 1;
           }catch(error){
@@ -32112,8 +32210,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         if(result && (result.ok || resultStatus === 'stage-updated' || resultStatus === 'already-stage' || resultStatus === 'already-advanced')){
           removeOrderStageTransitionRequest(activeRequest);
-          if(resultStatus === 'stage-updated') saveData({ reason:'order-stage-retry-confirmed', allowFullBackup:false });
-          if(!opts.silent) render();
+          if(resultStatus === 'stage-updated') saveData({ reason:'order-stage-retry-confirmed', allowFullBackup:false, skipLiveOrderPersistence:true });
+          if(!opts.silent) requestOrderLifecycleRender();
           return result;
         }
         const resultError = createOrderSubmissionError(resultStatus || 'order-stage-retry-not-confirmed', resultStatus || 'order-stage-retry-not-confirmed');
@@ -32125,7 +32223,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           status:(result && result.needsCheck) ? 'needs-check' : 'pending',
           lastError:resultStatus || ''
         });
-        if(!opts.silent) render();
+        if(!opts.silent) requestOrderLifecycleRender();
         return result || { status:'pending' };
       }catch(error){
         await saveOrderLifecycleAttemptSafely({
@@ -32136,7 +32234,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           status:'pending',
           lastError:String((error && (error.code || error.message)) || error || '')
         });
-        if(!opts.silent) render();
+        if(!opts.silent) requestOrderLifecycleRender();
         return { status:'pending', error };
       }
     }
@@ -32168,6 +32266,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         showMessage(`${actionLabel || '단계 변경'} 반영 연결이 준비되지 않았습니다. 잠시 후 다시 시도해주세요.`);
         return;
       }
+      beginOrderLifecycleScrollPreservation(`order-stage:${String(orderId || '')}:${safeTargetStage}`);
       const lifecycleBase = {
         orderId:String(order.id || orderId || ''),
         action:String(actionLabel || '단계 변경'),
@@ -32196,8 +32295,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         if(result && (result.ok || resultStatus === 'stage-updated' || resultStatus === 'already-stage' || resultStatus === 'already-advanced')){
           removeOrderStageTransitionRequest(lifecycleBase);
-          if(resultStatus === 'stage-updated') saveData({ reason:'order-stage-transaction-confirmed', allowFullBackup:false });
-          render();
+          if(resultStatus === 'stage-updated') saveData({ reason:'order-stage-transaction-confirmed', allowFullBackup:false, skipLiveOrderPersistence:true });
+          requestOrderLifecycleRender();
           if(successMessage !== '') showMessage(successMessage || '주문 단계가 변경되었습니다.');
           return;
         }
@@ -32208,7 +32307,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }, resultError);
         if(result && result.needsCheck){
           enqueueOrderStageTransitionRequest(lifecycleBase, { status:'needs-check', lastError:resultStatus || '' });
-          render();
+          clearOrderLifecycleScrollPreservation();
+          requestOrderLifecycleRender();
           showMessage('주문 상태 확인 필요: 서버의 최신 주문 상태를 확인해주세요.');
           return;
         }
@@ -32270,6 +32370,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      beginOrderLifecycleScrollPreservation(`order-complete:${String(orderId || '')}`);
       const hydratedCompletionRequest = await hydrateCompletionRequestForOrderFromCloud(order);
       if(hydratedCompletionRequest && hydratedCompletionRequest.cloudStatus === 'COMPLETED'){
         const verified = hydratedCompletionRequest.request ? await verifyCompletionRequestServerState(hydratedCompletionRequest.request) : null;
@@ -32277,11 +32378,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
           return applyConfirmedCompletionResult(hydratedCompletionRequest.request, verified, 'order-completed-server-verified');
         }
         markCompletionRequestOnLocalOrder(order.id, 'needs-check', order.completionRequestMessage || '');
-        render();
+        clearOrderLifecycleScrollPreservation();
+        requestOrderLifecycleRender();
         return verified || { status:'needs-check', needsCheck:true };
       }
       const request = (hydratedCompletionRequest && hydratedCompletionRequest.request) || enqueueCompletionRequest(order);
       if(!request){
+        clearOrderLifecycleScrollPreservation();
         showMessage('주문 상태 확인 필요: 완료 요청을 만들 수 없습니다.');
         return;
       }
@@ -32291,11 +32394,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const lastAttemptMs = getTimestampMs(request.lastAttemptAt);
       if(!opts.recoveryConfirmed && lastAttemptMs && Date.now() - lastAttemptMs < ORDER_COMPLETION_MANUAL_RECLICK_BLOCK_MS && String(request.status || '') !== 'needs-check'){
         markCompletionRequestOnLocalOrder(order.id, String(request.status || 'pending'), order.completionRequestMessage || '동기화 대기 중');
-        render();
+        requestOrderLifecycleRender();
         return { status:String(request.status || 'pending'), skipped:true, reason:'manual-reclick-blocked' };
       }
       markCompletionRequestOnLocalOrder(order.id, 'pending', '동기화 대기 중');
-      render();
+      requestOrderLifecycleRender();
       const result = await processCompletionRequestQueueItem(request, { silent:false });
       if(result && (result.status === 'pending' || result.status === 'retrying')){
         showMessage('네트워크 연결 후 제작완료 반영을 다시 확인합니다.');
@@ -32596,9 +32699,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.editingOrderId = null;
       state.editOrderData = { quantity:1, cupType:'TUMBLER', deliveryType:'PICKUP', deliveryLocation:'', tumblerInfo:'', memo:'', items:[], editStartedByUser:false };
       state.editOrderInitialSnapshot = '';
+      state.editOrderBaseVersion = { editedAt:'', statusRevision:1, stageRevision:1 };
       state.editOrderOperationId = '';
       state.editOrderOperationStartedAt = '';
       state.editOrderSaveInFlight = false;
+      orderEditInputIsComposing = false;
+      deferredOrderSearchRemoteRender = false;
       clearOrderEditValidation();
     }
 
@@ -32629,6 +32735,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return;
       }
       state.editingOrderId = order.id;
+      orderEditInputIsComposing = false;
       state.editOrderData = {
         quantity: Number(getOrderTotalQuantity(order) || order.quantity || 1),
         couponPolicyVersion: Number(order.couponPolicyVersion || 0),
@@ -32643,6 +32750,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
       };
       ensureEditOrderItemsRuntime();
       state.editOrderInitialSnapshot = getOrderEditComparableSnapshot(state.editOrderData);
+      state.editOrderBaseVersion = {
+        editedAt:String(order.editedAt || ''),
+        statusRevision:Number(order.statusRevision || 1),
+        stageRevision:Number(order.stageRevision || 1)
+      };
       state.editOrderOperationId = '';
       state.editOrderOperationStartedAt = '';
       state.editOrderSaveInFlight = false;
@@ -33413,9 +33525,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
           operationId:orderEditOperationId,
           editedAt:orderEditTimestamp,
           editedBy:getCurrentActorLabel(),
-          baseEditedAt:String(order.editedAt || ''),
-          baseStatusRevision:Number(order.statusRevision || 1),
-          baseStageRevision:Number(order.stageRevision || 1),
+          baseEditedAt:String(state.editOrderBaseVersion && state.editOrderBaseVersion.editedAt || ''),
+          baseStatusRevision:Number(state.editOrderBaseVersion && state.editOrderBaseVersion.statusRevision || 1),
+          baseStageRevision:Number(state.editOrderBaseVersion && state.editOrderBaseVersion.stageRevision || 1),
           nextOrder,
           couponDelta,
           couponRecord:preparedEditCouponRecord,
@@ -34001,11 +34113,53 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const source = normalizeCouponRestoreBackupUser(backupUser);
       return {
         ...source,
-        id: source.id || uid('user'),
+        id: source.id,
         createdAt: source.createdAt || timestamp,
         updatedAt: timestamp,
         couponsUpdatedAt: source.couponsUpdatedAt || timestamp
       };
+    }
+
+    function hashCouponRestoreIdentity(value){
+      const source = String(value || '');
+      let forward = 2166136261;
+      let reverse = 2166136261;
+      for(let index = 0; index < source.length; index += 1){
+        forward ^= source.charCodeAt(index);
+        forward = Math.imul(forward, 16777619);
+        reverse ^= source.charCodeAt(source.length - index - 1);
+        reverse = Math.imul(reverse, 16777619);
+      }
+      return `${(forward >>> 0).toString(36).padStart(7, '0')}${(reverse >>> 0).toString(36).padStart(7, '0')}`;
+    }
+
+    function getCouponRestoreDeterministicBatchId(rows){
+      const targetRows = (Array.isArray(rows) ? rows : []).map(row => {
+        const backupUser = row && row.backupUser && typeof row.backupUser === 'object' ? row.backupUser : {};
+        return {
+          userId:String(row && row.userId || ''),
+          currentUserId:String(row && row.currentUserId || ''),
+          restoreCoupons:row && row.restoreCoupons === null ? null : Number(row && row.restoreCoupons || 0),
+          defaultLocation:String(backupUser.defaultLocation || ''),
+          tumblerInfo:String(backupUser.tumblerInfo || ''),
+          personalTumblers:normalizeOrderPersonalTumblers(backupUser.personalTumblers)
+        };
+      }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      const seed = JSON.stringify({
+        baseAt:String(state.couponRestoreBaseAt || ''),
+        applyFrom:String(state.couponRestoreApplyFrom || ''),
+        includeOrderDeduct:!!state.couponRestoreIncludeOrderDeduct,
+        includeManualDeduct:!!state.couponRestoreIncludeManualDeduct,
+        includeOrderRefund:!!state.couponRestoreIncludeOrderRefund,
+        includeManualCharge:!!state.couponRestoreIncludeManualCharge,
+        includeOrderEdit:!!state.couponRestoreIncludeOrderEdit,
+        targets:targetRows
+      });
+      return `coupon_restore_${hashCouponRestoreIdentity(seed)}`;
+    }
+
+    function getCouponRestoreDeterministicLogId(batchId, userId){
+      return `${String(batchId || 'coupon_restore')}_${hashCouponRestoreIdentity(userId)}`;
     }
 
     function applyCouponRestoreProfileFields(user, backupUser, timestamp){
@@ -34157,7 +34311,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
     }
 
+    let couponRestoreApplyInFlight = false;
+
     async function handleApplyCouponRestore(){
+      if(couponRestoreApplyInFlight) return;
+      couponRestoreApplyInFlight = true;
+      try{
       const rows = getCouponRestoreSelectedRows();
       if(!rows.length){ showMessage('복구 적용할 사용자를 선택하세요.'); return; }
       const changedRows = rows.filter(row => row.hasRestoreChange);
@@ -34171,29 +34330,93 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!window.confirm(confirmMessage)) return;
 
       const now = new Date().toISOString();
+      const restoreBatchId = getCouponRestoreDeterministicBatchId(changedRows);
       const preparedRows = [];
       for(const row of changedRows){
         const existingUser = getUserById(row.currentUserId || row.userId);
         const nextCoupons = Number(row.restoreCoupons || 0);
-        if(existingUser && row.restoreCoupons !== null && nextCoupons !== Number(existingUser.coupons || 0)){
+        if(existingUser){
           if(Number(row.currentCoupons || 0) !== Number(existingUser.coupons || 0)){
             showMessage('쿠폰 복구 미리보기 이후 잔여쿠폰이 변경되었습니다. 복구 점검을 다시 실행해주세요.');
             return;
           }
           const prepared = await prepareCouponBalanceMutation(existingUser, '쿠폰 복구');
           if(!prepared) return;
-          preparedRows.push({ row, userId:String(existingUser.id || ''), prepared, nextCoupons });
+          preparedRows.push({
+            row,
+            userId:String(existingUser.id || ''),
+            prepared,
+            nextCoupons,
+            couponChange:row.restoreCoupons !== null && nextCoupons !== Number(prepared.currentCoupons || 0)
+          });
         }
       }
 
       const backupKey = backupUsersBeforeCouponRestore();
+      const missingPreparedRows = changedRows
+        .filter(row => !getUserById(row.currentUserId || row.userId) && row.backupUser)
+        .map(row => {
+          const user = createCouponRestoreUserFromBackup(row.backupUser, now);
+          const oldCoupons = Number(row.currentCoupons || 0);
+          const nextCoupons = Number(row.restoreCoupons || 0);
+          user.coupons = nextCoupons;
+          if(nextCoupons !== oldCoupons) markUserCouponsUpdated(user, now);
+          user.updatedAt = now;
+          let couponLog = null;
+          let history = null;
+          if(row.restoreCoupons !== null && nextCoupons !== oldCoupons){
+            const couponLogId = getCouponRestoreDeterministicLogId(restoreBatchId, user.id);
+            couponLog = {
+              id:couponLogId,
+              userId:user.id,
+              action:'RESTORE_COUPON',
+              amount:Math.abs(nextCoupons - oldCoupons),
+              oldCoupons,
+              restoredCoupons:nextCoupons,
+              remainingCoupons:nextCoupons,
+              reason:`쿠폰 복구 적용: 기준 ${state.couponRestoreBaseAt}, 이후 반영 ${state.couponRestoreApplyFrom}`,
+              changedBy:getCurrentActorLabel(),
+              timestamp:now,
+              baseAt:state.couponRestoreBaseAt,
+              applyFrom:state.couponRestoreApplyFrom,
+              restoreOrderDeduct:row.orderDeduct,
+              restoreManualDeduct:row.manualDeduct,
+              restoreManualCharge:row.manualCharge,
+              restoreManualChargeIncluded:state.couponRestoreIncludeManualCharge,
+              restoreOrderRefund:row.orderRefund,
+              restoreOrderEditDelta:row.orderEditDelta,
+              backupKey
+            };
+            history = recordManualCouponHistory(user, 'RESTORE_COUPON', couponLog.amount, oldCoupons, nextCoupons, {
+              id:'coupon_log_' + couponLog.id,
+              timestamp:now,
+              reason:couponLog.reason,
+              changedBy:couponLog.changedBy,
+              baseAt:couponLog.baseAt,
+              applyFrom:couponLog.applyFrom,
+              backupKey:couponLog.backupKey,
+              restoreOrderDeduct:couponLog.restoreOrderDeduct,
+              restoreManualDeduct:couponLog.restoreManualDeduct,
+              restoreManualCharge:couponLog.restoreManualCharge,
+              restoreManualChargeIncluded:couponLog.restoreManualChargeIncluded,
+              restoreOrderRefund:couponLog.restoreOrderRefund,
+              restoreOrderEditDelta:couponLog.restoreOrderEditDelta,
+              sourceLogId:couponLog.id,
+              source:'coupon-restore',
+              prepareOnly:true
+            });
+          }
+          return { row, user, couponLog, history };
+        });
       preparedRows.forEach(item => {
         const row = item.row;
         const user = getUserById(item.userId);
         const oldCoupons = Number(item.prepared.currentCoupons || 0);
         const nextCoupons = Number(item.nextCoupons || 0);
+        if(!item.couponChange) return;
+        const couponLogId = getCouponRestoreDeterministicLogId(restoreBatchId, item.userId);
         const couponLog = {
-          id:uid('log'),
+          id:couponLogId,
           userId:item.userId,
           action:'RESTORE_COUPON',
           amount:Math.abs(nextCoupons - oldCoupons),
@@ -34235,99 +34458,81 @@ body.mobile-tablet-device .pos-keyboard-btn{
         item.couponLog = couponLog;
         item.history = history;
       });
-      let balanceResult = null;
-      if(preparedRows.length){
-        const guard = window.HaetsalCouponBalanceGuard;
-        if(!guard || typeof guard.applyMutationsWithEvents !== 'function'){
-          showMessage('쿠폰 잔액 서버 확인 모듈이 준비되지 않았습니다.');
-          return;
-        }
-        try{
-          balanceResult = await guard.applyMutationsWithEvents(preparedRows.map(item => ({
+      const guard = window.HaetsalCouponBalanceGuard;
+      if(!guard || typeof guard.applyRestoreTransaction !== 'function'){
+        showMessage('쿠폰 잔액 서버 확인 모듈이 준비되지 않았습니다.');
+        return;
+      }
+      let restoreResult = null;
+      try{
+        restoreResult = await guard.applyRestoreTransaction(
+          preparedRows.map(item => ({
             userId:item.userId,
             expectedCoupons:Number(item.prepared.currentCoupons || 0),
             expectedCouponsUpdatedAt:String(item.prepared.expectedCouponsUpdatedAt || ''),
             expectedVersion:Number(item.prepared.expectedVersion || 0),
             expectedLastRecalcRunId:String(item.prepared.expectedLastRecalcRunId || ''),
             nextCoupons:Number(item.nextCoupons || 0),
+            couponChange:!!item.couponChange,
             updatedAt:now,
-            operationId:`coupon-restore:${item.userId}:${now}`
-          })), preparedRows.map(item => item.history), { reason:'coupon-restore-with-events' });
-          if(balanceResult && Array.isArray(balanceResult.users)){
-            balanceResult.users.forEach(serverUser => {
-              const localUser = getUserById(serverUser && serverUser.id);
-              if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
-            });
-          }
-          applyAuthoritativeSharedCouponData(balanceResult);
-        }catch(error){
-          console.error('쿠폰 복구 서버 잔액 변경 실패', error);
-          showMessage('서버의 최신 잔여쿠폰과 일치하지 않아 쿠폰 복구를 중단했습니다.');
-          return;
+            operationId:`coupon-restore:${restoreBatchId}:${item.userId}`,
+            profile:item.row.backupUser ? {
+              defaultLocation:String(item.row.backupUser.defaultLocation || ''),
+              tumblerInfo:String(item.row.backupUser.tumblerInfo || ''),
+              personalTumblers:normalizeOrderPersonalTumblers(item.row.backupUser.personalTumblers)
+            } : null
+          })),
+          missingPreparedRows.map(item => item.user),
+          [
+            ...preparedRows.map(item => item.history).filter(Boolean),
+            ...missingPreparedRows.map(item => item.history).filter(Boolean)
+          ],
+          { reason:'coupon-restore-combined-atomic', batchId:restoreBatchId }
+        );
+        if(!restoreResult || restoreResult.ok !== true || restoreResult.commitConfirmed !== true){
+          throw new Error('쿠폰 복구 transaction 결과를 확인하지 못했습니다.');
         }
+        applyAuthoritativeSharedCouponData(restoreResult);
+        (Array.isArray(restoreResult.users) ? restoreResult.users : []).forEach(serverUser => {
+          if(!serverUser || !serverUser.id) return;
+          const localUser = getUserById(serverUser.id);
+          if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
+          else state.users.push(JSON.parse(JSON.stringify(serverUser)));
+        });
+      }catch(error){
+        console.error('쿠폰 복구 전체 원자 저장 실패', error);
+        showMessage('서버의 최신 잔여쿠폰과 일치하지 않아 쿠폰 복구를 중단했습니다.');
+        return;
       }
 
-      const savedRestoreRecordById = new Map((balanceResult && Array.isArray(balanceResult.saved) ? balanceResult.saved : []).map(record => [String(record && record.id || ''), record]));
+      const savedRestoreRecordById = new Map([
+        ...(restoreResult && Array.isArray(restoreResult.saved) ? restoreResult.saved : [])
+      ].map(record => [String(record && record.id || ''), record]));
+      const preparedRestoreItemByUserId = new Map([
+        ...preparedRows.map(item => [String(item && item.userId || ''), item]),
+        ...missingPreparedRows.map(item => [String(item && item.user && item.user.id || ''), item])
+      ]);
+      const hasMissingPreparedLocalRecord = changedRows.some(row => {
+        const oldCoupons = Number(row && row.currentCoupons || 0);
+        const nextCoupons = Number(row && row.restoreCoupons || 0);
+        if(!row || row.restoreCoupons === null || nextCoupons === oldCoupons) return false;
+        const preparedItem = preparedRestoreItemByUserId.get(String(row.currentUserId || row.userId || ''));
+        return !preparedItem || !preparedItem.couponLog || !preparedItem.history;
+      });
+      if(hasMissingPreparedLocalRecord) throw new Error('쿠폰 복구 로컬 기록 준비 결과를 확인할 수 없습니다.');
       changedRows.forEach(row => {
         let user = getUserById(row.currentUserId || row.userId);
-        if(!user && row.backupUser){
-          user = createCouponRestoreUserFromBackup(row.backupUser, now);
-          state.users.push(user);
-        }
         if(!user) return;
         applyCouponRestoreProfileFields(user, row.backupUser, now);
         const oldCoupons = Number(row.currentCoupons || 0);
         const nextCoupons = Number(row.restoreCoupons || 0);
         if(row.restoreCoupons !== null && nextCoupons !== oldCoupons){
-          const preparedItem = preparedRows.find(item => item.userId === String(user.id || ''));
-          if(!preparedItem){
-            user.coupons = nextCoupons;
-            markUserCouponsUpdated(user, now);
-          }
+          const preparedItem = preparedRestoreItemByUserId.get(String(user.id || ''));
+          if(!preparedItem || !preparedItem.couponLog || !preparedItem.history) return;
           user.updatedAt = now;
-          const couponLog = preparedItem ? preparedItem.couponLog : {
-            id: uid('log'),
-            userId: user.id,
-            action: 'RESTORE_COUPON',
-            amount: Math.abs(nextCoupons - oldCoupons),
-            oldCoupons,
-            restoredCoupons: nextCoupons,
-            remainingCoupons: nextCoupons,
-            reason: `쿠폰 복구 적용: 기준 ${state.couponRestoreBaseAt}, 이후 반영 ${state.couponRestoreApplyFrom}`,
-            changedBy: getCurrentActorLabel(),
-            timestamp: now,
-            baseAt: state.couponRestoreBaseAt,
-            applyFrom: state.couponRestoreApplyFrom,
-            restoreOrderDeduct: row.orderDeduct,
-            restoreManualDeduct: row.manualDeduct,
-            restoreManualCharge: row.manualCharge,
-            restoreManualChargeIncluded: state.couponRestoreIncludeManualCharge,
-            restoreOrderRefund: row.orderRefund,
-            restoreOrderEditDelta: row.orderEditDelta,
-            backupKey
-          };
-          state.logs.push(couponLog);
-          if(preparedItem){
-            rememberCommittedCouponHistoryRecord(savedRestoreRecordById.get(String(preparedItem.history && preparedItem.history.id || '')) || preparedItem.history);
-          }else{
-            recordManualCouponHistory(user, 'RESTORE_COUPON', couponLog.amount, oldCoupons, nextCoupons, {
-              id: 'coupon_log_' + couponLog.id,
-              timestamp: now,
-              reason: couponLog.reason,
-              changedBy: couponLog.changedBy,
-              baseAt: couponLog.baseAt,
-              applyFrom: couponLog.applyFrom,
-              backupKey: couponLog.backupKey,
-              restoreOrderDeduct: couponLog.restoreOrderDeduct,
-              restoreManualDeduct: couponLog.restoreManualDeduct,
-              restoreManualCharge: couponLog.restoreManualCharge,
-              restoreManualChargeIncluded: couponLog.restoreManualChargeIncluded,
-              restoreOrderRefund: couponLog.restoreOrderRefund,
-              restoreOrderEditDelta: couponLog.restoreOrderEditDelta,
-              sourceLogId: couponLog.id,
-              source: 'coupon-restore'
-            });
-          }
+          const couponLog = preparedItem.couponLog;
+          if(!state.logs.some(log => String(log && log.id || '') === String(couponLog.id || ''))) state.logs.push(couponLog);
+          rememberCommittedCouponHistoryRecord(savedRestoreRecordById.get(String(preparedItem.history.id || '')) || preparedItem.history);
         }
       });
       addAuditLog('COUPON_RESTORE_BATCH', {
@@ -34336,7 +34541,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         applyFrom: state.couponRestoreApplyFrom,
         backupKey
       });
-      saveData();
+      saveData({ reason:'coupon-restore-combined-atomic', saveShared:false });
       state.couponRestorePreview = [];
       state.couponRestoreSelectedIds = [];
       state.showCouponRestoreModal = false;
@@ -34344,10 +34549,18 @@ body.mobile-tablet-device .pos-keyboard-btn{
       showMessage(`쿠폰 복구가 완료되었습니다.
 적용 인원: ${changedRows.length}명${backupKey ? `
 백업키: ${backupKey}` : ''}`);
+      }catch(error){
+        console.error('쿠폰 복구 적용 실패', error);
+        showMessage('서버의 최신 잔여쿠폰과 일치하지 않아 쿠폰 복구를 중단했습니다.');
+      }finally{
+        couponRestoreApplyInFlight = false;
+      }
     }
 
-    function handleAddUser(){
+    async function handleAddUser(){
+      if(addUserSaveInFlight) return;
       const userCreatedAt = new Date().toISOString();
+      const newUsers = [];
       if(state.addUserMode === 'SINGLE'){
         if(!state.newUserData.name.trim()){
           showMessage('이름을 입력하세요.');
@@ -34368,14 +34581,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           tumblerDueDate: '',
           rentedTumbler: ''
         };
-        state.users.push(newUser);
-        if(initialCoupons > 0){
-          recordManualCouponHistory(newUser, 'COUPON_CHARGE', initialCoupons, 0, initialCoupons, {
-            timestamp: userCreatedAt,
-            reason: '사용자 등록 초기 쿠폰',
-            source: 'user-created'
-          });
-        }
+        newUsers.push(newUser);
       }else{
         if(!state.bulkUsersText.trim()){
           showMessage('내용을 입력하세요.');
@@ -34402,22 +34608,52 @@ body.mobile-tablet-device .pos-keyboard-btn{
             tumblerDueDate: '',
             rentedTumbler: ''
           };
-          state.users.push(newUser);
-          if(coupons > 0){
-            recordManualCouponHistory(newUser, 'COUPON_CHARGE', coupons, 0, coupons, {
-              timestamp: userCreatedAt,
-              reason: '사용자 등록 초기 쿠폰',
-              source: 'user-created'
-            });
-          }
+          newUsers.push(newUser);
         });
       }
-      saveData();
-      state.showAddUserModal = false;
-      state.newUserData = { name:'', dept:'', coupons:0, defaultLocation:'', tumblerInfo:'', password:'', isStaffMember:true };
-      state.bulkUsersText = '';
-      render();
-      showMessage('사용자가 추가되었습니다.');
+      const initialCouponRecords = newUsers
+        .filter(user => Number(user && user.coupons || 0) > 0)
+        .map(user => recordManualCouponHistory(user, 'COUPON_CHARGE', Number(user.coupons || 0), 0, Number(user.coupons || 0), {
+          timestamp: userCreatedAt,
+          reason: '사용자 등록 초기 쿠폰',
+          source: 'user-created',
+          prepareOnly: true
+        }));
+      if(initialCouponRecords.some(record => !record)){
+        console.error('사용자 초기 쿠폰 기록을 준비하지 못했습니다.');
+        return;
+      }
+      const atomicStore = window.HaetsalNewUserInitialCouponAtomic;
+      if(!atomicStore || typeof atomicStore.createUsers !== 'function'){
+        console.error('사용자 저장 모듈이 준비되지 않았습니다.');
+        return;
+      }
+      addUserSaveInFlight = true;
+      try{
+        const result = await atomicStore.createUsers(newUsers, initialCouponRecords, { reason:'user-created' });
+        applyAuthoritativeSharedCouponData(result);
+        const committedUsers = Array.isArray(result && result.users) ? result.users : [];
+        committedUsers.forEach(serverUser => {
+          const localUser = getUserById(serverUser && serverUser.id);
+          if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
+          else if(serverUser) state.users.push(JSON.parse(JSON.stringify(serverUser)));
+        });
+        const savedRecordById = new Map((Array.isArray(result && result.saved) ? result.saved : [])
+          .map(record => [String(record && record.id || ''), record]));
+        initialCouponRecords.forEach(record => {
+          rememberCommittedCouponHistoryRecord(savedRecordById.get(String(record && record.id || '')) || record);
+        });
+        saveData({ reason:'new-user-initial-coupon-atomic', saveShared:false });
+        state.showAddUserModal = false;
+        state.newUserData = { name:'', dept:'', coupons:0, defaultLocation:'', tumblerInfo:'', password:'', isStaffMember:true };
+        state.bulkUsersText = '';
+        render();
+        showMessage('사용자가 추가되었습니다.');
+      }catch(error){
+        console.error('신규 사용자 초기 쿠폰 원자 저장 실패', error);
+      }finally{
+        addUserSaveInFlight = false;
+      }
     }
 
     function getOwnSettingsTargetUser(){
@@ -36859,10 +37095,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let adminCouponRecalcSearchIsComposing = false;
     let registrationHistorySearchIsComposing = false;
     let preserveOrderScrollOnNextRender = false;
+    let orderLifecycleScrollSnapshot = null;
+    let lastDashboardScrollSnapshot = null;
+    let orderScrollRestoreGeneration = 0;
+    let orderLifecycleRenderQueued = false;
+    let orderLifecycleRenderGeneration = 0;
     let preserveOrderEditModalScrollOnNextRender = false;
     let orderEditModalScrollSnapshot = null;
     let deferredOrderSearchRemoteRender = false;
     let orderUserSearchSelecting = false;
+    let orderEditInputIsComposing = false;
 
     function isOrderEntryInputElement(element){
       if(!element || !state || state.currentView !== 'ORDER_MAIN') return false;
@@ -36880,6 +37122,21 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function isOrderInputFocusedForRemoteRender(){
       return isOrderEntryInputElement(document.activeElement);
+    }
+
+    function isOrderEditInputElement(element){
+      if(!element || !state || !state.editingOrderId || !isDashboardView()) return false;
+      const tagName = String(element.tagName || '').toUpperCase();
+      if(!['INPUT','TEXTAREA','SELECT'].includes(tagName)) return false;
+      if(!modalRoot.contains(element)) return false;
+      const id = String(element.id || '');
+      if(id === 'editOrderMemo' || id === 'editOrderDeliveryLocation' || id === 'editOrderTumblerInfo') return true;
+      const data = element.dataset || {};
+      return !!(data.editOrderItemField || data.editOrderUnitField);
+    }
+
+    function isOrderEditInputFocusedForRemoteRender(){
+      return isOrderEditInputElement(document.activeElement);
     }
 
     function isDashboardDateInputElement(element){
@@ -37075,7 +37332,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
     }
 
-    function renderAfterRemoteOrderSync(reason){
+    function renderAfterRemoteOrderSync(reason, options){
+      const opts = options || {};
+      const editingOrderId = String(state.editingOrderId || '');
+      const orderEditUrgent = !!(editingOrderId && Array.isArray(opts.orderEditUrgentIds)
+        && opts.orderEditUrgentIds.some(orderId => String(orderId || '') === editingOrderId));
       if(isLoginModalInputActiveForRemoteRender()){
         deferredOrderSearchRemoteRender = true;
         if(window.console && console.info){
@@ -37090,6 +37351,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         return;
       }
+      if(!orderEditUrgent && (isOrderEditInputFocusedForRemoteRender() || orderEditInputIsComposing)){
+        deferredOrderSearchRemoteRender = true;
+        if(window.console && console.info){
+          console.info('관리자 주문수정 입력 중이라 동기화 화면 갱신을 보류합니다.', reason || 'remote-sync');
+        }
+        return;
+      }
+      if(orderEditUrgent) orderEditInputIsComposing = false;
       if(isOrderInputFocusedForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderUserSearchSelecting){
         deferredOrderSearchRemoteRender = true;
         if(window.console && console.info){
@@ -37098,11 +37367,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
         refreshActiveOrderInputPartialUi();
         return;
       }
+      if(getActiveOrderLifecycleScrollSnapshot()){
+        requestOrderLifecycleRender();
+        return;
+      }
       render();
     }
 
     function flushDeferredOrderSearchRemoteRender(reason){
-      if(!deferredOrderSearchRemoteRender || searchTermIsComposing || orderEntryInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
+      if(!deferredOrderSearchRemoteRender || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
       deferredOrderSearchRemoteRender = false;
       requestOrderScrollRestore();
       render();
@@ -37256,18 +37529,106 @@ body.mobile-tablet-device .pos-keyboard-btn{
       };
     }
 
+    function getActiveOrderLifecycleScrollSnapshot(){
+      const snapshot = orderLifecycleScrollSnapshot;
+      if(!snapshot) return null;
+      const valid = isDashboardView()
+        && snapshot.view === state.currentView
+        && String(snapshot.dashboardTab || '') === String(state.dashboardTab || '');
+      if(valid) return snapshot;
+      orderLifecycleScrollSnapshot = null;
+      return null;
+    }
+
+    function getRemoteLifecycleScrollFallback(){
+      const current = captureOrderScrollPosition();
+      const previous = lastDashboardScrollSnapshot;
+      if(Number(current.dashboardTop || 0) > 0 || !previous) return null;
+      if(previous.view !== current.view) return null;
+      if(String(previous.dashboardTab || '') !== String(current.dashboardTab || '')) return null;
+      if(Number(previous.dashboardTop || 0) <= 0) return null;
+      if(previous.owner === getDashboardScrollContainer()) return null;
+      return previous;
+    }
+
+    function beginOrderLifecycleScrollPreservation(reason, fallbackSnapshot){
+      if(!isDashboardView()) return null;
+      const current = captureOrderScrollPosition();
+      const active = getActiveOrderLifecycleScrollSnapshot();
+      if(active && Number(current.dashboardTop || 0) <= 0) return active;
+      const fallback = fallbackSnapshot
+        && fallbackSnapshot.view === current.view
+        && String(fallbackSnapshot.dashboardTab || '') === String(current.dashboardTab || '')
+        && Number(current.dashboardTop || 0) <= 0
+        && Number(fallbackSnapshot.dashboardTop || 0) > 0
+          ? fallbackSnapshot
+          : null;
+      orderLifecycleScrollSnapshot = {
+        ...(fallback || current),
+        lifecycleReason:String(reason || 'order-lifecycle'),
+        restoredOwner:null,
+        restoredTop:null
+      };
+      return orderLifecycleScrollSnapshot;
+    }
+
+    function clearOrderLifecycleScrollPreservation(){
+      orderLifecycleScrollSnapshot = null;
+    }
+
+    function requestOrderLifecycleRender(){
+      if(!getActiveOrderLifecycleScrollSnapshot()){
+        render();
+        return;
+      }
+      if(orderLifecycleRenderQueued) return;
+      orderLifecycleRenderQueued = true;
+      const generation = ++orderLifecycleRenderGeneration;
+      requestAnimationFrame(() => {
+        if(!orderLifecycleRenderQueued || generation !== orderLifecycleRenderGeneration) return;
+        orderLifecycleRenderQueued = false;
+        render();
+      });
+    }
+
+    document.addEventListener('scroll', event => {
+      const current = getDashboardScrollContainer();
+      const target = event.target === document ? document.scrollingElement : event.target;
+      if(current && target === current && isDashboardView()){
+        lastDashboardScrollSnapshot = {
+          ...captureOrderScrollPosition(),
+          owner:current
+        };
+      }
+      const snapshot = getActiveOrderLifecycleScrollSnapshot();
+      if(!snapshot) return;
+      if(!current || target !== current || target !== snapshot.restoredOwner) return;
+      if(Math.abs(Number(target.scrollTop || 0) - Number(snapshot.restoredTop || 0)) > 1){
+        clearOrderLifecycleScrollPreservation();
+      }
+    }, true);
+
     function restoreOrderScrollPosition(snapshot){
+      const restoreGeneration = ++orderScrollRestoreGeneration;
       if(!snapshot) return;
       if(snapshot.view !== state.currentView) return;
       if(isDashboardView() && String(snapshot.dashboardTab || '') !== String(state.dashboardTab || '')) return;
       if(!isDashboardView() && String(snapshot.selectedUserId || '') !== String(state.selectedUserId || '')) return;
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
+          if(restoreGeneration !== orderScrollRestoreGeneration) return;
           try{
             const page = getOrderScrollContainer();
             const dashboardBody = getDashboardScrollContainer();
             if(page) page.scrollTop = Number(snapshot.pageTop || 0);
-            if(dashboardBody) dashboardBody.scrollTop = Number(snapshot.dashboardTop || 0);
+            if(dashboardBody){
+              const maximumTop = Math.max(0, Number(dashboardBody.scrollHeight || 0) - Number(dashboardBody.clientHeight || 0));
+              dashboardBody.scrollTop = Math.min(Math.max(0, Number(snapshot.dashboardTop || 0)), maximumTop);
+              if(orderLifecycleScrollSnapshot === snapshot){
+                snapshot.restoredOwner = dashboardBody;
+                snapshot.restoredTop = Number(dashboardBody.scrollTop || 0);
+              }
+            }
             if(document.scrollingElement) document.scrollingElement.scrollTop = Number(snapshot.windowTop || 0);
             window.scrollTo(window.pageXOffset || 0, Number(snapshot.windowTop || 0));
           }catch(error){}
@@ -37376,8 +37737,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
   function render(){
+      if(orderLifecycleRenderQueued){
+        orderLifecycleRenderQueued = false;
+        orderLifecycleRenderGeneration += 1;
+      }
       const orderFocusSnapshot = captureOrderFocusSnapshot();
-      const orderScrollSnapshot = (preserveOrderScrollOnNextRender || isDashboardView() || orderFocusSnapshot) ? captureOrderScrollPosition() : null;
+      const orderScrollSnapshot = getActiveOrderLifecycleScrollSnapshot()
+        || ((preserveOrderScrollOnNextRender || isDashboardView() || orderFocusSnapshot) ? captureOrderScrollPosition() : null);
       const adminUsersScrollSnapshot = captureAdminUsersListScrollPosition();
       const editModalScrollSnapshot = preserveOrderEditModalScrollOnNextRender ? (orderEditModalScrollSnapshot || captureOrderEditModalScrollPosition()) : null;
       preserveOrderScrollOnNextRender = false;
@@ -37739,6 +38105,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!state.couponRecalcCorrectionDraft || typeof state.couponRecalcCorrectionDraft !== 'object') state.couponRecalcCorrectionDraft = { action:'DUPLICATE_VOID', correctedAmount:'', reason:'', memo:'' };
       if(!state.couponRecalcLatestByUserId || typeof state.couponRecalcLatestByUserId !== 'object') state.couponRecalcLatestByUserId = {};
       if(!state.couponRecalcLatestLoadStateByUserId || typeof state.couponRecalcLatestLoadStateByUserId !== 'object') state.couponRecalcLatestLoadStateByUserId = {};
+      if(!['ALL','RECHARGE_NEEDED'].includes(String(state.adminUserFilter || ''))) state.adminUserFilter = 'ALL';
       if(!['MANAGEMENT','RECALC'].includes(String(state.adminUsersSectionMode || ''))) state.adminUsersSectionMode = 'MANAGEMENT';
       if(typeof state.adminCouponRecalcSearch !== 'string') state.adminCouponRecalcSearch = '';
       if(!['ALL','PENDING','COMPLETE','NEEDS_DATE'].includes(String(state.adminCouponRecalcFilter || ''))) state.adminCouponRecalcFilter = 'ALL';
@@ -40628,7 +40995,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
           if(savedRecord){
             state.couponHistory = mergeCouponHistoryRecords(Array.isArray(state.couponHistory) ? state.couponHistory : [], [savedRecord]);
             rememberOfflineCouponUseHistoryGuardRecord(savedRecord);
-            enqueueCouponEventCloudRecord({ ...savedRecord, appVersion:ORDER_APP_VERSION }, 'offline-coupon-use-create');
           }
           addAuditLog('COUPON_OFFLINE_USE_CREATED', { userId:user.id, amount, usedDate, reason });
         }
@@ -41735,6 +42101,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
       if(isOrderEntryInputElement(t)) orderEntryInputIsComposing = true;
+      if(isOrderEditInputElement(t)) orderEditInputIsComposing = true;
       if(t.id === 'searchTerm') searchTermIsComposing = true;
       if(t.id === 'adminUserSearch') adminUserSearchIsComposing = true;
       if(t.id === 'adminCouponRecalcSearch') adminCouponRecalcSearchIsComposing = true;
@@ -41746,6 +42113,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
       if(isOrderEntryInputElement(t)) orderEntryInputIsComposing = false;
+      if(isOrderEditInputElement(t)){
+        orderEditInputIsComposing = false;
+        window.setTimeout(() => flushDeferredOrderSearchRemoteRender('order-edit-composition-end'), 0);
+      }
       if(t.id === 'searchTerm'){
         searchTermIsComposing = false;
         state.searchTerm = t.value;
@@ -41789,9 +42160,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('focusout', (event) => {
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
-      if(isOrderEntryInputElement(t) || isDashboardDateInputElement(t)){
+      if(isOrderEntryInputElement(t) || isOrderEditInputElement(t) || isDashboardDateInputElement(t)){
         window.setTimeout(() => {
-          flushDeferredOrderSearchRemoteRender(isDashboardDateInputElement(t) ? 'dashboard-date-input-blur' : 'order-input-blur');
+          flushDeferredOrderSearchRemoteRender(isDashboardDateInputElement(t) ? 'dashboard-date-input-blur' : (isOrderEditInputElement(t) ? 'order-edit-input-blur' : 'order-input-blur'));
         }, 0);
       }
       if(t.id === 'milkSupportReceivedDate' || (t.dataset && (t.dataset.milkSupportField || t.dataset.milkReviewField))){
@@ -43864,7 +44235,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         state.historyUserId = btn.dataset.userId;
         render();
         hydrateOfflineCouponUseCloudRecords('offline-coupon-use-user-history-open', { renderAfter:true });
-        hydrateUserCouponHistorySources(btn.dataset.userId, { renderAfter:true, backfill:true, force:true });
+        hydrateUserCouponHistorySources(btn.dataset.userId, { renderAfter:true, backfill:false, force:true });
         hydrateLatestCouponRecalcForUser(btn.dataset.userId, { renderAfter:true, force:true });
       }
       else if(action === 'close-user-history'){
@@ -43951,6 +44322,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       else if(action === 'save-edit-user'){
         handleSaveUserEdit();
+      }
+      else if(action === 'set-admin-user-filter'){
+        if(state.appRole !== 'ADMIN'){ showMessage('최고 관리자만 사용할 수 있습니다.'); return; }
+        const nextFilter = btn.dataset.value === 'RECHARGE_NEEDED' ? 'RECHARGE_NEEDED' : 'ALL';
+        if(state.adminUserFilter !== nextFilter) state.selectedUserIds = [];
+        state.adminUserFilter = nextFilter;
+        render();
       }
       else if(action === 'set-admin-users-section-mode'){
         if(state.appRole !== 'ADMIN'){ showMessage('최고 관리자만 사용할 수 있습니다.'); return; }
@@ -44225,11 +44603,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           sysSettings: state.sysSettings
         }, 'cloud-save');
       },
-      receiveLiveOrderDoc: function(value){
-        return receiveOrderLiveDocuments([value], '주문별 실시간 저장소');
+      receiveLiveOrderDoc: function(value, options){
+        return receiveOrderLiveDocuments([value], '주문별 실시간 저장소', options);
       },
-      receiveLiveOrderDocs: function(values, sourceLabel){
-        return receiveOrderLiveDocuments(values, sourceLabel || '주문별 실시간 저장소');
+      receiveLiveOrderDocs: function(values, sourceLabel, options){
+        return receiveOrderLiveDocuments(values, sourceLabel || '주문별 실시간 저장소', options);
+      },
+      prepareRemoteLifecycleScroll: function(values, sourceLabel, options){
+        return prepareRemoteOrderLifecycleScrollPreservation(values, sourceLabel || '주문별 실시간 저장소', options);
       },
       persistLocal: persistOrderLiveQueueLocal
     };
@@ -54064,6 +54445,161 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return Math.max(0, Math.floor(Number(value || 0)) || 0);
   }
 
+  async function createSharedUsersWithInitialCouponEvents(users, records, options){
+    const userRows = Array.isArray(users) ? users.filter(Boolean) : [];
+    const sourceRecords = Array.isArray(records) ? records.filter(Boolean) : [];
+    const couponRestoreMode = String((options && options.eventMode) || '') === 'coupon-restore';
+    if(!userRows.length) return { ok:true, users:[], sharedData:null, saved:[], count:0 };
+    if(window.HaetsalAdminAuth && typeof window.HaetsalAdminAuth.verifyCurrent === 'function'){
+      const authResult = await window.HaetsalAdminAuth.verifyCurrent();
+      if(!authResult || authResult.verified !== true) throw new Error('Firebase 관리자 권한이 확인되지 않았습니다.');
+    }else if(!window.HaetsalAdminAuth || typeof window.HaetsalAdminAuth.isVerified !== 'function' || !window.HaetsalAdminAuth.isVerified()){
+      throw new Error('Firebase 관리자 권한이 확인되지 않았습니다.');
+    }
+    await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
+    if(sourceRecords.length){
+      await checkCouponEventCloudWriteAccess({ reason:String((options && options.reason) || 'user-created') });
+    }
+    const entries = sourceRecords.map(record => prepareCouponEventCloudEntry(record, options));
+    const eventEntryByUserId = new Map();
+    entries.forEach(entry => {
+      const event = entry && entry.finalPayload;
+      const userId = String(event && event.userId || '').trim();
+      if(!userId || eventEntryByUserId.has(userId)) throw new Error('신규 사용자 초기 쿠폰 기록의 사용자 ID가 올바르지 않습니다.');
+      eventEntryByUserId.set(userId, entry);
+    });
+    userRows.forEach(user => {
+      const userId = String(user && user.id || '').trim();
+      const initialCoupons = Number(user && user.coupons || 0);
+      if(!userId || !Number.isFinite(initialCoupons)) throw new Error('신규 사용자 또는 초기 쿠폰 정보를 확인할 수 없습니다.');
+      const entry = eventEntryByUserId.get(userId);
+      const eventRequired = couponRestoreMode ? initialCoupons !== 0 : initialCoupons > 0;
+      if(eventRequired){
+        const event = entry && entry.finalPayload;
+        if(couponRestoreMode){
+          if(!event
+            || String(event.type || '') !== 'COUPON_RESTORE'
+            || String(event.source || '') !== 'coupon-restore'
+            || Number(event.beforeCoupons) !== 0
+            || Number(event.delta) !== initialCoupons
+            || Number(event.remainingCoupons) !== initialCoupons){
+            throw new Error('백업 전용 사용자 쿠폰 복구 기록이 기존 스키마와 일치하지 않습니다.');
+          }
+        }else if(!event
+          || String(event.type || '') !== 'COUPON_CHARGE'
+          || String(event.source || '') !== 'user-created'
+          || String(event.reason || '') !== '사용자 등록 초기 쿠폰'
+          || Number(event.beforeCoupons) !== 0
+          || Number(event.delta) !== initialCoupons
+          || Number(event.remainingCoupons) !== initialCoupons){
+          throw new Error('신규 사용자 초기 쿠폰 기록이 기존 스키마와 일치하지 않습니다.');
+        }
+      }else if(entry){
+        throw new Error('초기 쿠폰이 없는 신규 사용자에게 쿠폰 기록을 저장할 수 없습니다.');
+      }
+    });
+    if(eventEntryByUserId.size !== userRows.filter(user => couponRestoreMode
+      ? Number(user && user.coupons || 0) !== 0
+      : Number(user && user.coupons || 0) > 0).length){
+      throw new Error('신규 사용자 수와 초기 쿠폰 기록 수가 일치하지 않습니다.');
+    }
+    const transactionResult = await runArchiveCloudPromiseWithTimeout(
+      runTransaction(db, async transaction => {
+        const sharedSnapshot = await transaction.get(cloudDocRefs.shared);
+        const existingEventSnapshots = [];
+        for(const entry of entries){
+          existingEventSnapshots.push(await transaction.get(entry.eventRef));
+        }
+        if(!sharedSnapshot.exists()) throw new Error('서버 사용자 명단 문서를 찾을 수 없습니다.');
+        const nextSharedData = JSON.parse(JSON.stringify(unwrapCouponRecalcDocData(sharedSnapshot)));
+        if(!Array.isArray(nextSharedData.users)) throw new Error('서버 사용자 명단 형식을 확인할 수 없습니다.');
+        const createdUsers = [];
+        const createdAtFallback = new Date().toISOString();
+        userRows.forEach(user => {
+          const source = user && typeof user === 'object' ? user : {};
+          const userId = String(source.id || '').trim();
+          const name = String(source.name || '').trim();
+          const dept = String(source.dept || source.department || '').trim();
+          if(nextSharedData.users.some(existing => String(existing && existing.id || '') === userId)){
+            throw new Error('동일한 신규 사용자 ID가 이미 저장되어 있습니다.');
+          }
+          const sameNameUsers = nextSharedData.users.filter(existing => String(existing && existing.name || '').trim().toLowerCase() === name.toLowerCase());
+          const matchedProfile = dept
+            ? sameNameUsers.find(existing => String(existing && (existing.dept || existing.department) || '').trim().toLowerCase() === dept.toLowerCase())
+            : (sameNameUsers.length === 1 ? sameNameUsers[0] : null);
+          if(matchedProfile) throw new Error('동일한 이름과 부서의 사용자가 이미 등록되어 있습니다.');
+          const normalizedUser = {
+            id:userId,
+            name,
+            dept,
+            department:dept,
+            nickname:String(source.nickname || '').trim(),
+            defaultLocation:String(source.defaultLocation || '').trim(),
+            tumblerInfo:String(source.tumblerInfo || '').trim(),
+            personalTumblers:couponRestoreMode && Array.isArray(source.personalTumblers) ? JSON.parse(JSON.stringify(source.personalTumblers)) : [],
+            password:String(source.password || '').trim(),
+            isStaffMember:source.isStaffMember === false ? false : true,
+            tumblerDueDate:String(source.tumblerDueDate || '').trim(),
+            rentedTumbler:String(source.rentedTumbler || '').trim(),
+            totalRentalCount:Number.isFinite(Number(source.totalRentalCount)) ? Number(source.totalRentalCount) : 0,
+            returnCount:Number.isFinite(Number(source.returnCount)) ? Number(source.returnCount) : 0,
+            nameLocked:!!source.nameLocked,
+            approvedAt:String(source.approvedAt || '').trim(),
+            approvedBy:String(source.approvedBy || '').trim(),
+            createdAt:String(source.createdAt || '').trim() || createdAtFallback,
+            updatedAt:String(source.updatedAt || '').trim() || createdAtFallback,
+            coupons:Number(source.coupons || 0),
+            couponsUpdatedAt:String(source.couponsUpdatedAt || '').trim(),
+            couponBalanceVersion:normalizeCouponBalanceVersionValue(source.couponBalanceVersion),
+            lastRecalcRunId:String(source.lastRecalcRunId || '').trim()
+          };
+          nextSharedData.users.push(normalizedUser);
+          createdUsers.push(normalizedUser);
+        });
+        existingEventSnapshots.forEach(snapshot => {
+          if(snapshot.exists()) throw new Error('동일한 신규 사용자 초기 쿠폰 기록이 이미 저장되어 있습니다.');
+        });
+        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        entries.forEach(entry => {
+          const builtPayload = buildPayload(entry.finalPayload);
+          builtPayload.serverCreatedAt = serverTimestamp();
+          builtPayload.serverUpdatedAt = serverTimestamp();
+          transaction.set(entry.eventRef, builtPayload);
+        });
+        return { users:createdUsers, sharedData:nextSharedData };
+      }),
+      ORDER_ARCHIVE_CLOUD_WRITE_TIMEOUT_MS,
+      '신규 사용자와 초기 쿠폰 기록 저장 시간이 초과되었습니다.'
+    );
+    const sharedVerifySnapshot = await getDocFromServer(cloudDocRefs.shared);
+    if(!sharedVerifySnapshot.exists()) throw new Error('신규 사용자 저장 후 서버 사용자 명단을 확인하지 못했습니다.');
+    const verifiedSharedData = unwrapCouponRecalcDocData(sharedVerifySnapshot);
+    const verifiedUsers = userRows.map(user => {
+      const verifiedUser = getCouponRecalcSharedUserFromData(verifiedSharedData, user && user.id);
+      if(!verifiedUser || Number(verifiedUser.coupons || 0) !== Number(user && user.coupons || 0)){
+        throw new Error('신규 사용자 저장 결과가 요청과 일치하지 않습니다.');
+      }
+      return JSON.parse(JSON.stringify(verifiedUser));
+    });
+    const saved = [];
+    for(const entry of entries){
+      const verifiedRecord = await verifyCouponEventCloudRecord(entry.eventRef, entry.finalPayload);
+      saved.push({ ...entry.finalPayload, ...verifiedRecord, cloudStored:true, serverVerified:true });
+    }
+    return {
+      ok:true,
+      users:verifiedUsers,
+      sharedData:JSON.parse(JSON.stringify(verifiedSharedData)),
+      saved,
+      count:saved.length,
+      transactionResult
+    };
+  }
+
+  window.HaetsalNewUserInitialCouponAtomic = {
+    createUsers:createSharedUsersWithInitialCouponEvents
+  };
+
   function prepareVersionedCouponMutation(sharedData, mutation){
     const source = mutation && typeof mutation === 'object' ? mutation : {};
     const userId = String(source.userId || '').trim();
@@ -54106,6 +54642,404 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       nextSharedData,
       nextVersion
     };
+  }
+
+  function getCouponRestoreTransactionProfileKey(user){
+    const name = String(user && user.name || '').trim().toLowerCase();
+    const dept = String(user && (user.dept || user.department) || '').trim().toLowerCase();
+    return name ? name + '\u0001' + dept : '';
+  }
+
+  function normalizeCouponRestoreTransactionUser(user, createdAtFallback){
+    const source = user && typeof user === 'object' ? user : {};
+    const userId = String(source.id || '').trim();
+    const name = String(source.name || '').trim();
+    const dept = String(source.dept || source.department || '').trim();
+    if(!userId || !name) throw new Error('백업 전용 사용자의 ID 또는 이름을 확인할 수 없습니다.');
+    const coupons = Number(source.coupons || 0);
+    if(!Number.isFinite(coupons) || !Number.isInteger(coupons)) throw new Error('백업 전용 사용자의 쿠폰 수량 형식이 올바르지 않습니다.');
+    return {
+      id:userId,
+      name,
+      dept,
+      department:dept,
+      nickname:String(source.nickname || '').trim(),
+      defaultLocation:String(source.defaultLocation || '').trim(),
+      tumblerInfo:String(source.tumblerInfo || '').trim(),
+      personalTumblers:Array.isArray(source.personalTumblers) ? JSON.parse(JSON.stringify(source.personalTumblers)) : [],
+      password:String(source.password || '').trim(),
+      isStaffMember:source.isStaffMember === false ? false : true,
+      tumblerDueDate:String(source.tumblerDueDate || '').trim(),
+      rentedTumbler:String(source.rentedTumbler || '').trim(),
+      totalRentalCount:Number.isFinite(Number(source.totalRentalCount)) ? Number(source.totalRentalCount) : 0,
+      returnCount:Number.isFinite(Number(source.returnCount)) ? Number(source.returnCount) : 0,
+      nameLocked:!!source.nameLocked,
+      approvedAt:String(source.approvedAt || '').trim(),
+      approvedBy:String(source.approvedBy || '').trim(),
+      createdAt:String(source.createdAt || '').trim() || createdAtFallback,
+      updatedAt:String(source.updatedAt || '').trim() || createdAtFallback,
+      coupons,
+      couponsUpdatedAt:String(source.couponsUpdatedAt || '').trim(),
+      couponBalanceVersion:normalizeCouponBalanceVersionValue(source.couponBalanceVersion),
+      lastRecalcRunId:String(source.lastRecalcRunId || '').trim()
+    };
+  }
+
+  function applyCouponRestoreTransactionProfile(user, profile, updatedAt){
+    const nextUser = JSON.parse(JSON.stringify(user || {}));
+    const source = profile && typeof profile === 'object' ? profile : null;
+    if(!source) return nextUser;
+    let changed = false;
+    const defaultLocation = String(source.defaultLocation || '').trim();
+    const tumblerInfo = String(source.tumblerInfo || '').trim();
+    const personalTumblers = Array.isArray(source.personalTumblers) ? JSON.parse(JSON.stringify(source.personalTumblers)) : [];
+    if(defaultLocation && String(nextUser.defaultLocation || '').trim() !== defaultLocation){
+      nextUser.defaultLocation = defaultLocation;
+      changed = true;
+    }
+    if(tumblerInfo && String(nextUser.tumblerInfo || '').trim() !== tumblerInfo){
+      nextUser.tumblerInfo = tumblerInfo;
+      changed = true;
+    }
+    if(personalTumblers.length && JSON.stringify(Array.isArray(nextUser.personalTumblers) ? nextUser.personalTumblers : []) !== JSON.stringify(personalTumblers)){
+      nextUser.personalTumblers = personalTumblers;
+      changed = true;
+    }
+    if(changed) nextUser.updatedAt = String(updatedAt || nextUser.updatedAt || new Date().toISOString());
+    return nextUser;
+  }
+
+  function couponRestoreTransactionProfileMatches(user, profile){
+    const source = profile && typeof profile === 'object' ? profile : null;
+    if(!source) return true;
+    const defaultLocation = String(source.defaultLocation || '').trim();
+    const tumblerInfo = String(source.tumblerInfo || '').trim();
+    const personalTumblers = Array.isArray(source.personalTumblers) ? source.personalTumblers : [];
+    if(defaultLocation && String(user && user.defaultLocation || '').trim() !== defaultLocation) return false;
+    if(tumblerInfo && String(user && user.tumblerInfo || '').trim() !== tumblerInfo) return false;
+    if(personalTumblers.length && JSON.stringify(Array.isArray(user && user.personalTumblers) ? user.personalTumblers : []) !== JSON.stringify(personalTumblers)) return false;
+    return true;
+  }
+
+  function couponRestoreTransactionMissingUserMatches(actual, expected){
+    if(!actual || !expected) return false;
+    return String(actual.id || '') === String(expected.id || '')
+      && String(actual.name || '').trim() === String(expected.name || '').trim()
+      && String(actual.dept || actual.department || '').trim() === String(expected.dept || expected.department || '').trim()
+      && String(actual.nickname || '').trim() === String(expected.nickname || '').trim()
+      && Number(actual.coupons || 0) === Number(expected.coupons || 0)
+      && normalizeCouponBalanceVersionValue(actual.couponBalanceVersion) === normalizeCouponBalanceVersionValue(expected.couponBalanceVersion)
+      && String(actual.lastRecalcRunId || '') === String(expected.lastRecalcRunId || '')
+      && String(actual.defaultLocation || '').trim() === String(expected.defaultLocation || '').trim()
+      && String(actual.tumblerInfo || '').trim() === String(expected.tumblerInfo || '').trim()
+      && JSON.stringify(Array.isArray(actual.personalTumblers) ? actual.personalTumblers : []) === JSON.stringify(Array.isArray(expected.personalTumblers) ? expected.personalTumblers : [])
+      && String(actual.password || '').trim() === String(expected.password || '').trim()
+      && (actual.isStaffMember === false ? false : true) === (expected.isStaffMember === false ? false : true)
+      && String(actual.tumblerDueDate || '').trim() === String(expected.tumblerDueDate || '').trim()
+      && String(actual.rentedTumbler || '').trim() === String(expected.rentedTumbler || '').trim()
+      && Number(actual.totalRentalCount || 0) === Number(expected.totalRentalCount || 0)
+      && Number(actual.returnCount || 0) === Number(expected.returnCount || 0)
+      && !!actual.nameLocked === !!expected.nameLocked
+      && String(actual.approvedAt || '').trim() === String(expected.approvedAt || '').trim()
+      && String(actual.approvedBy || '').trim() === String(expected.approvedBy || '').trim();
+  }
+
+  function inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows){
+    const users = Array.isArray(sharedData && sharedData.users) ? sharedData.users : [];
+    const authoritativeUsers = [];
+    for(const row of existingRows){
+      const user = users.find(item => String(item && item.id || '') === String(row.userId || ''));
+      const expectedVersion = normalizeCouponBalanceVersionValue(row.expectedVersion) + (row.couponChange ? 1 : 0);
+      if(!user
+        || Number(user.coupons || 0) !== Number(row.nextCoupons)
+        || normalizeCouponBalanceVersionValue(user.couponBalanceVersion) !== expectedVersion
+        || String(user.lastRecalcRunId || '') !== String(row.expectedLastRecalcRunId || '')
+        || !couponRestoreTransactionProfileMatches(user, row.profile)){
+        return { applied:false, users:[] };
+      }
+      authoritativeUsers.push(JSON.parse(JSON.stringify(user)));
+    }
+    for(const expected of missingRows){
+      const user = users.find(item => String(item && item.id || '') === String(expected.id || ''));
+      if(!couponRestoreTransactionMissingUserMatches(user, expected)) return { applied:false, users:[] };
+      authoritativeUsers.push(JSON.parse(JSON.stringify(user)));
+    }
+    return { applied:true, users:authoritativeUsers };
+  }
+
+  async function verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries){
+    const sharedSnapshot = await runArchiveCloudPromiseWithTimeout(
+      getDocFromServer(cloudDocRefs.shared),
+      ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+      '쿠폰 복구 후 서버 사용자 명단 확인 시간이 초과되었습니다.'
+    );
+    if(!sharedSnapshot.exists()) return { committed:false, sharedData:null, users:[], saved:[] };
+    const sharedData = unwrapCouponRecalcDocData(sharedSnapshot);
+    const appliedState = inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows);
+    if(!appliedState.applied) return { committed:false, sharedData, users:[], saved:[] };
+    const saved = [];
+    for(const entry of entries){
+      const eventSnapshot = await runArchiveCloudPromiseWithTimeout(
+        getDocFromServer(entry.eventRef),
+        ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+        '쿠폰 복구 기록의 서버 확인 시간이 초과되었습니다.'
+      );
+      if(!eventSnapshot.exists()) return { committed:false, sharedData, users:[], saved:[] };
+      const actual = assertCouponEventServerRecordMatches(entry.finalPayload, eventSnapshot);
+      saved.push({ ...entry.finalPayload, ...actual, cloudStored:true, serverVerified:true });
+    }
+    return {
+      committed:true,
+      sharedData:JSON.parse(JSON.stringify(sharedData)),
+      users:appliedState.users,
+      saved
+    };
+  }
+
+  async function applyCouponRestoreCombinedTransaction(existingMutations, missingUsers, records, options){
+    const existingRows = Array.isArray(existingMutations) ? existingMutations.filter(Boolean) : [];
+    const sourceMissingRows = Array.isArray(missingUsers) ? missingUsers.filter(Boolean) : [];
+    const sourceRecords = Array.isArray(records) ? records.filter(Boolean) : [];
+    if(!existingRows.length && !sourceMissingRows.length) return { ok:true, commitConfirmed:true, users:[], sharedData:null, saved:[], count:0 };
+    const createdAtFallback = new Date().toISOString();
+    const missingRows = sourceMissingRows.map(user => normalizeCouponRestoreTransactionUser(user, createdAtFallback));
+    const targetIds = new Set();
+    existingRows.forEach(row => {
+      const userId = String(row && row.userId || '').trim();
+      if(!userId || targetIds.has(userId)) throw new Error('복구 대상 사용자 ID가 중복되었습니다.');
+      targetIds.add(userId);
+    });
+    const missingProfileKeys = new Set();
+    missingRows.forEach(user => {
+      const userId = String(user.id || '');
+      const profileKey = getCouponRestoreTransactionProfileKey(user);
+      if(targetIds.has(userId)) throw new Error('복구 대상 사용자 ID가 중복되었습니다.');
+      if(!profileKey || missingProfileKeys.has(profileKey)) throw new Error('복구 대상의 이름과 부서가 중복되었습니다.');
+      targetIds.add(userId);
+      missingProfileKeys.add(profileKey);
+    });
+    if(window.HaetsalAdminAuth && typeof window.HaetsalAdminAuth.verifyCurrent === 'function'){
+      const authResult = await window.HaetsalAdminAuth.verifyCurrent();
+      if(!authResult || authResult.verified !== true) throw new Error('Firebase 관리자 권한이 확인되지 않았습니다.');
+    }else if(!window.HaetsalAdminAuth || typeof window.HaetsalAdminAuth.isVerified !== 'function' || !window.HaetsalAdminAuth.isVerified()){
+      throw new Error('Firebase 관리자 권한이 확인되지 않았습니다.');
+    }
+    await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
+    if(sourceRecords.length) await checkCouponEventCloudWriteAccess({ reason:String(options && options.reason || 'coupon-restore-combined-atomic') });
+    const entries = sourceRecords.map(record => prepareCouponEventCloudEntry(record, options));
+    if(entries.length + 1 > 450) throw new Error('쿠폰 복구 대상 수가 안전 한도를 초과했습니다.');
+    const eventEntryByUserId = new Map();
+    entries.forEach(entry => {
+      const event = entry && entry.finalPayload;
+      const userId = String(event && event.userId || '').trim();
+      if(!userId || eventEntryByUserId.has(userId)) throw new Error('쿠폰 복구 기록의 사용자 ID가 중복되었습니다.');
+      if(String(event.type || '') !== 'COUPON_RESTORE' || String(event.source || '') !== 'coupon-restore'){
+        throw new Error('쿠폰 복구 기록이 기존 스키마와 일치하지 않습니다.');
+      }
+      eventEntryByUserId.set(userId, entry);
+    });
+    let requiredEventCount = 0;
+    existingRows.forEach(row => {
+      const entry = eventEntryByUserId.get(String(row.userId || ''));
+      if(row.couponChange){
+        if(!entry) throw new Error('기존 사용자 쿠폰 복구 기록이 없습니다.');
+        assertCouponEventMatchesMutation(row, entry.finalPayload);
+        requiredEventCount += 1;
+      }else if(entry){
+        throw new Error('쿠폰 변동이 없는 사용자에게 복구 기록을 저장할 수 없습니다.');
+      }
+    });
+    missingRows.forEach(user => {
+      const entry = eventEntryByUserId.get(String(user.id || ''));
+      const eventRequired = Number(user.coupons || 0) !== 0;
+      if(eventRequired){
+        const event = entry && entry.finalPayload;
+        if(!event
+          || Number(event.beforeCoupons) !== 0
+          || Number(event.delta) !== Number(user.coupons || 0)
+          || Number(event.remainingCoupons) !== Number(user.coupons || 0)){
+          throw new Error('백업 전용 사용자 쿠폰 복구 기록이 기존 스키마와 일치하지 않습니다.');
+        }
+        requiredEventCount += 1;
+      }else if(entry){
+        throw new Error('쿠폰이 0인 백업 전용 사용자에게 복구 기록을 저장할 수 없습니다.');
+      }
+    });
+    if(eventEntryByUserId.size !== requiredEventCount) throw new Error('쿠폰 복구 대상과 기록 수가 일치하지 않습니다.');
+
+    const transactionPromise = runTransaction(db, async transaction => {
+      const sharedSnapshot = await transaction.get(cloudDocRefs.shared);
+      const existingEventSnapshots = [];
+      for(const entry of entries) existingEventSnapshots.push(await transaction.get(entry.eventRef));
+      if(!sharedSnapshot.exists()) throw new Error('서버 사용자 명단 문서를 찾을 수 없습니다.');
+      const sharedData = unwrapCouponRecalcDocData(sharedSnapshot);
+      if(!Array.isArray(sharedData.users)) throw new Error('서버 사용자 명단 형식을 확인할 수 없습니다.');
+      const existingEventCount = existingEventSnapshots.filter(snapshot => snapshot.exists()).length;
+      if(existingEventCount > 0 && existingEventCount !== entries.length){
+        throw new Error('기존 쿠폰 복구 기록의 완료 상태가 일치하지 않습니다.');
+      }
+      if(existingEventCount === entries.length && entries.length){
+        entries.forEach((entry, index) => assertCouponEventServerRecordMatches(entry.finalPayload, existingEventSnapshots[index]));
+        const appliedState = inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows);
+        if(!appliedState.applied) throw new Error('기존 쿠폰 복구 기록과 현재 사용자 상태가 일치하지 않습니다.');
+        return { idempotent:true, users:appliedState.users, sharedData };
+      }
+      if(!entries.length){
+        const appliedState = inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows);
+        if(appliedState.applied) return { idempotent:true, users:appliedState.users, sharedData };
+      }
+      let nextSharedData = JSON.parse(JSON.stringify(sharedData));
+      const updatedUsers = [];
+      existingRows.forEach(row => {
+        const userId = String(row.userId || '');
+        const userIndex = nextSharedData.users.findIndex(user => String(user && user.id || '') === userId);
+        if(userIndex < 0) throw new Error('서버 사용자 명단에서 쿠폰 복구 사용자를 찾을 수 없습니다.');
+        let nextUser = null;
+        if(row.couponChange){
+          const prepared = prepareVersionedCouponMutation(nextSharedData, row);
+          nextSharedData = prepared.nextSharedData;
+          nextUser = prepared.nextUser;
+        }else{
+          const currentUser = nextSharedData.users[userIndex] || {};
+          if(Number(currentUser.coupons || 0) !== Number(row.expectedCoupons)
+            || normalizeCouponBalanceVersionValue(currentUser.couponBalanceVersion) !== normalizeCouponBalanceVersionValue(row.expectedVersion)
+            || String(currentUser.couponsUpdatedAt || '') !== String(row.expectedCouponsUpdatedAt || '')
+            || String(currentUser.lastRecalcRunId || '') !== String(row.expectedLastRecalcRunId || '')){
+            throw new Error('서버의 쿠폰 잔액 버전이 변경되었습니다. 최신 잔액을 반영한 뒤 다시 시도해주세요.');
+          }
+          nextUser = currentUser;
+        }
+        const targetIndex = nextSharedData.users.findIndex(user => String(user && user.id || '') === userId);
+        nextUser = applyCouponRestoreTransactionProfile(nextUser, row.profile, row.updatedAt);
+        nextSharedData.users[targetIndex] = nextUser;
+        updatedUsers.push(nextUser);
+      });
+      missingRows.forEach(user => {
+        const userId = String(user.id || '');
+        const profileKey = getCouponRestoreTransactionProfileKey(user);
+        if(nextSharedData.users.some(existing => String(existing && existing.id || '') === userId)){
+          throw new Error('동일한 신규 사용자 ID가 이미 저장되어 있습니다.');
+        }
+        if(nextSharedData.users.some(existing => getCouponRestoreTransactionProfileKey(existing) === profileKey)){
+          throw new Error('동일한 이름과 부서의 사용자가 이미 등록되어 있습니다.');
+        }
+        const normalizedUser = JSON.parse(JSON.stringify(user));
+        nextSharedData.users.push(normalizedUser);
+        updatedUsers.push(normalizedUser);
+      });
+      const sharedPayload = buildPayload(nextSharedData);
+      const estimatedBytes = getArchiveJsonBytes(sharedPayload) + entries.reduce((sum, entry) => sum + getArchiveJsonBytes(buildPayload(entry.finalPayload)), 0);
+      if(estimatedBytes > 8 * 1024 * 1024) throw new Error('쿠폰 복구 요청 크기가 안전 한도를 초과했습니다.');
+      transaction.set(cloudDocRefs.shared, sharedPayload);
+      entries.forEach(entry => {
+        const builtPayload = buildPayload(entry.finalPayload);
+        builtPayload.serverCreatedAt = serverTimestamp();
+        builtPayload.serverUpdatedAt = serverTimestamp();
+        transaction.set(entry.eventRef, builtPayload);
+      });
+      return { idempotent:false, users:updatedUsers, sharedData:nextSharedData, estimatedBytes };
+    });
+
+    const timeoutMessage = '쿠폰 복구 전체 원자 저장 시간이 초과되었습니다.';
+    const timeoutMs = Math.max(1, Math.floor(Number(options && options.timeoutMs || ORDER_ARCHIVE_CLOUD_WRITE_TIMEOUT_MS)));
+    let transactionResult = null;
+    let timeoutObserved = false;
+    try{
+      transactionResult = await runArchiveCloudPromiseWithTimeout(transactionPromise, timeoutMs, timeoutMessage);
+    }catch(error){
+      if(String(error && error.message || '') !== timeoutMessage) throw error;
+      timeoutObserved = true;
+      let timeoutVerification = null;
+      try{
+        timeoutVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+      }catch(verificationError){}
+      if(timeoutVerification && timeoutVerification.committed){
+        return {
+          ok:true,
+          commitConfirmed:true,
+          commitStatus:'COMMIT_CONFIRMED_AFTER_TIMEOUT',
+          users:timeoutVerification.users,
+          sharedData:timeoutVerification.sharedData,
+          saved:timeoutVerification.saved,
+          count:timeoutVerification.saved.length,
+          timeoutObserved:true
+        };
+      }
+      const reconcileWaitMs = Math.max(1000, Math.floor(Number(options && options.reconcileWaitMs || ORDER_ARCHIVE_CLOUD_WRITE_TIMEOUT_MS)));
+      let transactionWaitError = null;
+      try{
+        transactionResult = await runArchiveCloudPromiseWithTimeout(transactionPromise, reconcileWaitMs, timeoutMessage);
+      }catch(waitError){
+        transactionWaitError = waitError;
+      }
+      let finalVerification = null;
+      try{
+        finalVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+      }catch(verificationError){}
+      if(finalVerification && finalVerification.committed){
+        return {
+          ok:true,
+          commitConfirmed:true,
+          commitStatus:'COMMIT_CONFIRMED_AFTER_TIMEOUT',
+          users:finalVerification.users,
+          sharedData:finalVerification.sharedData,
+          saved:finalVerification.saved,
+          count:finalVerification.saved.length,
+          transactionResult,
+          timeoutObserved:true
+        };
+      }
+      if(transactionWaitError && String(transactionWaitError.message || '') !== timeoutMessage) throw transactionWaitError;
+      const unknownError = new Error('쿠폰 복구 transaction 결과를 서버에서 확정하지 못했습니다.');
+      unknownError.code = 'COUPON_RESTORE_COMMIT_UNKNOWN';
+      unknownError.commitStatus = 'COMMIT_UNKNOWN';
+      throw unknownError;
+    }
+
+    try{
+      const verification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+      if(!verification.committed){
+        return {
+          ok:false,
+          commitConfirmed:true,
+          commitStatus:'COMMIT_CONFIRMED_BUT_DATA_MISMATCH',
+          users:[],
+          sharedData:verification.sharedData ? JSON.parse(JSON.stringify(verification.sharedData)) : null,
+          saved:[],
+          count:0,
+          transactionResult,
+          verificationError:new Error('쿠폰 복구 후 서버 저장 결과가 요청과 일치하지 않습니다.')
+        };
+      }
+      return {
+        ok:true,
+        commitConfirmed:true,
+        commitStatus:timeoutObserved ? 'COMMIT_CONFIRMED_AFTER_TIMEOUT' : 'COMMIT_CONFIRMED',
+        idempotent:!!(transactionResult && transactionResult.idempotent),
+        users:verification.users,
+        sharedData:verification.sharedData,
+        saved:verification.saved,
+        count:verification.saved.length,
+        transactionResult,
+        timeoutObserved
+      };
+    }catch(verificationError){
+      if(transactionResult){
+        return {
+          ok:true,
+          commitConfirmed:true,
+          commitStatus:'COMMIT_CONFIRMED_BUT_READ_UNAVAILABLE',
+          idempotent:!!transactionResult.idempotent,
+          users:(Array.isArray(transactionResult.users) ? transactionResult.users : []).map(user => JSON.parse(JSON.stringify(user))),
+          sharedData:transactionResult.sharedData ? JSON.parse(JSON.stringify(transactionResult.sharedData)) : null,
+          saved:entries.map(entry => ({ ...entry.finalPayload, cloudStored:true, serverVerified:false })),
+          count:entries.length,
+          transactionResult,
+          verificationError
+        };
+      }
+      throw verificationError;
+    }
   }
 
   async function readVersionedCouponUser(userId){
@@ -54418,7 +55352,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     readUser:readVersionedCouponUser,
     applyMutation:applyVersionedCouponMutation,
     applyMutations:applyVersionedCouponMutations,
-    applyMutationsWithEvents:applyVersionedCouponMutationsWithEvents
+    applyMutationsWithEvents:applyVersionedCouponMutationsWithEvents,
+    applyRestoreTransaction:applyCouponRestoreCombinedTransaction
   };
 
   const milkSupportCollectionRef = collection(db, 'haetsalMilkSupportRequests');
@@ -54816,11 +55751,25 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       cloudReason:String((options && options.reason) || 'offline-coupon-use')
     };
     const couponMutations = Array.isArray(options && options.couponMutations) ? options.couponMutations.filter(Boolean) : [];
+    const atomicCouponEvent = !!(options && options.atomicCouponEvent === true);
+    const couponEntry = atomicCouponEvent
+      ? prepareCouponEventCloudEntry({
+          ...source,
+          cloudStored:true,
+          appVersion:String(source.appVersion || (window.OrderModule && window.OrderModule.state && window.OrderModule.state.orderAppVersion) || '')
+        }, { reason:String((options && options.reason) || 'offline-coupon-use') })
+      : null;
+    if(couponEntry){
+      if(couponMutations.length !== 1) throw new Error('앱 미사용일 신규 차감의 쿠폰 잔액 변경은 한 건이어야 합니다.');
+      assertCouponEventMatchesMutation(couponMutations[0], couponEntry.finalPayload);
+      await checkCouponEventCloudWriteAccess({ reason:String((options && options.reason) || 'offline-coupon-use') });
+    }
     const eventRef = doc(db, 'haetsalCombinedApp', docId);
     const transactionResult = await runArchiveCloudPromiseWithTimeout(
       runTransaction(db, async transaction => {
         const existing = await transaction.get(eventRef);
         const sharedSnapshot = couponMutations.length ? await transaction.get(cloudDocRefs.shared) : null;
+        const couponSnapshot = couponEntry ? await transaction.get(couponEntry.eventRef) : null;
         if(existing.exists()){
           const actual = normalizeOfflineCouponUseCloudPayload(existing);
           if(!actual
@@ -54831,8 +55780,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }
           const sharedData = sharedSnapshot && sharedSnapshot.exists() ? unwrapCouponRecalcDocData(sharedSnapshot) : null;
           const users = couponMutations.map(mutation => getCouponRecalcSharedUserFromData(sharedData, mutation.userId)).filter(Boolean);
-          return { idempotent:true, record:actual, users, sharedData };
+          let couponRecord = null;
+          if(couponEntry){
+            if(!couponSnapshot || !couponSnapshot.exists()) throw new Error('기존 앱 미사용일 차감 기록의 쿠폰 개별 기록이 없습니다.');
+            couponRecord = assertCouponEventServerRecordMatches(couponEntry.finalPayload, couponSnapshot);
+            const mutation = couponMutations[0];
+            const currentUser = users[0] || null;
+            const alreadyApplied = currentUser
+              && Number(currentUser.coupons || 0) === Number(mutation.nextCoupons)
+              && normalizeCouponBalanceVersionValue(currentUser.couponBalanceVersion) === normalizeCouponBalanceVersionValue(mutation.expectedVersion) + 1
+              && String(currentUser.couponsUpdatedAt || '') === String(mutation.updatedAt || '');
+            if(!alreadyApplied) throw new Error('기존 앱 미사용일 차감 기록과 현재 쿠폰 잔액 상태가 일치하지 않습니다.');
+          }
+          return { idempotent:true, record:actual, users, sharedData, couponRecord };
         }
+        if(couponEntry && couponSnapshot && couponSnapshot.exists()) throw new Error('동일한 앱 미사용일 쿠폰 개별 기록이 이미 존재합니다.');
         let nextSharedData = null;
         const updatedUsers = [];
         if(couponMutations.length){
@@ -54849,7 +55811,19 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         builtPayload.serverCreatedAt = serverTimestamp();
         builtPayload.serverUpdatedAt = serverTimestamp();
         transaction.set(eventRef, builtPayload);
-        return { idempotent:false, record:finalPayload, users:updatedUsers, sharedData:nextSharedData };
+        if(couponEntry){
+          const builtCouponPayload = buildPayload(couponEntry.finalPayload);
+          builtCouponPayload.serverCreatedAt = serverTimestamp();
+          builtCouponPayload.serverUpdatedAt = serverTimestamp();
+          transaction.set(couponEntry.eventRef, builtCouponPayload);
+        }
+        return {
+          idempotent:false,
+          record:finalPayload,
+          users:updatedUsers,
+          sharedData:nextSharedData,
+          couponRecord:couponEntry ? couponEntry.finalPayload : null
+        };
       }),
       ORDER_ARCHIVE_CLOUD_WRITE_TIMEOUT_MS,
       '앱 미사용일 차감 기록 저장 시간이 초과되었습니다.'
@@ -54862,6 +55836,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       || String(verifiedRecord.userId || '') !== String(finalPayload.userId || '')
       || Number(verifiedRecord.delta || 0) !== Number(finalPayload.delta || 0)){
       throw new Error('앱 미사용일 차감 기록 저장 후 서버 기록이 요청과 일치하지 않습니다.');
+    }
+    let verifiedCouponRecord = null;
+    if(couponEntry){
+      verifiedCouponRecord = await verifyCouponEventCloudRecord(couponEntry.eventRef, couponEntry.finalPayload);
     }
     let verifiedSharedData = transactionResult && transactionResult.sharedData ? transactionResult.sharedData : null;
     let verifiedUsers = Array.isArray(transactionResult && transactionResult.users) ? transactionResult.users : [];
@@ -54882,6 +55860,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       ok:true,
       idempotent:!!(transactionResult && transactionResult.idempotent),
       record:{ ...finalPayload, ...verifiedRecord, cloudStored:true, serverVerified:true },
+      couponRecord:verifiedCouponRecord ? { ...couponEntry.finalPayload, ...verifiedCouponRecord, cloudStored:true, serverVerified:true } : null,
       users:verifiedUsers,
       sharedData:verifiedSharedData ? JSON.parse(JSON.stringify(verifiedSharedData)) : null
     };
@@ -55659,7 +56638,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           rememberLiveOrderDocumentWriteSignature(data);
           const verifiedOrders = await filterIncomingOrdersByCloudGuards([data]);
           if(verifiedOrders.length){
-            window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '완료 주문 개별 상태 확인');
+            window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '완료 주문 개별 상태 확인', {
+              remoteSnapshot:true,
+              initialSnapshot:false,
+              hasPendingWrites:false,
+              fromCache:false
+            });
           }
         }
         if(window.OrderModule && typeof window.OrderModule.hideCurrentDayLiveOrderId === 'function'){
@@ -55707,7 +56691,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           : buildLiveOpenOrderQueryRef(businessDate);
         unsubscribeCurrentQuery = onSnapshot(activeQueryRef, snapshot => {
           if(stopped) return;
+          const isInitialSnapshot = !initialSnapshotReceived;
           initialSnapshotReceived = true;
+          const snapshotMetadata = {
+            remoteSnapshot:true,
+            initialSnapshot:isInitialSnapshot,
+            hasPendingWrites:!!(snapshot.metadata && snapshot.metadata.hasPendingWrites),
+            fromCache:!!(snapshot.metadata && snapshot.metadata.fromCache)
+          };
           const activeDocumentIds = snapshot.docs
             .filter(docSnap => String((docSnap && docSnap.id) || '').startsWith(liveOrderDocPrefix))
             .map(docSnap => {
@@ -55720,10 +56711,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               return belongsToCurrentDate ? String((order && order.id) || '').trim() : '';
             })
             .filter(Boolean);
-          if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
-            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT);
-          }
           const changedLiveOrders = [];
+          const remoteLifecycleRows = [];
           snapshot.docChanges().forEach(change => {
             if(!change || !change.doc || !String(change.doc.id || '').startsWith(liveOrderDocPrefix)) return;
             const payload = change.doc.data();
@@ -55747,11 +56736,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             }
             rememberLiveOrderDocumentWriteSignature(payload.data);
             changedLiveOrders.push(payload.data);
+            if(!(change.doc.metadata && change.doc.metadata.hasPendingWrites)) remoteLifecycleRows.push(payload.data);
           });
+          if(remoteLifecycleRows.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.prepareRemoteLifecycleScroll === 'function'){
+            window.HaetsalOrderLiveQueue.prepareRemoteLifecycleScroll(remoteLifecycleRows, '오늘 주문별 실시간 저장소', {
+              ...snapshotMetadata,
+              hasPendingWrites:false
+            });
+          }
+          if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
+            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT);
+          }
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             filterIncomingOrdersByCloudGuards(changedLiveOrders).then(verifiedOrders => {
               if(verifiedOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
-                window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '오늘 주문별 실시간 저장소');
+                window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '오늘 주문별 실시간 저장소', snapshotMetadata);
               }
               syncOrderGuardVerifications(true);
             });
@@ -55793,14 +56792,22 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
     function subscribeUserLiveOrder(orderId){
       const targetOrderId = String(orderId || '').trim();
+      let initialSnapshotReceived = false;
       return onSnapshot(getLiveOrderRef(targetOrderId), docSnap => {
+        const isInitialSnapshot = !initialSnapshotReceived;
+        initialSnapshotReceived = true;
         if(!docSnap.exists()) return;
         const payload = docSnap.data();
         if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
         rememberLiveOrderDocumentWriteSignature(payload.data);
         filterIncomingOrdersByCloudGuards([payload.data]).then(verifiedOrders => {
           if(verifiedOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
-            window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '사용자 주문별 실시간 저장소');
+            window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '사용자 주문별 실시간 저장소', {
+              remoteSnapshot:true,
+              initialSnapshot:isInitialSnapshot,
+              hasPendingWrites:!!(docSnap.metadata && docSnap.metadata.hasPendingWrites),
+              fromCache:!!(docSnap.metadata && docSnap.metadata.fromCache)
+            });
           }
         });
       }, error => {
