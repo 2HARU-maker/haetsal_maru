@@ -11170,6 +11170,43 @@ body.order-keyboard-submit-active{
 <div id="tumbler-modal-root"></div>
 </div>
 <script>
+const ORDER_USER_CREDENTIAL_SCHEMA_VERSION = 1;
+const ORDER_USER_PASSWORD_MANAGEMENT_FROZEN = true;
+
+// Legacy profile credentials are consumed only here as a protection signal.
+function sanitizeOrderUserCredentialFields(source, previous){
+  const record = source && typeof source === "object" && !Array.isArray(source) ? source : {};
+  const next = {};
+  Object.keys(record).forEach(key => {
+    if(key !== "password") Object.defineProperty(next, key, { value:record[key], enumerable:true, writable:true, configurable:true });
+  });
+  const legacy = Object.prototype.hasOwnProperty.call(record, "password") ? record.password : undefined;
+  next.passwordProtected = record.passwordProtected === true
+    || (legacy !== undefined && legacy !== null && legacy !== "")
+    || (previous != null && sanitizeOrderUserCredentialFields(previous).passwordProtected === true);
+  return next;
+}
+
+function applyOrderUserCredentialProtection(target, source){
+  if(!target || typeof target !== "object" || Array.isArray(target)) return target;
+  const safe = sanitizeOrderUserCredentialFields(target, source);
+  delete target.password;
+  target.passwordProtected = safe.passwordProtected;
+  return target;
+}
+
+function sanitizeOrderUserCredentialData(source, previous){
+  if(!source || typeof source !== "object" || Array.isArray(source) || !Array.isArray(source.users)) return source;
+  const previousUsers = previous && Array.isArray(previous.users) ? previous.users : [];
+  const previousById = new Map(previousUsers.map(user => [user && user.id, user]));
+  return {
+    ...source,
+    users: source.users.map(user => sanitizeOrderUserCredentialFields(user, user && previousById.get(user.id))),
+    orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION
+  };
+}
+
+
 window.HaetsalCombinedApp = (function(){
   const screens = {
     main: document.getElementById('main-screen'),
@@ -11509,9 +11546,9 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202608310048;
-  const APP_BUILD_LABEL = '20260831_0048';
-  const WRITE_SCHEMA_VERSION = 5;
+  const APP_BUILD_NUMBER = 202608310436;
+  const APP_BUILD_LABEL = '20260831_0436';
+  const WRITE_SCHEMA_VERSION = 6;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
   const realtimeUnsubscribers = new Set();
@@ -11790,7 +11827,7 @@ window.HaetsalCloudStore = (function(){
   }
 
   function setCache(key, value, shouldNotify=true){
-    caches[key] = clone(value);
+    caches[key] = clone((key === "shared" || key === "order") ? sanitizeOrderUserCredentialData(value, caches[key]) : value);
     if(shouldNotify) emit(key);
     return clone(caches[key]);
   }
@@ -12173,7 +12210,7 @@ window.HaetsalSharedStore = (function(){
   }
 
   function defaultSharedData(){
-    return { auth: { ...DEFAULT_AUTH }, users: [], deletedUserIds: {}, deletedUserKeys: {} };
+    return { orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION, auth: { ...DEFAULT_AUTH }, users: [], deletedUserIds: {}, deletedUserKeys: {} };
   }
 
   function hasLoadedSharedData(){
@@ -12187,6 +12224,7 @@ window.HaetsalSharedStore = (function(){
         ? window.HaetsalCloudStore.getShared(defaultSharedData)
         : defaultSharedData();
       const normalized = {
+        orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
         auth: { ...DEFAULT_AUTH, ...((stored && stored.auth) || {}) },
         users: Array.isArray(stored && stored.users) ? stored.users.map(normalizeSharedUserPreservingCouponPresence) : [],
         deletedUserIds: { ...(((stored && stored.deletedUserIds) || {})) },
@@ -12201,6 +12239,7 @@ window.HaetsalSharedStore = (function(){
 
   function save(shared){
     const normalized = {
+        orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
       auth: { ...DEFAULT_AUTH, ...((shared && shared.auth) || {}) },
       users: Array.isArray(shared && shared.users)
         ? shared.users.map(user => toSharedUser(user, { omitCouponFields: !!(user && user[OMIT_COUPON_FIELDS_FLAG]) || !hasOwnRecordField(user, 'coupons') }))
@@ -12239,7 +12278,7 @@ window.HaetsalSharedStore = (function(){
       defaultLocation: str(record && record.defaultLocation),
       tumblerInfo: str(record && record.tumblerInfo),
       personalTumblers: normalizePersonalTumblers(record && record.personalTumblers),
-      password: str(record && record.password),
+      passwordProtected: sanitizeOrderUserCredentialFields(record).passwordProtected,
       isStaffMember: !(record && record.isStaffMember === false),
       tumblerDueDate: str(record && record.tumblerDueDate),
       rentedTumbler: str(record && record.rentedTumbler),
@@ -12463,7 +12502,7 @@ window.HaetsalSharedStore = (function(){
     target.defaultLocation = preserveDefaultLocationValue(target, record);
     target.tumblerInfo = preserveTumblerInfoValue(target, record);
     target.personalTumblers = preservePersonalTumblersValue(target, record);
-    target.password = source.password;
+    applyOrderUserCredentialProtection(target, source);
     target.isStaffMember = source.isStaffMember !== false;
     target.tumblerDueDate = source.tumblerDueDate;
     target.rentedTumbler = source.rentedTumbler;
@@ -12574,7 +12613,7 @@ window.HaetsalSharedStore = (function(){
       defaultLocation: str(user.defaultLocation),
       tumblerInfo: str(user.tumblerInfo),
       personalTumblers: normalizePersonalTumblers(user.personalTumblers),
-      password: str(user.password),
+      passwordProtected: sanitizeOrderUserCredentialFields(user).passwordProtected,
       isStaffMember: user.isStaffMember !== false,
       tumblerDueDate: str(user.tumblerDueDate),
       rentedTumbler: str(user.rentedTumbler),
@@ -12641,7 +12680,7 @@ window.HaetsalSharedStore = (function(){
   function syncOrderData(orderData, options){
     const opts = options || {};
     const couponMode = getCouponMode(opts);
-    const localData = clone(orderData || {});
+    const localData = sanitizeOrderUserCredentialData(clone(orderData || {}));
     const shared = read();
     const originalSharedUsers = Array.isArray(shared.users) ? shared.users.map(normalizeSharedUserPreservingCouponPresence) : [];
     let users = filterDeletedSharedUsers(shared, originalSharedUsers);
@@ -12679,6 +12718,7 @@ window.HaetsalSharedStore = (function(){
 
     return {
       ...localData,
+      orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
       users: exportedUsers,
       sysSettings: {
         ...(localData.sysSettings || {}),
@@ -12798,7 +12838,7 @@ window.HaetsalSharedStore = (function(){
     const localList = Array.isArray(localUsers) ? localUsers.map(toSharedUser) : [];
     return (Array.isArray(sharedUsers) ? sharedUsers : []).map(user => {
       const localMatch = findMatchingUser(localList, user);
-      const next = toSharedUser(user);
+      const next = sanitizeOrderUserCredentialFields(toSharedUser(user), localMatch);
       if(localMatch){
         applyCouponFields(next, localMatch, { couponMode: couponMode === 'preserve-local' ? 'force-record' : couponMode });
       }
@@ -12818,7 +12858,7 @@ window.HaetsalSharedStore = (function(){
 
   function hydrateOrderData(orderData, options){
     const opts = options || {};
-    const localData = clone(orderData || {});
+    const localData = sanitizeOrderUserCredentialData(clone(orderData || {}));
     const shared = read();
     const localUsers = Array.isArray(localData.users) ? localData.users : [];
     const sharedHasRealUsers = hasRealSharedUsers(shared.users);
@@ -12828,6 +12868,7 @@ window.HaetsalSharedStore = (function(){
     const shouldTrustSharedUsers = sharedHasRealUsers || (hasDeletedSharedUserRecords(shared) && !localHasRealUsers);
     return {
       ...localData,
+      orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
       users: shouldTrustSharedUsers ? sharedUsers : localUsersWithoutDeleted,
       sysSettings: {
         ...(localData.sysSettings || {}),
@@ -15850,6 +15891,7 @@ window.HaetsalSharedStore = (function(){
 
     function applyAuthoritativeCouponUser(localUser, serverUser){
       if(!localUser || !serverUser) return localUser;
+      applyOrderUserCredentialProtection(localUser, serverUser);
       localUser.coupons = Number(serverUser.coupons || 0);
       localUser.couponsUpdatedAt = String(serverUser.couponsUpdatedAt || '');
       localUser.couponBalanceVersion = getCouponBalanceVersion(serverUser);
@@ -16011,7 +16053,8 @@ window.HaetsalSharedStore = (function(){
         ...defaultData(),
         ...(raw || {}),
         sysSettings: mergedSettings,
-        users: Array.isArray(raw && raw.users) ? raw.users.map(user => ({ ...user, isStaffMember: user && user.isStaffMember === false ? false : true })) : [],
+        users: Array.isArray(raw && raw.users) ? raw.users.map(user => sanitizeOrderUserCredentialFields({ ...user, isStaffMember: user && user.isStaffMember === false ? false : true })) : [],
+        orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
         orders: Array.isArray(raw && raw.orders) ? raw.orders : [],
         deliveryRecords: normalizeDeliveryRecords(raw && raw.deliveryRecords),
         logs: sourceLogs,
@@ -16802,8 +16845,8 @@ window.HaetsalSharedStore = (function(){
 
     function mergeUsersWithLocalProtection(localUsers, incomingUsers, options){
       const couponMode = String((options && options.couponMode) || 'default');
-      const localList = Array.isArray(localUsers) ? localUsers.filter(user => user && typeof user === 'object') : [];
-      const incomingList = Array.isArray(incomingUsers) ? incomingUsers.filter(user => user && typeof user === 'object') : [];
+      const localList = Array.isArray(localUsers) ? localUsers.filter(user => user && typeof user === "object").map(user => sanitizeOrderUserCredentialFields(user)) : [];
+      const incomingList = Array.isArray(incomingUsers) ? incomingUsers.filter(user => user && typeof user === "object").map(user => sanitizeOrderUserCredentialFields(user)) : [];
       if(hasOrderUsersForRemoteOverwriteProtection(localList) && !hasOrderUsersForRemoteOverwriteProtection(incomingList)){
         return localList;
       }
@@ -16814,7 +16857,7 @@ window.HaetsalSharedStore = (function(){
         const incoming = id ? incomingById.get(id) : null;
         if(!incoming) return localUser;
         usedIds.add(id);
-        const next = { ...localUser, ...incoming };
+        const next = sanitizeOrderUserCredentialFields({ ...localUser, ...incoming }, localUser);
         const localCouponVersion = Math.max(0, Math.floor(Number(localUser.couponBalanceVersion || 0)) || 0);
         const incomingCouponVersion = Math.max(0, Math.floor(Number(incoming.couponBalanceVersion || 0)) || 0);
         const localRecalcRunId = String(localUser.lastRecalcRunId || '').trim();
@@ -16878,7 +16921,8 @@ window.HaetsalSharedStore = (function(){
             lastRecalcRunId:String(next.lastRecalcRunId || ''),
             defaultLocation:next.defaultLocation,
             tumblerInfo:next.tumblerInfo,
-            personalTumblers:next.personalTumblers
+            personalTumblers:next.personalTumblers,
+            passwordProtected:next.passwordProtected
           };
         }
         return next;
@@ -25958,7 +26002,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         couponsUpdatedAt: new Date().toISOString(),
         defaultLocation: String(request.defaultLocation || '').trim(),
         tumblerInfo: String(request.tumblerInfo || '').trim(),
-        password: '',
+        passwordProtected: false,
         isStaffMember: request && request.isStaffMember === false ? false : true,
         tumblerDueDate: '',
         rentedTumbler: '',
@@ -30861,6 +30905,7 @@ function invalidateUserPasswordVerification(){
 }
 
 function selectUser(user){
+      user = sanitizeOrderUserCredentialFields(user);
   invalidateUserPasswordVerification();
       ensureOrderItemsRuntime();
       state.cupType = 'TUMBLER';
@@ -30870,7 +30915,7 @@ function selectUser(user){
       state.overdueTumblerAction = '';
       state.isLocationPermanent = false;
       state.isTumblerPermanent = false;
-      if(user.password && !isStaff()){
+      if(user.passwordProtected === true && !isStaff()){
         state.targetUserPwId = user.id;
         state.userPwInput = '';
         state.showUserPwModal = true;
@@ -33994,9 +34039,7 @@ function selectUser(user){
         user.isStaffMember = editData.isStaffMember !== false;
         if(couponDiff === 0) user.coupons = nextCoupons;
         user.updatedAt = userUpdatedAt;
-        if(state.userDetailPasswordReset){
-          user.password = '';
-        }
+        applyOrderUserCredentialProtection(user);
 
         if(adminCouponHistoryRecord){
           markImportantFullBackupPending('admin-coupon-user-detail-important-backup');
@@ -34640,7 +34683,7 @@ function selectUser(user){
         defaultLocation: String(source.defaultLocation || '').trim(),
         tumblerInfo: String(source.tumblerInfo || '').trim(),
         personalTumblers: normalizeOrderPersonalTumblers(source.personalTumblers),
-        password: String(source.password || '').trim(),
+        passwordProtected: sanitizeOrderUserCredentialFields(source).passwordProtected,
         isStaffMember: source.isStaffMember === false ? false : true,
         tumblerDueDate: String(source.tumblerDueDate || '').trim(),
         rentedTumbler: String(source.rentedTumbler || '').trim(),
@@ -34666,7 +34709,7 @@ function selectUser(user){
       const users = Array.isArray(parsed.users)
         ? parsed.users.map(normalizeCouponRestoreBackupUser).filter(user => user.id || user.name)
         : [];
-      return { ...parsed, users };
+      return sanitizeOrderUserCredentialData({ ...parsed, users });
     }
 
     function readCouponRestoreBackup(){
@@ -34890,7 +34933,9 @@ function selectUser(user){
 
     function applyCouponRestoreProfileFields(user, backupUser, timestamp){
       if(!user || !backupUser) return false;
-      let changed = false;
+      const beforeProtected = sanitizeOrderUserCredentialFields(user).passwordProtected;
+      applyOrderUserCredentialProtection(user, backupUser);
+      let changed = beforeProtected !== user.passwordProtected;
       if(backupUser.defaultLocation && String(user.defaultLocation || '').trim() !== backupUser.defaultLocation){
         user.defaultLocation = backupUser.defaultLocation;
         changed = true;
@@ -35091,7 +35136,8 @@ function selectUser(user){
             coupons: Number(user.coupons || 0),
             defaultLocation: user.defaultLocation || '',
             tumblerInfo: user.tumblerInfo || '',
-            personalTumblers: normalizeOrderPersonalTumblers(user.personalTumblers)
+            personalTumblers: normalizeOrderPersonalTumblers(user.personalTumblers),
+          passwordProtected: sanitizeOrderUserCredentialFields(user).passwordProtected
           }))
         }));
         return key;
@@ -35307,7 +35353,7 @@ function selectUser(user){
           if(!serverUser || !serverUser.id) return;
           const localUser = getUserById(serverUser.id);
           if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
-          else state.users.push(JSON.parse(JSON.stringify(serverUser)));
+          else state.users.push(sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(serverUser))));
         });
       }catch(error){
         console.error('쿠폰 복구 전체 원자 저장 실패', error);
@@ -35386,7 +35432,7 @@ function selectUser(user){
           couponsUpdatedAt: userCreatedAt,
           defaultLocation: state.newUserData.defaultLocation.trim(),
           tumblerInfo: state.newUserData.tumblerInfo.trim(),
-          password: state.newUserData.password.trim(),
+          passwordProtected: false,
           isStaffMember: state.newUserData.isStaffMember !== false,
           tumblerDueDate: '',
           rentedTumbler: ''
@@ -35413,7 +35459,7 @@ function selectUser(user){
             couponsUpdatedAt: userCreatedAt,
             defaultLocation: '',
             tumblerInfo: '',
-            password: '',
+            passwordProtected: false,
             isStaffMember: true,
             tumblerDueDate: '',
             rentedTumbler: ''
@@ -35446,7 +35492,7 @@ function selectUser(user){
         committedUsers.forEach(serverUser => {
           const localUser = getUserById(serverUser && serverUser.id);
           if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
-          else if(serverUser) state.users.push(JSON.parse(JSON.stringify(serverUser)));
+          else if(serverUser) state.users.push(sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(serverUser))));
         });
         const savedRecordById = new Map((Array.isArray(result && result.saved) ? result.saved : [])
           .map(record => [String(record && record.id || ''), record]));
@@ -35479,14 +35525,14 @@ function selectUser(user){
       state.ocDept = user.dept || user.department || '';
       state.ocDefaultLocation = user.defaultLocation || '';
       state.ocTumblerInfo = user.tumblerInfo || '';
-      state.ocIsSecure = !!user.password;
-      state.ocPassword = user.password || '';
+      state.ocIsSecure = sanitizeOrderUserCredentialFields(user).passwordProtected;
+      state.ocPassword = "";
     }
 
     function handleSaveOwnSettings(){
       const user = getOwnSettingsTargetUser();
       if(!user){ showMessage('사용자를 찾을 수 없습니다.'); return; }
-      if(state.ocIsSecure && String(state.ocPassword || '').length < 4){
+      if(!ORDER_USER_PASSWORD_MANAGEMENT_FROZEN && state.ocIsSecure && String(state.ocPassword || "").length < 4){
         showMessage('비밀번호는 최소 4자리 이상 입력해주세요.');
         return;
       }
@@ -35495,7 +35541,7 @@ function selectUser(user){
       user.department = state.ocDept.trim();
       user.defaultLocation = state.ocDefaultLocation.trim();
       user.tumblerInfo = state.ocTumblerInfo.trim();
-      user.password = state.ocIsSecure ? state.ocPassword : '';
+      applyOrderUserCredentialProtection(user);
       saveData();
       state.ocIsSaved = true;
       render();
@@ -37761,14 +37807,15 @@ function selectUser(user){
     }
 
     function handleResetUserPassword(userId){
+      if(ORDER_USER_PASSWORD_MANAGEMENT_FROZEN) return;
       const user = getUserById(userId);
       if(!user){ showMessage('사용자를 찾을 수 없습니다.'); return; }
-      if(!user.password){
+      if(!sanitizeOrderUserCredentialFields(user).passwordProtected){
         showMessage('현재 비밀번호가 설정되어 있지 않습니다.');
         return;
       }
       if(!window.confirm(`${user.name} 사용자의 비밀번호를 초기화하시겠습니까?\n초기화 후에는 보안설정이 해제됩니다.`)) return;
-      user.password = '';
+      return; // Credential resets require a separate authenticated server implementation.
       saveData();
       state.userDetailPasswordReset = false;
       render();
@@ -38600,7 +38647,7 @@ function selectUser(user){
           ${filteredUsers.map(item => `
             <button type="button" class="search-item" data-action="select-user" data-user-id="${item.id}" data-order-user-direct="1">
               <div style="text-align:left;min-width:0">
-                <div class="search-main">${escapeHtml(item.name)} <span class="search-sub">(${escapeHtml(item.dept || '소속없음')})</span> ${item.password ? '🔒' : ''}</div>
+                <div class="search-main">${escapeHtml(item.name)} <span class="search-sub">(${escapeHtml(item.dept || '소속없음')})</span> ${sanitizeOrderUserCredentialFields(item).passwordProtected ? '🔒' : ''}</div>
               </div>
             </button>
           `).join('')}
@@ -42058,8 +42105,8 @@ function selectUser(user){
           <div class="field"><label>기본 배달 장소</label><input id="ocDefaultLocation" class="input" type="text" placeholder="예: 교무실 1" value="${escapeHtml(state.ocDefaultLocation)}"></div>
           <div class="field"><label>텀블러 정보 (기본값)</label><input id="ocTumblerInfo" class="input" type="text" placeholder="예: 보라색 스탠리" value="${escapeHtml(state.ocTumblerInfo)}"></div>
           <div class="card" style="padding:16px;border-radius:18px;background:${state.ocIsSecure ? '#fffbeb' : '#f9fafb'};border:2px solid ${state.ocIsSecure ? '#fcd34d' : '#eee'}">
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:900"><input id="ocIsSecure" type="checkbox" ${state.ocIsSecure ? 'checked' : ''}> ${state.ocIsSecure ? '🔒' : '🔓'} 계정 보안 (비밀번호 사용)</label>
-            ${state.ocIsSecure ? `<div class="field" style="margin-top:12px"><input id="ocPassword" class="input" type="password" placeholder="비밀번호 입력" value="${escapeHtml(state.ocPassword)}" style="text-align:center;letter-spacing:.2em;background:#fff"></div>` : ''}
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:900"><input id="ocIsSecure" disabled type="checkbox" ${state.ocIsSecure ? 'checked' : ''}> ${state.ocIsSecure ? '🔒' : '🔓'} 계정 보안 (비밀번호 사용)</label>
+            ${state.ocIsSecure ? `<div class="field" style="margin-top:12px"><input id="ocPassword" disabled class="input" type="password" placeholder="비밀번호 입력" value="${escapeHtml(state.ocPassword)}" style="text-align:center;letter-spacing:.2em;background:#fff"></div>` : ''}
           </div>
           <button class="btn ${state.ocIsSaved ? 'btn-emerald' : 'btn-dark'}" style="width:100%;margin-top:16px" data-action="save-own-settings">${state.ocIsSaved ? '✅ 저장 완료!' : '저장 및 닫기'}</button>
         `, 'large');
@@ -42138,8 +42185,8 @@ function selectUser(user){
             <div class="row">
               <div class="field">
                 <label>보안설정</label>
-                <div class="input" style="background:#fff">${isEditMode ? (state.userDetailPasswordReset ? '저장 시 해제됨' : (user.password ? '설정됨' : '해제됨')) : (user.password ? '설정됨' : '해제됨')}</div>
-                ${isEditMode ? (user.password && !state.userDetailPasswordReset ? `<button class="btn btn-outline" style="width:100%;margin-top:8px;color:#2563eb;border-color:#bfdbfe" data-action="request-user-password-reset" data-user-id="${user.id}">비밀번호 초기화</button>` : `<div class="help-note" style="margin-top:8px">${state.userDetailPasswordReset ? '저장하면 비밀번호가 초기화됩니다.' : '현재 비밀번호가 설정되어 있지 않습니다.'}</div>`) : ''}
+                <div class="input" style="background:#fff">${isEditMode ? (state.userDetailPasswordReset ? '저장 시 해제됨' : (sanitizeOrderUserCredentialFields(user).passwordProtected ? '설정됨' : '해제됨')) : (sanitizeOrderUserCredentialFields(user).passwordProtected ? '설정됨' : '해제됨')}</div>
+                ${isEditMode ? (sanitizeOrderUserCredentialFields(user).passwordProtected && !state.userDetailPasswordReset ? `<button class="btn btn-outline" style="width:100%;margin-top:8px;color:#2563eb;border-color:#bfdbfe" data-action="request-user-password-reset" disabled data-user-id="${user.id}">비밀번호 초기화</button>` : `<div class="help-note" style="margin-top:8px">${state.userDetailPasswordReset ? '저장하면 비밀번호가 초기화됩니다.' : '현재 비밀번호가 설정되어 있지 않습니다.'}</div>`) : ''}
               </div>
               <div class="field"><label>현재 대여 텀블러</label><div class="input" style="background:#fff">${escapeHtml(user.rentedTumbler || '없음')}</div></div>
             </div>
@@ -42368,7 +42415,7 @@ function selectUser(user){
             <div class="field"><input id="newUserCoupons" class="input" type="number" placeholder="초기 쿠폰 수량" value="${escapeHtml(state.newUserData.coupons)}"></div>
             <div class="field"><input id="newUserLocation" class="input" type="text" placeholder="기본 배달 장소 (선택)" value="${escapeHtml(state.newUserData.defaultLocation)}"></div>
             <div class="field"><input id="newUserTumbler" class="input" type="text" placeholder="개인 텀블러 정보 (선택)" value="${escapeHtml(state.newUserData.tumblerInfo)}"></div>
-            <div class="field"><input id="newUserPassword" class="input" type="text" placeholder="초기 암호/비밀번호 (선택)" value="${escapeHtml(state.newUserData.password)}"></div>
+            <div class="field"><input id="newUserPassword" disabled class="input" type="text" placeholder="초기 암호/비밀번호 (선택)" value="${escapeHtml("")}"></div>
           ` : `
             <div class="help-note" style="margin-bottom:10px">이름, 부서, 초기쿠폰수를 쉼표(,)나 탭으로 구분하여 한 줄에 한 명씩 입력하세요.<br>예시)<br>홍길동, 교무실, 10<br>김철수, 행정실, 5</div>
             <div class="field"><textarea id="bulkUsersText" class="textarea" placeholder="홍길동, 교무실, 10&#10;김철수, 행정실, 5">${escapeHtml(state.bulkUsersText)}</textarea></div>
@@ -42737,7 +42784,7 @@ function selectUser(user){
       if(t.id === 'ocDept'){ state.ocDept = t.value; return; }
       if(t.id === 'ocDefaultLocation'){ state.ocDefaultLocation = t.value; return; }
       if(t.id === 'ocTumblerInfo'){ state.ocTumblerInfo = t.value; return; }
-      if(t.id === 'ocPassword'){ state.ocPassword = t.value; return; }
+      if(t.id === "ocPassword"){ if(ORDER_USER_PASSWORD_MANAGEMENT_FROZEN) return; state.ocPassword = t.value; return; }
       if(t.id === 'editUserName'){ state.editUserData.name = t.value; return; }
       if(t.id === 'editUserDept'){ state.editUserData.dept = t.value; return; }
       if(t.id === 'editUserLocation'){ state.editUserData.defaultLocation = t.value; return; }
@@ -42753,7 +42800,7 @@ function selectUser(user){
       if(t.id === 'newUserCoupons'){ state.newUserData.coupons = t.value; return; }
       if(t.id === 'newUserLocation'){ state.newUserData.defaultLocation = t.value; return; }
       if(t.id === 'newUserTumbler'){ state.newUserData.tumblerInfo = t.value; return; }
-      if(t.id === 'newUserPassword'){ state.newUserData.password = t.value; return; }
+      if(t.id === "newUserPassword"){ if(ORDER_USER_PASSWORD_MANAGEMENT_FROZEN) return; state.newUserData.password = t.value; return; }
       if(t.id === 'bulkUsersText'){ state.bulkUsersText = t.value; return; }
       if(t.id === 'adminUserSearch'){
         state.adminUserSearch = t.value;
@@ -43090,7 +43137,7 @@ function selectUser(user){
         render();
         return;
       }
-      if(t.id === 'ocIsSecure'){ state.ocIsSecure = t.checked; render(); return; }
+      if(t.id === "ocIsSecure"){ if(ORDER_USER_PASSWORD_MANAGEMENT_FROZEN) return; state.ocIsSecure = t.checked; render(); return; }
       if(t.id === 'selectAllUsers'){
         ensureDashboardRuntimeDefaults();
         const visibleUsers = getAdminUsersForDisplay();
@@ -45090,10 +45137,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         state.userDetailPasswordReset = false;
         render();
       }
-      else if(action === 'request-user-password-reset'){
+      else if(action === "request-user-password-reset"){
+        if(ORDER_USER_PASSWORD_MANAGEMENT_FROZEN) return;
         const user = getUserById(btn.dataset.userId || state.viewingUserId);
         if(!user) return;
-        if(!user.password){
+        if(!sanitizeOrderUserCredentialFields(user).passwordProtected){
           showMessage('현재 비밀번호가 설정되어 있지 않습니다.');
           return;
         }
@@ -50236,7 +50284,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
 
   function getPayloadData(raw){
     const source = raw && typeof raw === 'object' ? raw : {};
-    return source.data && typeof source.data === 'object' ? source.data : source;
+    return sanitizeOrderUserCredentialData(source.data && typeof source.data === "object" ? source.data : source);
   }
 
   function getOfficialLiveOrderFromData(raw){
@@ -52351,14 +52399,14 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       const currentVersion = normalizeCouponBalanceVersionValue(currentUser.couponBalanceVersion);
       const nextCoupons = currentCoupons - amount;
       const nextSharedData = JSON.parse(JSON.stringify(sharedData));
-      const nextUser = {
+      const nextUser = sanitizeOrderUserCredentialFields({
         ...nextSharedData.users[userIndex],
         coupons:nextCoupons,
         couponsUpdatedAt:now,
         couponBalanceVersion:currentVersion + 1,
         lastRecalcRunId:String(currentUser.lastRecalcRunId || ''),
         updatedAt:now
-      };
+      });
       nextSharedData.users[userIndex] = nextUser;
       const couponEntry = prepareCouponEventCloudEntry({
         id:couponRecordId,
@@ -54072,7 +54120,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
   }
 
   function attachRemoteDataGuard(data, savedAt){
-    const cloned = JSON.parse(JSON.stringify(data));
+    const cloned = JSON.parse(JSON.stringify(sanitizeOrderUserCredentialData(data)));
     if(cloned && typeof cloned === 'object' && !Array.isArray(cloned)){
       cloned[REMOTE_DATA_GUARD_FIELD] = {
         dataGuardVersion: REMOTE_DATA_GUARD_VERSION,
@@ -54493,7 +54541,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
 
   function unwrapCouponRecalcDocData(snapshotOrData){
     const raw = snapshotOrData && typeof snapshotOrData.data === 'function' ? snapshotOrData.data() : snapshotOrData;
-    return raw && raw.data && typeof raw.data === 'object' ? raw.data : raw;
+    return sanitizeOrderUserCredentialData(raw && raw.data && typeof raw.data === "object" ? raw.data : raw);
   }
 
   function getCouponRecalcSharedUserFromData(sharedData, userId){
@@ -54515,7 +54563,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     const sharedData = unwrapCouponRecalcDocData(snapshot);
     const user = getCouponRecalcSharedUserFromData(sharedData, targetUserId);
     if(!user) throw new Error('서버 사용자 명단에서 재계산할 사용자를 찾을 수 없습니다.');
-    return { user:JSON.parse(JSON.stringify(user)), sharedData:JSON.parse(JSON.stringify(sharedData)) };
+    return { user:sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user))), sharedData:JSON.parse(JSON.stringify(sharedData)) };
   }
 
   function assertCouponRecalcDocMatches(snapshot, expected, kind){
@@ -54968,14 +55016,14 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
 
         const nextSharedData = JSON.parse(JSON.stringify(sharedData));
         const nextCouponBalanceVersion = Math.max(0, Math.floor(Number(currentServerUser.couponBalanceVersion || 0)) || 0) + 1;
-        nextSharedData.users[userIndex] = {
+        nextSharedData.users[userIndex] = sanitizeOrderUserCredentialFields({
           ...nextSharedData.users[userIndex],
           coupons:finalBalance,
           couponsUpdatedAt:appliedAtClient,
           couponBalanceVersion:nextCouponBalanceVersion,
           lastRecalcRunId:runId,
           updatedAt:appliedAtClient
-        };
+        });
         transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
         grantEntries.forEach((entry, index) => {
           if(grantSnapshots[index].exists()) return;
@@ -55352,7 +55400,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
             defaultLocation:String(source.defaultLocation || '').trim(),
             tumblerInfo:String(source.tumblerInfo || '').trim(),
             personalTumblers:couponRestoreMode && Array.isArray(source.personalTumblers) ? JSON.parse(JSON.stringify(source.personalTumblers)) : [],
-            password:String(source.password || '').trim(),
+            passwordProtected:couponRestoreMode ? sanitizeOrderUserCredentialFields(source).passwordProtected : false,
             isStaffMember:source.isStaffMember === false ? false : true,
             tumblerDueDate:String(source.tumblerDueDate || '').trim(),
             rentedTumbler:String(source.rentedTumbler || '').trim(),
@@ -55394,7 +55442,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       if(!verifiedUser || Number(verifiedUser.coupons || 0) !== Number(user && user.coupons || 0)){
         throw new Error('신규 사용자 저장 결과가 요청과 일치하지 않습니다.');
       }
-      return JSON.parse(JSON.stringify(verifiedUser));
+      return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(verifiedUser)));
     });
     const saved = [];
     for(const entry of entries){
@@ -55442,14 +55490,14 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     const updatedAt = String(source.updatedAt || new Date().toISOString());
     const nextVersion = currentVersion + 1;
     const nextSharedData = JSON.parse(JSON.stringify(sharedData));
-    nextSharedData.users[userIndex] = {
+    nextSharedData.users[userIndex] = sanitizeOrderUserCredentialFields({
       ...nextSharedData.users[userIndex],
       coupons:nextCoupons,
       couponsUpdatedAt:updatedAt,
       couponBalanceVersion:nextVersion,
       lastRecalcRunId:currentRunId,
       updatedAt
-    };
+    });
     return {
       userIndex,
       currentUser,
@@ -55482,7 +55530,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       defaultLocation:String(source.defaultLocation || '').trim(),
       tumblerInfo:String(source.tumblerInfo || '').trim(),
       personalTumblers:Array.isArray(source.personalTumblers) ? JSON.parse(JSON.stringify(source.personalTumblers)) : [],
-      password:String(source.password || '').trim(),
+      passwordProtected:sanitizeOrderUserCredentialFields(source).passwordProtected,
       isStaffMember:source.isStaffMember === false ? false : true,
       tumblerDueDate:String(source.tumblerDueDate || '').trim(),
       rentedTumbler:String(source.rentedTumbler || '').trim(),
@@ -55501,7 +55549,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
   }
 
   function applyCouponRestoreTransactionProfile(user, profile, updatedAt){
-    const nextUser = JSON.parse(JSON.stringify(user || {}));
+    const nextUser = sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user || {})), profile);
     const source = profile && typeof profile === 'object' ? profile : null;
     if(!source) return nextUser;
     let changed = false;
@@ -55548,7 +55596,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       && String(actual.defaultLocation || '').trim() === String(expected.defaultLocation || '').trim()
       && String(actual.tumblerInfo || '').trim() === String(expected.tumblerInfo || '').trim()
       && JSON.stringify(Array.isArray(actual.personalTumblers) ? actual.personalTumblers : []) === JSON.stringify(Array.isArray(expected.personalTumblers) ? expected.personalTumblers : [])
-      && String(actual.password || '').trim() === String(expected.password || '').trim()
+      && sanitizeOrderUserCredentialFields(actual).passwordProtected === sanitizeOrderUserCredentialFields(expected).passwordProtected
       && (actual.isStaffMember === false ? false : true) === (expected.isStaffMember === false ? false : true)
       && String(actual.tumblerDueDate || '').trim() === String(expected.tumblerDueDate || '').trim()
       && String(actual.rentedTumbler || '').trim() === String(expected.rentedTumbler || '').trim()
@@ -55572,12 +55620,12 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         || !couponRestoreTransactionProfileMatches(user, row.profile)){
         return { applied:false, users:[] };
       }
-      authoritativeUsers.push(JSON.parse(JSON.stringify(user)));
+      authoritativeUsers.push(sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user))));
     }
     for(const expected of missingRows){
       const user = users.find(item => String(item && item.id || '') === String(expected.id || ''));
       if(!couponRestoreTransactionMissingUserMatches(user, expected)) return { applied:false, users:[] };
-      authoritativeUsers.push(JSON.parse(JSON.stringify(user)));
+      authoritativeUsers.push(sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user))));
     }
     return { applied:true, users:authoritativeUsers };
   }
@@ -56201,7 +56249,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         if(nextSharedData.users.some(existing => getCouponRestoreTransactionProfileKey(existing) === profileKey)){
           throw new Error('동일한 이름과 부서의 사용자가 이미 등록되어 있습니다.');
         }
-        const normalizedUser = JSON.parse(JSON.stringify(user));
+        const normalizedUser = sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user)));
         nextSharedData.users.push(normalizedUser);
         updatedUsers.push(normalizedUser);
       });
@@ -56328,7 +56376,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           commitConfirmed:true,
           commitStatus:'COMMIT_CONFIRMED_BUT_READ_UNAVAILABLE',
           idempotent:!!transactionResult.idempotent,
-          users:(Array.isArray(transactionResult.users) ? transactionResult.users : []).map(user => JSON.parse(JSON.stringify(user))),
+          users:(Array.isArray(transactionResult.users) ? transactionResult.users : []).map(user => sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user)))),
           sharedData:transactionResult.sharedData ? JSON.parse(JSON.stringify(transactionResult.sharedData)) : null,
           saved:entries.map(entry => ({ ...entry.finalPayload, cloudStored:true, serverVerified:false })),
           count:entries.length,
@@ -56411,7 +56459,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     return {
       ok:true,
       idempotent:!!(result && result.idempotent),
-      user:JSON.parse(JSON.stringify(verifiedUser)),
+      user:sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(verifiedUser))),
       sharedData:JSON.parse(JSON.stringify(verifiedSharedData)),
       couponBalanceVersion:normalizeCouponBalanceVersionValue(verifiedUser.couponBalanceVersion),
       couponRecord:savedRecord
@@ -56447,7 +56495,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       if(!user || Number(user.coupons || 0) !== Number(mutation.nextCoupons)){
         throw new Error('쿠폰 잔액 일괄 변경 후 서버 저장 결과가 요청과 일치하지 않습니다.');
       }
-      return JSON.parse(JSON.stringify(user));
+      return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user)));
     });
     return { ok:true, users:verifiedUsers, sharedData:JSON.parse(JSON.stringify(verifiedSharedData)) };
   }
@@ -56519,7 +56567,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         if(!user || Number(user.coupons || 0) !== Number(mutation.nextCoupons)){
           throw new Error('쿠폰 지급 후 서버 저장 결과가 요청과 일치하지 않습니다.');
         }
-        return JSON.parse(JSON.stringify(user));
+        return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user)));
       });
       const saved = [];
       for(const entry of entries){
@@ -56535,7 +56583,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         transactionResult
       };
     }
-    const committedUsers = (Array.isArray(transactionResult && transactionResult.users) ? transactionResult.users : []).map(user => JSON.parse(JSON.stringify(user)));
+    const committedUsers = (Array.isArray(transactionResult && transactionResult.users) ? transactionResult.users : []).map(user => sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user))));
     const committedSharedData = transactionResult && transactionResult.sharedData
       ? JSON.parse(JSON.stringify(transactionResult.sharedData))
       : null;
@@ -56570,11 +56618,11 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         if(!user || Number(user.coupons || 0) !== Number(mutation.nextCoupons)){
           throw new Error('쿠폰 지급 후 서버 저장 결과가 요청과 일치하지 않습니다.');
         }
-        return JSON.parse(JSON.stringify(user));
+        return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user)));
       });
     }catch(error){
       const authoritativeUsers = verifiedSharedData
-        ? rows.map(mutation => getCouponRecalcSharedUserFromData(verifiedSharedData, mutation.userId)).filter(Boolean).map(user => JSON.parse(JSON.stringify(user)))
+        ? rows.map(mutation => getCouponRecalcSharedUserFromData(verifiedSharedData, mutation.userId)).filter(Boolean).map(user => sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(user))))
         : [];
       return {
         ok:false,
@@ -57155,7 +57203,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         if(!transactionResult.idempotent && Number(verifiedUser.coupons || 0) !== Number(mutation.nextCoupons)){
           throw new Error('앱 미사용일 차감 후 서버 잔액이 요청과 일치하지 않습니다.');
         }
-        return JSON.parse(JSON.stringify(verifiedUser));
+        return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(verifiedUser)));
       });
     }
     return {
@@ -57386,13 +57434,13 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 수정 잔액 증감값이 올바르지 않습니다.');
     }
     const nextVersion = normalizeCouponBalanceVersionValue(currentUser.couponBalanceVersion) + 1;
-    sharedData.users[userIndex] = {
+    sharedData.users[userIndex] = sanitizeOrderUserCredentialFields({
       ...currentUser,
       coupons:remainingCoupons,
       couponsUpdatedAt:operation.createdAtClient,
       couponBalanceVersion:nextVersion,
       updatedAt:operation.createdAtClient
-    };
+    });
     return {
       userId:descriptor.userId,
       delta,
@@ -57662,7 +57710,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       verifiedUsers = Array.from(new Set(descriptors.map(row => row.userId))).map(userId => {
         const verifiedUser = getCouponRecalcSharedUserFromData(verifiedSharedData, userId);
         if(!verifiedUser) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 후 서버 사용자를 확인하지 못했습니다.');
-        return JSON.parse(JSON.stringify(verifiedUser));
+        return sanitizeOrderUserCredentialFields(JSON.parse(JSON.stringify(verifiedUser)));
       });
     }
     return {
@@ -57826,7 +57874,8 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     outgoing.users = outgoingUsers.map(user => {
       const userId = String((user && user.id) || '');
       const serverUser = userId ? serverById.get(userId) : null;
-      if(!serverUser) return user;
+      if(!serverUser) return sanitizeOrderUserCredentialFields(user);
+      user = sanitizeOrderUserCredentialFields(user, serverUser);
       const serverVersion = normalizeCouponBalanceVersionValue(serverUser.couponBalanceVersion);
       const outgoingVersion = normalizeCouponBalanceVersionValue(user && user.couponBalanceVersion);
       const serverRunId = String(serverUser.lastRecalcRunId || '');
@@ -57847,7 +57896,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       }
       return user;
     });
-    return outgoing;
+    return sanitizeOrderUserCredentialData(outgoing, serverData);
   }
 
   async function saveSharedWithCouponVersionProtection(ref, value){

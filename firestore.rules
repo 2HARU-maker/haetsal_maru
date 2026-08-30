@@ -124,6 +124,16 @@ service cloud.firestore {
       return request.resource.data.data is map;
     }
 
+    // v6 adds credential profile markers; Rules cannot inspect every map in users.
+    function hasOrderUserCredentialSchema(docId) {
+      return !(isSharedPeopleAuthDocId(docId) || docId == 'order_data')
+        || (request.resource.data.writeSchemaVersion is int
+          && request.resource.data.writeSchemaVersion >= 6
+          && request.resource.data.data is map
+          && request.resource.data.data.orderUserCredentialSchemaVersion is int
+          && request.resource.data.data.orderUserCredentialSchemaVersion == 1);
+    }
+
     function isSharedPeopleAuthDocId(docId) {
       return docId == 'shared_people_auth';
     }
@@ -2430,6 +2440,10 @@ service cloud.firestore {
         && after.savedTime >= before.savedTime;
     }
 
+    match /haetsalCredentialMigrationRuns/{document=**} {
+      allow read, write: if false;
+    }
+
     match /haetsalUserCredentialVerifiers/{document=**} {
       allow read, write: if false;
     }
@@ -2443,6 +2457,7 @@ service cloud.firestore {
         && topCollection != 'haetsalCombinedApp'
         && topCollection != 'haetsalUserCredentialVerifiers'
         && topCollection != 'haetsalUserCredentialRateLimits'
+        && topCollection != 'haetsalCredentialMigrationRuns'
         && topCollection != 'haetsalRestoreAuditRuns'
         && topCollection != 'haetsalRestoreAudits'
         && topCollection != 'haetsalUserAccountStatus'
@@ -2456,6 +2471,7 @@ service cloud.firestore {
         && topCollection != 'haetsalCombinedApp'
         && topCollection != 'haetsalUserCredentialVerifiers'
         && topCollection != 'haetsalUserCredentialRateLimits'
+        && topCollection != 'haetsalCredentialMigrationRuns'
         && topCollection != 'haetsalRestoreAuditRuns'
         && topCollection != 'haetsalRestoreAudits'
         && topCollection != 'haetsalCompletedOrders'
@@ -2571,6 +2587,7 @@ service cloud.firestore {
           && resource.data.data.payloadKind == 'coupon-event'
         );
       allow create: if docId != 'app_runtime_policy'
+        && hasOrderUserCredentialSchema(docId)
         && hasCouponBalanceGuardSchema(docId)
         && (
           (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthCreate(docId))
@@ -2598,6 +2615,7 @@ service cloud.firestore {
           )
         );
       allow update: if docId != 'app_runtime_policy'
+        && hasOrderUserCredentialSchema(docId)
         && hasCouponBalanceGuardSchema(docId)
         && (
           (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthUpdate(docId))
