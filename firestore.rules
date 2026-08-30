@@ -2430,9 +2430,19 @@ service cloud.firestore {
         && after.savedTime >= before.savedTime;
     }
 
+    match /haetsalUserCredentialVerifiers/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /haetsalUserCredentialRateLimits/{document=**} {
+      allow read, write: if false;
+    }
+
     match /{topCollection}/{document=**} {
       allow read: if isSignedIn()
         && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalUserCredentialVerifiers'
+        && topCollection != 'haetsalUserCredentialRateLimits'
         && topCollection != 'haetsalRestoreAuditRuns'
         && topCollection != 'haetsalRestoreAudits'
         && topCollection != 'haetsalUserAccountStatus'
@@ -2444,6 +2454,8 @@ service cloud.firestore {
         && topCollection != 'haetsalOfflineCouponEdits';
       allow create, update, delete: if isSignedIn()
         && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalUserCredentialVerifiers'
+        && topCollection != 'haetsalUserCredentialRateLimits'
         && topCollection != 'haetsalRestoreAuditRuns'
         && topCollection != 'haetsalRestoreAudits'
         && topCollection != 'haetsalCompletedOrders'

@@ -11509,8 +11509,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202608301940;
-  const APP_BUILD_LABEL = '20260830_1940';
+  const APP_BUILD_NUMBER = 202608310048;
+  const APP_BUILD_LABEL = '20260831_0048';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -30852,7 +30852,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
         ${renderOrderMenuManageSection()}
       `;
     }
-    function selectUser(user){
+    let userPasswordVerificationGeneration = 0;
+let userPasswordVerificationInFlight = null;
+
+function invalidateUserPasswordVerification(){
+  userPasswordVerificationGeneration += 1;
+  userPasswordVerificationInFlight = null;
+}
+
+function selectUser(user){
+  invalidateUserPasswordVerification();
       ensureOrderItemsRuntime();
       state.cupType = 'TUMBLER';
       state.deliveryType = 'PICKUP';
@@ -43932,15 +43941,40 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(user) selectUser(user);
       }
       else if(action === 'close-user-pw-modal'){
+        invalidateUserPasswordVerification();
         state.showUserPwModal = false;
         state.targetUserPwId = null;
         state.userPwInput = '';
         render();
       }
-      else if(action === 'confirm-user-pw'){
-        const targetUser = getUserById(state.targetUserPwId);
-        if(!targetUser) return;
-        if(state.userPwInput === targetUser.password){
+      else if(action === "confirm-user-pw"){
+  const targetUser = getUserById(state.targetUserPwId);
+  if(!targetUser || !state.showUserPwModal || userPasswordVerificationInFlight) return;
+  const attempt = {
+    requestId: Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, "0")).join(""),
+    targetUserId: targetUser.id,
+    generation: userPasswordVerificationGeneration
+  };
+  userPasswordVerificationInFlight = attempt;
+  const isCurrentAttempt = () => userPasswordVerificationInFlight === attempt
+    && userPasswordVerificationGeneration === attempt.generation
+    && state.showUserPwModal && state.targetUserPwId === attempt.targetUserId;
+  const payload = {
+    userId: targetUser.id,
+    password: state.userPwInput,
+    requestId: attempt.requestId,
+    appBuildNumber: window.HaetsalRuntimeGuard.APP_BUILD_NUMBER,
+    verifierProtocolVersion: 1
+  };
+  Promise.resolve().then(() => {
+    if(!window.HaetsalOrderPasswordVerifier) throw new Error("Verification unavailable");
+    return window.HaetsalOrderPasswordVerifier.verify(payload);
+  }).then(result => {
+    if(!isCurrentAttempt()) return;
+    if(!result || result.verified !== true || result.requestId !== attempt.requestId || result.verifierProtocolVersion !== 1){
+      throw new Error("Invalid verification response");
+    }
+    userPasswordVerificationInFlight = null;
           state.selectedUserId = targetUser.id;
           state.searchTerm = '';
           state.showUserPwModal = false;
@@ -43956,10 +43990,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
           resetOrderMobileScroll();
           maybeOpenUserMessagePopupForUser(targetUser.id);
           hydrateUserRecentCouponHistory(targetUser.id, { renderAfter:true });
-        }else{
-          showMessage('비밀번호가 일치하지 않습니다.');
-        }
-      }
+  }).catch(error => {
+    if(!isCurrentAttempt()) return;
+    userPasswordVerificationInFlight = null;
+    showMessage(error && (error.code === "functions/permission-denied" || error.code === "functions/resource-exhausted")
+      ? "비밀번호가 일치하지 않습니다." : "클라우드 연결 실패");
+  });
+}
       else if(action === 'set-cup-type'){
         const value = btn.dataset.value;
         state.cupType = value;
@@ -49716,6 +49753,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-app.js";
   import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence, getIdTokenResult } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
   import { getFirestore, doc, collection, onSnapshot, setDoc, getDoc, getDocFromServer, getDocs, getDocsFromServer, query, where, orderBy, limit, documentId, runTransaction, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
+import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-functions.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBfEwPirSANZ2s7CzRvlUeFDnYNxWITuew",
@@ -49738,7 +49776,17 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return result.user;
   }
 
-  async function verifyFirebaseOperatorUser(user, forceRefresh){
+  const orderPasswordFunctions = getFunctions(app, "us-central1");
+const verifyOrderPasswordCallable = httpsCallable(orderPasswordFunctions, "verifyOrderUserPassword", { timeout: 10000 });
+window.HaetsalOrderPasswordVerifier = Object.freeze({
+  async verify(payload){
+    await ensureAnonymousLogin();
+    const response = await verifyOrderPasswordCallable(payload);
+    return response.data;
+  }
+});
+
+async function verifyFirebaseOperatorUser(user, forceRefresh){
     if(!user || user.isAnonymous){
       verifiedAdminUid = '';
       verifiedManagerUid = '';
