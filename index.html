@@ -12959,6 +12959,8 @@ window.HaetsalSharedStore = (function(){
     const ORDER_CANCELLED_FOLLOWUP_QUEUE_MAX_COUNT = 500;
     const ORDER_IMPORTANT_FULL_BACKUP_QUEUE_LOCAL_KEY = 'haetsalmaru_order_important_full_backup_queue_v1';
     const ORDER_OFFLINE_COUPON_USE_HISTORY_GUARD_LOCAL_KEY = 'haetsalmaru_order_offline_coupon_use_history_guard_v1';
+    const ORDER_OFFLINE_COUPON_EDIT_PENDING_LOCAL_KEY = 'haetsalmaru_order_offline_coupon_edit_pending_v1';
+    const ORDER_OFFLINE_COUPON_EDIT_PENDING_MAX_COUNT = 50;
     const ORDER_COUPON_EVENT_RETRY_QUEUE_LOCAL_KEY = 'haetsalmaru_order_coupon_event_retry_queue_v1';
     const ORDER_COUPON_EVENT_RETRY_DELAY_MS = 1200;
     const ORDER_COUPON_EVENT_RETRY_FAILURE_DELAY_MS = 15000;
@@ -13651,6 +13653,9 @@ window.HaetsalSharedStore = (function(){
         couponHistoryRecoverySavedKeys: [],
         showOfflineCouponUseModal: false,
         offlineCouponUseEditId: '',
+        offlineCouponUseEditBaseRevision: 0,
+        offlineCouponUseEditBaseState: null,
+        offlineCouponUseEditCurrentByRecordId: {},
         offlineCouponUseSearch: '',
         offlineCouponUseData: { usedDate: getTodayString(), userId:'', amount:1, reason:'앱 미사용일 수기 차감' },
         showAddUserModal: false,
@@ -14768,6 +14773,13 @@ window.HaetsalSharedStore = (function(){
         const value = String(source[key] || '').trim();
         if(value) normalized[key] = value;
       });
+      ['restoreBatchId','restoreManifestId','restoreOperationId'].forEach(key => {
+        const value = String(source[key] || '').trim();
+        if(value) normalized[key] = value;
+      });
+      if(Number.isInteger(Number(source.restorePolicyVersion)) && Number(source.restorePolicyVersion) > 0){
+        normalized.restorePolicyVersion = Number(source.restorePolicyVersion);
+      }
       return normalized;
     }
 
@@ -15115,6 +15127,10 @@ window.HaetsalSharedStore = (function(){
         restoreManualChargeIncluded: !!(meta && meta.restoreManualChargeIncluded),
         restoreOrderRefund: meta && meta.restoreOrderRefund,
         restoreOrderEditDelta: meta && meta.restoreOrderEditDelta,
+        restoreBatchId: (meta && meta.restoreBatchId) || '',
+        restoreManifestId: (meta && meta.restoreManifestId) || '',
+        restoreOperationId: (meta && meta.restoreOperationId) || '',
+        restorePolicyVersion: meta && meta.restorePolicyVersion,
         sourceLogId: (meta && meta.sourceLogId) || '',
         source: (meta && meta.source) || 'manual-coupon-change',
         createdAtClient: (meta && meta.timestamp) || new Date().toISOString(),
@@ -15271,6 +15287,307 @@ window.HaetsalSharedStore = (function(){
         return false;
       }finally{
         offlineCouponUseCloudHydrationInFlight = false;
+      }
+    }
+
+    function normalizeOfflineCouponEditEffectiveState(source, fallback){
+      const primary = source && typeof source === 'object' ? source : {};
+      const base = fallback && typeof fallback === 'object' ? fallback : {};
+      const userId = String(primary.userId != null ? primary.userId : base.userId || '').trim();
+      const amountValue = primary.amount != null ? primary.amount : (base.amount != null ? base.amount : Math.abs(Number(base.delta || 0)));
+      const amount = Math.floor(Math.abs(Number(amountValue || 0)));
+      const usedDate = String(primary.usedDate != null ? primary.usedDate : (base.usedDate || getDateString(base.timestamp) || '')).trim();
+      const reason = String(primary.reason != null ? primary.reason : base.reason || '').trim();
+      if(!userId || !Number.isInteger(amount) || amount <= 0 || !isValidDateKey(usedDate) || !reason) return null;
+      return {
+        userId,
+        userName:String(primary.userName != null ? primary.userName : base.userName || '').trim(),
+        userDept:String(primary.userDept != null ? primary.userDept : base.userDept || '').trim(),
+        amount,
+        usedDate,
+        reason
+      };
+    }
+
+    function normalizeOfflineCouponEditCurrentRecord(record){
+      const source = record && typeof record === 'object' ? record : {};
+      const originalRecordId = String(source.originalRecordId || '').trim();
+      const revision = Math.max(0, Math.floor(Number(source.revision || 0)) || 0);
+      const effectiveState = normalizeOfflineCouponEditEffectiveState({
+        userId:source.effectiveUserId,
+        userName:source.effectiveUserName,
+        userDept:source.effectiveUserDept,
+        amount:source.effectiveAmount,
+        usedDate:source.effectiveUsedDate,
+        reason:source.effectiveReason
+      });
+      if(!originalRecordId || revision < 1 || !effectiveState) return null;
+      return {
+        ...source,
+        payloadKind:'offline-coupon-edit-current',
+        originalRecordId,
+        revision,
+        effectiveUserId:effectiveState.userId,
+        effectiveUserName:effectiveState.userName,
+        effectiveUserDept:effectiveState.userDept,
+        effectiveAmount:effectiveState.amount,
+        effectiveUsedDate:effectiveState.usedDate,
+        effectiveReason:effectiveState.reason
+      };
+    }
+
+    function rememberOfflineCouponEditCurrentRecord(record){
+      const normalized = normalizeOfflineCouponEditCurrentRecord(record);
+      if(!normalized) return null;
+      state.offlineCouponUseEditCurrentByRecordId = state.offlineCouponUseEditCurrentByRecordId && typeof state.offlineCouponUseEditCurrentByRecordId === 'object'
+        ? state.offlineCouponUseEditCurrentByRecordId
+        : {};
+      state.offlineCouponUseEditCurrentByRecordId[normalized.originalRecordId] = normalized;
+      return normalized;
+    }
+
+    function materializeOfflineCouponUseCurrentRecord(record){
+      const immutableRecord = record && typeof record === 'object' ? record : null;
+      if(!immutableRecord) return null;
+      const originalRecordId = String(immutableRecord.id || immutableRecord.eventId || '').trim();
+      const currentMap = state.offlineCouponUseEditCurrentByRecordId && typeof state.offlineCouponUseEditCurrentByRecordId === 'object'
+        ? state.offlineCouponUseEditCurrentByRecordId
+        : {};
+      const current = normalizeOfflineCouponEditCurrentRecord(currentMap[originalRecordId]);
+      if(!current) return { ...immutableRecord, offlineEditRevision:0 };
+      const effectiveState = normalizeOfflineCouponEditEffectiveState({
+        userId:current.effectiveUserId,
+        userName:current.effectiveUserName,
+        userDept:current.effectiveUserDept,
+        amount:current.effectiveAmount,
+        usedDate:current.effectiveUsedDate,
+        reason:current.effectiveReason
+      });
+      if(!effectiveState) return { ...immutableRecord, offlineEditRevision:0 };
+      return {
+        ...immutableRecord,
+        userId:effectiveState.userId,
+        userName:effectiveState.userName,
+        userDept:effectiveState.userDept,
+        amount:effectiveState.amount,
+        delta:-effectiveState.amount,
+        usedDate:effectiveState.usedDate,
+        timestamp:getOfflineCouponUseTimestamp(effectiveState.usedDate),
+        reason:effectiveState.reason,
+        editedAt:String(current.updatedAtClient || ''),
+        editedBy:String(current.updatedByLabel || ''),
+        editCount:current.revision,
+        offlineEditRevision:current.revision,
+        offlineEditLastOperationId:String(current.lastOperationId || ''),
+        offlineEditCurrentDocId:String(current.docId || '')
+      };
+    }
+
+    function getOfflineCouponEditCloudStore(){
+      return window.HaetsalOfflineCouponEditCloud && typeof window.HaetsalOfflineCouponEditCloud === 'object'
+        ? window.HaetsalOfflineCouponEditCloud
+        : null;
+    }
+
+    async function hydrateOfflineCouponEditCurrentRecords(triggerReason, options){
+      const cloud = getOfflineCouponEditCloudStore();
+      if(!cloud || typeof cloud.readCurrentRecords !== 'function') return false;
+      try{
+        const result = await cloud.readCurrentRecords({ reason:String(triggerReason || 'offline-coupon-edit-current-hydrate') });
+        const rows = Array.isArray(result && result.records) ? result.records : [];
+        const nextMap = {};
+        rows.forEach(row => {
+          const normalized = normalizeOfflineCouponEditCurrentRecord(row);
+          if(normalized) nextMap[normalized.originalRecordId] = normalized;
+        });
+        state.offlineCouponUseEditCurrentByRecordId = nextMap;
+        if(options && options.renderAfter){
+          try{ render(); }catch(error){ console.warn('앱 미사용일 수정 현재값 화면 갱신 실패', error); }
+        }
+        return true;
+      }catch(error){
+        console.warn('앱 미사용일 수정 현재값 불러오기 실패', error);
+        return false;
+      }
+    }
+
+    function sanitizeOfflineCouponEditIdentityPart(value){
+      return String(value || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+    }
+
+    function makeOfflineCouponEditIntentFingerprint(originalRecordId, baseRevision, beforeState, afterState){
+      return hashCouponRecalcText(JSON.stringify({
+        originalRecordId:String(originalRecordId || ''),
+        baseRevision:Math.max(0, Math.floor(Number(baseRevision || 0)) || 0),
+        beforeState:normalizeOfflineCouponEditEffectiveState(beforeState),
+        afterState:normalizeOfflineCouponEditEffectiveState(afterState)
+      }));
+    }
+
+    function buildOfflineCouponEditPendingOperation(originalRecordId, baseRevision, beforeState, afterState, createdAtClient){
+      const safeOriginalId = sanitizeOfflineCouponEditIdentityPart(originalRecordId);
+      const normalizedBefore = normalizeOfflineCouponEditEffectiveState(beforeState);
+      const normalizedAfter = normalizeOfflineCouponEditEffectiveState(afterState);
+      const normalizedBaseRevision = Math.max(0, Math.floor(Number(baseRevision || 0)) || 0);
+      if(!safeOriginalId || !normalizedBefore || !normalizedAfter) throw new Error('앱 미사용일 차감 수정 정보를 확인할 수 없습니다.');
+      const intentFingerprint = makeOfflineCouponEditIntentFingerprint(originalRecordId, normalizedBaseRevision, normalizedBefore, normalizedAfter);
+      return {
+        operationId:`offline_coupon_edit_${safeOriginalId}_r${normalizedBaseRevision + 1}_${intentFingerprint}`,
+        originalRecordId:String(originalRecordId || '').trim(),
+        baseRevision:normalizedBaseRevision,
+        newRevision:normalizedBaseRevision + 1,
+        beforeState:normalizedBefore,
+        afterState:normalizedAfter,
+        intentFingerprint,
+        actorLabel:getCurrentActorLabel(),
+        createdAtClient:String(createdAtClient || new Date().toISOString()),
+        appVersion:ORDER_APP_VERSION
+      };
+    }
+
+    function normalizeOfflineCouponEditPendingOperation(record){
+      const source = record && typeof record === 'object' ? record : {};
+      const operationId = String(source.operationId || '').trim();
+      const originalRecordId = String(source.originalRecordId || '').trim();
+      const baseRevision = Math.max(0, Math.floor(Number(source.baseRevision || 0)) || 0);
+      const newRevision = Math.max(0, Math.floor(Number(source.newRevision || 0)) || 0);
+      const beforeState = normalizeOfflineCouponEditEffectiveState(source.beforeState);
+      const afterState = normalizeOfflineCouponEditEffectiveState(source.afterState);
+      const intentFingerprint = String(source.intentFingerprint || '').trim();
+      if(!operationId || !originalRecordId || newRevision !== baseRevision + 1 || !beforeState || !afterState || !intentFingerprint) return null;
+      return {
+        operationId,
+        originalRecordId,
+        baseRevision,
+        newRevision,
+        beforeState,
+        afterState,
+        intentFingerprint,
+        actorLabel:String(source.actorLabel || '').trim(),
+        createdAtClient:String(source.createdAtClient || '').trim(),
+        appVersion:String(source.appVersion || ORDER_APP_VERSION)
+      };
+    }
+
+    function readOfflineCouponEditPendingOperations(){
+      try{
+        if(!window.localStorage) return [];
+        const raw = window.localStorage.getItem(ORDER_OFFLINE_COUPON_EDIT_PENDING_LOCAL_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed && parsed.records) ? parsed.records : [];
+        const byId = new Map();
+        rows.forEach(row => {
+          const normalized = normalizeOfflineCouponEditPendingOperation(row);
+          if(normalized) byId.set(normalized.operationId, normalized);
+        });
+        return Array.from(byId.values()).slice(-ORDER_OFFLINE_COUPON_EDIT_PENDING_MAX_COUNT);
+      }catch(error){
+        console.warn('앱 미사용일 수정 재시도 정보 읽기 실패', error);
+        return [];
+      }
+    }
+
+    function writeOfflineCouponEditPendingOperations(records){
+      try{
+        if(!window.localStorage) return false;
+        const byId = new Map();
+        (Array.isArray(records) ? records : []).forEach(row => {
+          const normalized = normalizeOfflineCouponEditPendingOperation(row);
+          if(normalized) byId.set(normalized.operationId, normalized);
+        });
+        const normalizedRows = Array.from(byId.values()).slice(-ORDER_OFFLINE_COUPON_EDIT_PENDING_MAX_COUNT);
+        if(!normalizedRows.length){
+          window.localStorage.removeItem(ORDER_OFFLINE_COUPON_EDIT_PENDING_LOCAL_KEY);
+          return true;
+        }
+        window.localStorage.setItem(ORDER_OFFLINE_COUPON_EDIT_PENDING_LOCAL_KEY, JSON.stringify({
+          version:1,
+          updatedAt:new Date().toISOString(),
+          records:normalizedRows
+        }));
+        return true;
+      }catch(error){
+        console.warn('앱 미사용일 수정 재시도 정보 저장 실패', error);
+        return false;
+      }
+    }
+
+    function rememberOfflineCouponEditPendingOperation(operation){
+      const normalized = normalizeOfflineCouponEditPendingOperation(operation);
+      if(!normalized) return false;
+      return writeOfflineCouponEditPendingOperations(readOfflineCouponEditPendingOperations().concat([normalized]));
+    }
+
+    function removeOfflineCouponEditPendingOperation(operationId){
+      const targetId = String(operationId || '').trim();
+      if(!targetId) return false;
+      return writeOfflineCouponEditPendingOperations(readOfflineCouponEditPendingOperations()
+        .filter(operation => operation.operationId !== targetId));
+    }
+
+    function isOfflineCouponEditNonRetryableError(error){
+      const code = String(error && error.code || '');
+      return code === 'OFFLINE_EDIT_STALE'
+        || code === 'OFFLINE_EDIT_CONFLICT'
+        || code === 'OFFLINE_EDIT_INVALID';
+    }
+
+    function applyOfflineCouponEditCloudResult(result){
+      if(result && Array.isArray(result.users)){
+        result.users.forEach(serverUser => {
+          const localUser = getUserById(serverUser && serverUser.id);
+          if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
+        });
+      }
+      applyAuthoritativeSharedCouponData(result);
+      if(result && result.currentRecord) rememberOfflineCouponEditCurrentRecord(result.currentRecord);
+      (Array.isArray(result && result.couponRecords) ? result.couponRecords : []).forEach(record => {
+        rememberCommittedCouponHistoryRecord(record);
+      });
+      return result;
+    }
+
+    async function saveOfflineCouponEditOperation(operation, triggerReason){
+      const normalized = normalizeOfflineCouponEditPendingOperation(operation);
+      if(!normalized) throw new Error('앱 미사용일 차감 수정 정보를 확인할 수 없습니다.');
+      const cloud = getOfflineCouponEditCloudStore();
+      if(!cloud || typeof cloud.saveOperation !== 'function') throw new Error('앱 미사용일 차감 수정 저장소를 사용할 수 없습니다.');
+      const result = await cloud.saveOperation(normalized, { reason:String(triggerReason || 'offline-coupon-use-edit') });
+      return applyOfflineCouponEditCloudResult(result);
+    }
+
+    let offlineCouponEditPendingFlushInFlight = false;
+
+    async function flushOfflineCouponEditPendingOperations(triggerReason, options){
+      if(offlineCouponEditPendingFlushInFlight) return false;
+      const adminVerified = !!(window.HaetsalAdminAuth
+        && typeof window.HaetsalAdminAuth.isVerified === 'function'
+        && window.HaetsalAdminAuth.isVerified());
+      if(!adminVerified) return false;
+      const pending = readOfflineCouponEditPendingOperations();
+      if(!pending.length) return true;
+      offlineCouponEditPendingFlushInFlight = true;
+      let changed = false;
+      try{
+        for(const operation of pending){
+          try{
+            await saveOfflineCouponEditOperation(operation, String(triggerReason || 'offline-coupon-edit-pending-retry'));
+            removeOfflineCouponEditPendingOperation(operation.operationId);
+            changed = true;
+          }catch(error){
+            if(isOfflineCouponEditNonRetryableError(error)){
+              removeOfflineCouponEditPendingOperation(operation.operationId);
+            }
+            console.warn('앱 미사용일 수정 재시도 실패', operation.operationId, error);
+          }
+        }
+        if(changed) saveData({ reason:String(triggerReason || 'offline-coupon-edit-pending-retry'), forceFullBackup:true });
+        if(options && options.renderAfter){
+          try{ render(); }catch(error){ console.warn('앱 미사용일 수정 재시도 후 화면 갱신 실패', error); }
+        }
+        return readOfflineCouponEditPendingOperations().length === 0;
+      }finally{
+        offlineCouponEditPendingFlushInFlight = false;
       }
     }
 
@@ -20291,9 +20608,19 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       return text.slice(0, max) + '…';
     }
 
-    function compactCompletedOrderItemForStorage(item){
+    function copyStoredCouponCostSnapshotFields(target, source, fieldNames){
+      const result = target && typeof target === 'object' ? target : {};
+      const snapshot = source && typeof source === 'object' ? source : null;
+      if(!snapshot) return result;
+      (Array.isArray(fieldNames) ? fieldNames : []).forEach(fieldName => {
+        if(Object.prototype.hasOwnProperty.call(snapshot, fieldName)) result[fieldName] = snapshot[fieldName];
+      });
+      return result;
+    }
+
+    function compactCompletedOrderItemForStorage(item, snapshotSource){
       const source = item && typeof item === 'object' ? item : {};
-      return {
+      return copyStoredCouponCostSnapshotFields({
         temp: String(source.temp || 'ICE').toUpperCase() === 'HOT' ? 'HOT' : 'ICE',
         menuName: trimCompletedOrderText(source.menuName || '메뉴명 없음', 80),
         cupType: ['TUMBLER','STORE_CUP','DISPOSABLE'].includes(String(source.cupType || '').toUpperCase()) ? String(source.cupType).toUpperCase() : 'TUMBLER',
@@ -20306,7 +20633,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         assignedTumblerLabel: trimCompletedOrderText(source.assignedTumblerLabel || source.tumblerInfo || '', 120),
         assignedTumblerKind: trimCompletedOrderText(source.assignedTumblerKind || '', 40),
         assignedTumblerNumber: trimCompletedOrderText(source.assignedTumblerNumber || '', 40)
-      };
+      }, snapshotSource, ['couponPolicyVersion', 'couponMenuNameSnapshot', 'usesMilkSnapshot', 'couponCostPerCup', 'couponCostTotal']);
     }
 
     function createCompletedOrderDocumentPayload(order, reason='auto'){
@@ -20317,9 +20644,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       const createdAt = order.createdAt || order.timestamp || '';
       const businessAt = order.businessAt || createdAt || completedAt || '';
       const businessDate = getOrderBusinessDateKey(order) || (businessAt ? getDateString(businessAt) : '');
-      const items = getOrderItemsForDisplay(order).map(compactCompletedOrderItemForStorage);
+      const sourceItems = Array.isArray(order.items) ? order.items : [];
+      const items = getOrderItemsForDisplay(order).map((item, index) => compactCompletedOrderItemForStorage(item, sourceItems[index]));
       const totalCups = getOrderTotalQuantity(order);
-      const orderLite = {
+      const orderLite = copyStoredCouponCostSnapshotFields({
         id: String(order.id || ''),
         orderNumber: String(order.orderNumber || order.seq || ''),
         seq: order.seq || '',
@@ -20366,7 +20694,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         remainingCoupons: Number(order.remainingCoupons || 0),
         isGroupOrder: order.isGroupOrder === true,
         items
-      };
+      }, order, ['couponPolicyVersion', 'couponCostTotal']);
       return {
         version: 2,
         appVersion: ORDER_APP_VERSION,
@@ -20412,7 +20740,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       const createdAt = String(source.createdAt || lite.createdAt || lite.timestamp || completedAt || '');
       const businessAt = String(source.businessAt || lite.businessAt || createdAt || lite.timestamp || completedAt || '');
       const businessDate = String(source.businessDate || lite.businessDate || (businessAt ? getDateString(businessAt) : '') || '');
-      const items = Array.isArray(lite.items) ? lite.items.map(item => ({
+      const items = Array.isArray(lite.items) ? lite.items.map(item => copyStoredCouponCostSnapshotFields({
         temp: String((item && item.temp) || 'ICE').toUpperCase() === 'HOT' ? 'HOT' : 'ICE',
         menuName: String((item && item.menuName) || '메뉴명 없음'),
         cupType: ['TUMBLER','STORE_CUP','DISPOSABLE'].includes(String((item && item.cupType) || '').toUpperCase()) ? String(item.cupType).toUpperCase() : 'TUMBLER',
@@ -20425,7 +20753,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         assignedTumblerLabel: String((item && (item.assignedTumblerLabel || item.tumblerInfo)) || ''),
         assignedTumblerKind: String((item && item.assignedTumblerKind) || ''),
         assignedTumblerNumber: String((item && item.assignedTumblerNumber) || '')
-      })) : [];
+      }, item, ['couponPolicyVersion', 'couponMenuNameSnapshot', 'usesMilkSnapshot', 'couponCostPerCup', 'couponCostTotal'])) : [];
       const seqRaw = lite.seq || lite.orderNumber || source.orderNumber || '';
       const seqNum = Number(seqRaw);
       return {
@@ -33905,12 +34233,250 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return getCouponRestoreEventDate(order.cancelledAt || order.cancelAt || order.processedAt || order.updatedAt || order.timestamp);
     }
 
+    function getCouponRestoreStoredNonNegativeInteger(source, fieldName){
+      if(!source || typeof source !== 'object' || !Object.prototype.hasOwnProperty.call(source, fieldName)) return null;
+      const raw = source[fieldName];
+      if(raw === null || raw === '') return null;
+      const value = Number(raw);
+      return Number.isInteger(value) && value >= 0 ? value : null;
+    }
+
+    function getCouponRestoreOrderCouponCost(order){
+      const source = order && typeof order === 'object' ? order : {};
+      const storedOrderTotal = getCouponRestoreStoredNonNegativeInteger(source, 'couponCostTotal');
+      if(storedOrderTotal !== null) return storedOrderTotal;
+
+      const items = Array.isArray(source.items) ? source.items : [];
+      if(items.length){
+        const storedItemTotals = items.map(item => getCouponRestoreStoredNonNegativeInteger(item, 'couponCostTotal'));
+        if(storedItemTotals.every(value => value !== null)){
+          return storedItemTotals.reduce((sum, value) => sum + value, 0);
+        }
+        const storedItemCosts = items.map(item => {
+          const perCup = getCouponRestoreStoredNonNegativeInteger(item, 'couponCostPerCup');
+          const quantity = getCouponRestoreStoredNonNegativeInteger(item, 'quantity');
+          return perCup !== null && quantity !== null ? perCup * quantity : null;
+        });
+        if(storedItemCosts.every(value => value !== null)){
+          return storedItemCosts.reduce((sum, value) => sum + value, 0);
+        }
+      }
+
+      const storedPerCup = getCouponRestoreStoredNonNegativeInteger(source, 'couponCostPerCup');
+      const storedQuantity = getCouponRestoreStoredNonNegativeInteger(source, 'quantity');
+      if(storedPerCup !== null && storedQuantity !== null) return storedPerCup * storedQuantity;
+
+      const legacyQuantity = Number(getOrderTotalQuantity(source));
+      return Number.isFinite(legacyQuantity) ? Math.max(0, legacyQuantity) : 0;
+    }
+
+    const COUPON_RESTORE_AUDIT_POLICY_VERSION = 1;
+
+    function normalizeCouponRestoreAuditText(value, maxLength){
+      const limit = Math.max(16, Math.floor(Number(maxLength || 240)) || 240);
+      const text = String(value == null ? '' : value).trim();
+      if(text.length <= limit) return text;
+      const suffix = '_' + hashCouponRestoreIdentity(text);
+      return text.slice(0, Math.max(1, limit - suffix.length)) + suffix;
+    }
+
+    function getCouponRestoreAuditSourceId(source, fallbackPrefix){
+      const row = source && typeof source === 'object' ? source : {};
+      const candidates = [row.id, row.eventId, row.couponHistoryId, row.docId, row.orderId, row.sourceLogId, row.operationId];
+      for(const candidate of candidates){
+        const value = normalizeCouponRestoreAuditText(candidate, 240);
+        if(value) return value;
+      }
+      return `${String(fallbackPrefix || 'restore_source')}_${hashCouponRestoreIdentity(JSON.stringify({
+        userId:String(row.userId || ''),
+        timestamp:String(row.timestamp || row.createdAt || row.updatedAt || ''),
+        type:String(row.type || row.action || ''),
+        delta:Number(row.delta || 0),
+        amount:Number(row.amount || 0)
+      }))}`;
+    }
+
+    function getCouponRestoreAuditSourceRevision(source){
+      const row = source && typeof source === 'object' ? source : {};
+      const candidates = [
+        row.statusUpdatedAt, row.updatedAtServerIso, row.serverUpdatedAtIso, row.updatedAt,
+        row.processedAt, row.editedAt, row.registeredAt, row.createdAtServerIso,
+        row.createdAtClient, row.createdAt, row.timestamp
+      ];
+      for(const candidate of candidates){
+        const value = normalizeCouponRestoreAuditText(candidate, 240);
+        if(value) return value;
+      }
+      return '';
+    }
+
+    function getCouponRestoreOrderCostEvidenceKind(order){
+      const source = order && typeof order === 'object' ? order : {};
+      if(getCouponRestoreStoredNonNegativeInteger(source, 'couponCostTotal') !== null) return 'ORDER_COUPON_COST_TOTAL';
+      const items = Array.isArray(source.items) ? source.items : [];
+      if(items.length && items.every(item => getCouponRestoreStoredNonNegativeInteger(item, 'couponCostTotal') !== null)) return 'ITEM_COUPON_COST_TOTAL';
+      if(items.length && items.every(item => getCouponRestoreStoredNonNegativeInteger(item, 'couponCostPerCup') !== null && getCouponRestoreStoredNonNegativeInteger(item, 'quantity') !== null)) return 'ITEM_COUPON_COST_PER_CUP';
+      if(getCouponRestoreStoredNonNegativeInteger(source, 'couponCostPerCup') !== null && getCouponRestoreStoredNonNegativeInteger(source, 'quantity') !== null) return 'ORDER_COUPON_COST_PER_CUP';
+      return 'LEGACY_ORDER_QUANTITY';
+    }
+
+    function createCouponRestoreSourceEvidence(targetUserId, sourceUserId, sourceKind, source, timestamp, contribution, included, exclusionReason, fallbackKind, phase){
+      const sourceRecordId = getCouponRestoreAuditSourceId(source, String(sourceKind || 'restore_source').toLowerCase());
+      const sourceRevision = getCouponRestoreAuditSourceRevision(source);
+      const sourceTimestamp = timestamp instanceof Date
+        ? timestamp.toISOString()
+        : normalizeCouponRestoreAuditText(timestamp, 240);
+      const normalizedContribution = Number(contribution || 0);
+      const evidenceSeed = JSON.stringify({
+        targetUserId:String(targetUserId || ''),
+        sourceUserId:String(sourceUserId || ''),
+        sourceKind:String(sourceKind || ''),
+        sourceRecordId,
+        sourceRevision,
+        sourceTimestamp,
+        normalizedContribution,
+        included:included === true,
+        exclusionReason:String(exclusionReason || ''),
+        fallbackKind:String(fallbackKind || ''),
+        phase:String(phase || '')
+      });
+      return {
+        evidenceType:'SOURCE',
+        evidenceId:`restore_evidence_${hashCouponRestoreIdentity(evidenceSeed)}`,
+        userId:normalizeCouponRestoreAuditText(targetUserId, 200),
+        sourceUserId:normalizeCouponRestoreAuditText(sourceUserId, 200),
+        sourceKind:normalizeCouponRestoreAuditText(sourceKind, 80),
+        sourceRecordId,
+        sourceRevision,
+        sourceTimestamp,
+        normalizedContribution,
+        included:included === true,
+        exclusionReason:normalizeCouponRestoreAuditText(exclusionReason, 160),
+        fallbackKind:normalizeCouponRestoreAuditText(fallbackKind, 100),
+        phase:normalizeCouponRestoreAuditText(phase, 40)
+      };
+    }
+
+    function collectCouponRestoreOrderEvidence(targetUserId, sourceUserId, startDate, endDate, includeStart, sourceKind, includeOption, phase){
+      const refundMode = sourceKind === 'ORDER_REFUND';
+      const contributionSign = refundMode ? 1 : -1;
+      return getOrdersForStatsAndHistory()
+        .filter(order => String(order && order.userId || '') === String(sourceUserId || ''))
+        .reduce((items, order) => {
+          const date = refundMode ? getCouponRestoreOrderCancelDate(order) : getCouponRestoreEventDate(order && order.timestamp);
+          if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return items;
+          const included = includeOption === true;
+          items.push(createCouponRestoreSourceEvidence(
+            targetUserId,
+            sourceUserId,
+            sourceKind,
+            order,
+            date,
+            contributionSign * Number(getCouponRestoreOrderCouponCost(order) || 0),
+            included,
+            included ? '' : `OPTION_${sourceKind}_DISABLED`,
+            getCouponRestoreOrderCostEvidenceKind(order),
+            phase
+          ));
+          return items;
+        }, []);
+    }
+
+    function collectCouponRestoreManualEvidence(targetUserId, sourceUserId, action, startDate, endDate, includeStart, includeOption, phase){
+      const targetType = action === 'CHARGE_COUPON' ? 'COUPON_CHARGE' : action === 'DEDUCT_COUPON' ? 'COUPON_DEDUCT' : '';
+      if(!targetType) return [];
+      const sourceKind = targetType === 'COUPON_CHARGE' ? 'ADMIN_CHARGE' : 'ADMIN_DEDUCT';
+      const contributionSign = targetType === 'COUPON_CHARGE' ? 1 : -1;
+      return mergeCouponHistoryRecords(state.couponHistory, buildCouponHistoryFromLegacyLogs(state.logs))
+        .filter(record => String(record && record.userId || '') === String(sourceUserId || '') && record.type === targetType)
+        .reduce((items, record) => {
+          const date = getCouponRestoreEventDate(record && record.timestamp);
+          if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return items;
+          let effectiveSourceKind = sourceKind;
+          let exclusionReason = '';
+          if(record.type === 'COUPON_CHARGE' && record.source === 'coupon-restore') exclusionReason = 'RESTORE_GENERATED_CHARGE_EXCLUDED';
+          if(record.source === 'offline-coupon-use-edit-adjustment'){
+            effectiveSourceKind = 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED';
+            exclusionReason = 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED';
+          }
+          const included = !exclusionReason && includeOption === true;
+          if(!included && !exclusionReason) exclusionReason = `OPTION_${sourceKind}_DISABLED`;
+          items.push(createCouponRestoreSourceEvidence(
+            targetUserId,
+            sourceUserId,
+            effectiveSourceKind,
+            record,
+            date,
+            contributionSign * Number(record.amount || 0),
+            included,
+            exclusionReason,
+            record.source === 'legacy-log' ? 'LEGACY_LOG' : 'COUPON_EVENT',
+            phase
+          ));
+          return items;
+        }, []);
+    }
+
+    function collectCouponRestoreOrderEditEvidence(targetUserId, sourceUserId, startDate, endDate, includeStart, includeOption, phase){
+      const historyRecords = mergeCouponHistoryRecords(state.couponHistory, buildCouponHistoryFromLegacyLogs(state.logs))
+        .filter(record => String(record && record.userId || '') === String(sourceUserId || '') && record.type === 'COUPON_ORDER_EDIT')
+        .filter(record => isCouponRestoreDateInRange(getCouponRestoreEventDate(record && record.timestamp), startDate, endDate, includeStart));
+      const historyDelta = historyRecords.reduce((sum, record) => sum + Number(record.delta || 0), 0);
+      const useHistory = !!historyDelta;
+      const items = historyRecords.map(record => createCouponRestoreSourceEvidence(
+        targetUserId,
+        sourceUserId,
+        'ORDER_EDIT',
+        record,
+        getCouponRestoreEventDate(record.timestamp),
+        Number(record.delta || 0),
+        useHistory && includeOption === true,
+        useHistory ? (includeOption === true ? '' : 'OPTION_ORDER_EDIT_DISABLED') : 'ORDER_EDIT_LEGACY_FALLBACK_SELECTED',
+        'COUPON_ORDER_EDIT_HISTORY',
+        phase
+      ));
+      (Array.isArray(state.logs) ? state.logs : [])
+        .filter(log => String(log && log.userId || '') === String(sourceUserId || '') && log.action === 'ORDER_EDITED')
+        .forEach(log => {
+          const date = getCouponRestoreEventDate(log.timestamp);
+          if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return;
+          const included = !useHistory && includeOption === true;
+          items.push(createCouponRestoreSourceEvidence(
+            targetUserId,
+            sourceUserId,
+            'ORDER_EDIT',
+            log,
+            date,
+            -Number(log.diffCouponCost != null ? log.diffCouponCost : log.diffQty || 0),
+            included,
+            useHistory ? 'ORDER_EDIT_HISTORY_SELECTED' : (included ? '' : 'OPTION_ORDER_EDIT_DISABLED'),
+            'LEGACY_ORDER_EDITED',
+            phase
+          ));
+        });
+      return items;
+    }
+
+    function buildCouponRestoreRangeEvidence(targetUserId, sourceUserIds, startDate, endDate, includeStart, options, phase){
+      const opts = options || {};
+      const ids = Array.from(new Set((Array.isArray(sourceUserIds) ? sourceUserIds : [sourceUserIds]).map(String).filter(Boolean)));
+      const items = [];
+      ids.forEach(sourceUserId => {
+        items.push(...collectCouponRestoreOrderEvidence(targetUserId, sourceUserId, startDate, endDate, includeStart, 'ORDER_DEDUCT', opts.includeOrderDeduct === true, phase));
+        items.push(...collectCouponRestoreOrderEvidence(targetUserId, sourceUserId, startDate, endDate, includeStart, 'ORDER_REFUND', opts.includeOrderRefund === true, phase));
+        items.push(...collectCouponRestoreManualEvidence(targetUserId, sourceUserId, 'CHARGE_COUPON', startDate, endDate, includeStart, opts.includeManualCharge === true, phase));
+        items.push(...collectCouponRestoreManualEvidence(targetUserId, sourceUserId, 'DEDUCT_COUPON', startDate, endDate, includeStart, opts.includeManualDeduct === true, phase));
+        items.push(...collectCouponRestoreOrderEditEvidence(targetUserId, sourceUserId, startDate, endDate, includeStart, opts.includeOrderEdit === true, phase));
+      });
+      return items;
+    }
+
     function sumCouponRestoreOrderDeduct(userId, startDate, endDate, includeStart){
       return getOrdersForStatsAndHistory().filter(order => String(order.userId || '') === String(userId || ''))
         .reduce((sum, order) => {
           const date = getCouponRestoreEventDate(order.timestamp);
           if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return sum;
-          return sum + Number(getOrderTotalQuantity(order) || order.quantity || 0);
+          return sum + getCouponRestoreOrderCouponCost(order);
         }, 0);
     }
 
@@ -33919,7 +34485,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         .reduce((sum, order) => {
           const date = getCouponRestoreOrderCancelDate(order);
           if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return sum;
-          return sum + Number(getOrderTotalQuantity(order) || order.quantity || 0);
+          return sum + getCouponRestoreOrderCouponCost(order);
         }, 0);
     }
 
@@ -33932,6 +34498,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const date = getCouponRestoreEventDate(record.timestamp);
           if(!isCouponRestoreDateInRange(date, startDate, endDate, includeStart)) return sum;
           if(record.type === 'COUPON_CHARGE' && record.source === 'coupon-restore') return sum;
+          if(record.source === 'offline-coupon-use-edit-adjustment') return sum;
           return sum + Number(record.amount || 0);
         }, 0);
     }
@@ -33964,7 +34531,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         candidates.push({
           timestamp: date,
           remainingCoupons: remaining,
-          source: `주문 후 잔여 기록 · ${formatDateTime(date)}`
+          source: `주문 후 잔여 기록 · ${formatDateTime(date)}`,
+          anchorKind:'ORDER_BALANCE',
+          anchorId:getCouponRestoreAuditSourceId(order, 'base_order'),
+          anchorRevision:getCouponRestoreAuditSourceRevision(order),
+          rawSource:order
         });
       });
       (Array.isArray(state.logs) ? state.logs : []).forEach(log => {
@@ -33977,7 +34548,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         candidates.push({
           timestamp: date,
           remainingCoupons: remaining,
-          source: `${label} · ${formatDateTime(date)}`
+          source: `${label} · ${formatDateTime(date)}`,
+          anchorKind:log.action === 'CHARGE_COUPON' ? 'ADMIN_CHARGE_BALANCE' : log.action === 'DEDUCT_COUPON' ? 'ADMIN_DEDUCT_BALANCE' : 'RESTORE_BALANCE',
+          anchorId:getCouponRestoreAuditSourceId(log, 'base_log'),
+          anchorRevision:getCouponRestoreAuditSourceRevision(log),
+          rawSource:log
         });
       });
       candidates.sort((a,b) => b.timestamp - a.timestamp);
@@ -34000,11 +34575,36 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(manualChargeAfterSeed) adjustments.push(`기준 전 수동 추가 +${manualChargeAfterSeed}`);
       if(manualDeductAfterSeed) adjustments.push(`기준 전 수동 차감 -${manualDeductAfterSeed}`);
       if(orderEditDeltaAfterSeed) adjustments.push(`기준 전 주문수정 ${orderEditDeltaAfterSeed > 0 ? '+' : ''}${orderEditDeltaAfterSeed}`);
+      const baseEvidence = [
+        createCouponRestoreSourceEvidence(
+          userId,
+          userId,
+          'BASE_ANCHOR',
+          seed.rawSource,
+          seed.timestamp,
+          Number(seed.remainingCoupons || 0),
+          true,
+          '',
+          seed.anchorKind,
+          'BASE_ANCHOR'
+        ),
+        ...buildCouponRestoreRangeEvidence(userId, [userId], seed.timestamp, baseDate, false, {
+          includeOrderDeduct:true,
+          includeOrderRefund:true,
+          includeManualCharge:true,
+          includeManualDeduct:true,
+          includeOrderEdit:true
+        }, 'BASE_ADJUSTMENT')
+      ];
       return {
         timestamp: seed.timestamp,
         seedCoupons: Number(seed.remainingCoupons || 0),
         remainingCoupons: adjusted,
-        source: adjustments.length ? `${seed.source} / ${adjustments.join(', ')}` : seed.source
+        source: adjustments.length ? `${seed.source} / ${adjustments.join(', ')}` : seed.source,
+        anchorKind:seed.anchorKind,
+        anchorId:seed.anchorId,
+        anchorRevision:seed.anchorRevision,
+        baseEvidence
       };
     }
 
@@ -34162,6 +34762,123 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return `${String(batchId || 'coupon_restore')}_${hashCouponRestoreIdentity(userId)}`;
     }
 
+    function getCouponRestoreManifestId(batchId){
+      return `coupon_restore_run_${normalizeCouponRestoreAuditText(batchId, 180)}`;
+    }
+
+    function getCouponRestoreIncludedEvidenceContribution(row, phase, sourceKind){
+      return (Array.isArray(row && row.restoreSourceEvidence) ? row.restoreSourceEvidence : [])
+        .filter(item => item && item.evidenceType === 'SOURCE' && item.included === true)
+        .filter(item => !phase || String(item.phase || '') === String(phase))
+        .filter(item => !sourceKind || String(item.sourceKind || '') === String(sourceKind))
+        .reduce((sum, item) => sum + Number(item.normalizedContribution || 0), 0);
+    }
+
+    function assertCouponRestoreAuditReconstruction(row){
+      if(!row || row.restoreCoupons === null) return true;
+      const baseBalance = Number(row.baseCoupons || 0);
+      const seedBalance = Number(row.baseSeedCoupons || 0);
+      const targetBalance = Number(row.restoreCoupons || 0);
+      const baseAdjustment = getCouponRestoreIncludedEvidenceContribution(row, 'BASE_ADJUSTMENT');
+      const applyContribution = getCouponRestoreIncludedEvidenceContribution(row, 'APPLY_RANGE');
+      if(seedBalance + baseAdjustment !== baseBalance){
+        throw new Error('쿠폰 복구 기준 잔액 evidence 합계가 계산 결과와 일치하지 않습니다.');
+      }
+      if(baseBalance + applyContribution !== targetBalance){
+        throw new Error('쿠폰 복구 source evidence 합계가 복구 목표 잔액과 일치하지 않습니다.');
+      }
+      const expectedByKind = [
+        ['ORDER_DEDUCT', state.couponRestoreIncludeOrderDeduct ? -Number(row.orderDeduct || 0) : 0],
+        ['ORDER_REFUND', state.couponRestoreIncludeOrderRefund ? Number(row.orderRefund || 0) : 0],
+        ['ORDER_EDIT', state.couponRestoreIncludeOrderEdit ? Number(row.orderEditDelta || 0) : 0],
+        ['ADMIN_CHARGE', state.couponRestoreIncludeManualCharge ? Number(row.manualCharge || 0) : 0],
+        ['ADMIN_DEDUCT', state.couponRestoreIncludeManualDeduct ? -Number(row.manualDeduct || 0) : 0]
+      ];
+      expectedByKind.forEach(([sourceKind, expected]) => {
+        const actual = getCouponRestoreIncludedEvidenceContribution(row, 'APPLY_RANGE', sourceKind);
+        if(actual !== expected) throw new Error(`쿠폰 복구 ${sourceKind} evidence 합계가 기존 계산 결과와 일치하지 않습니다.`);
+      });
+      const anchorEvidence = (Array.isArray(row.restoreSourceEvidence) ? row.restoreSourceEvidence : [])
+        .filter(item => item && item.phase === 'BASE_ANCHOR' && item.sourceKind === 'BASE_ANCHOR' && item.included === true);
+      if(anchorEvidence.length !== 1 || Number(anchorEvidence[0].normalizedContribution || 0) !== seedBalance){
+        throw new Error('쿠폰 복구 기준 anchor evidence를 확인할 수 없습니다.');
+      }
+      return true;
+    }
+
+    function buildCouponRestoreAuditDefinition(batchId, rows, createdAtClient){
+      const restoreBatchId = normalizeCouponRestoreAuditText(batchId, 180);
+      const restoreManifestId = getCouponRestoreManifestId(restoreBatchId);
+      const sourceRows = Array.isArray(rows) ? rows : [];
+      const sourceEvidence = [];
+      const userCoreEvidence = [];
+      const userLinkageEvidence = [];
+      sourceRows.forEach(row => {
+        assertCouponRestoreAuditReconstruction(row);
+        const userId = normalizeCouponRestoreAuditText(row.currentUserId || row.userId, 200);
+        const beforeBalance = Number(row.currentCoupons || 0);
+        const targetBalance = row.restoreCoupons === null ? beforeBalance : Number(row.restoreCoupons || 0);
+        const restoreLogId = getCouponRestoreDeterministicLogId(restoreBatchId, userId);
+        const restoreOperationId = `coupon-restore:${restoreBatchId}:${userId}`;
+        const generatedRestoreEventId = targetBalance !== beforeBalance ? `coupon_log_${restoreLogId}` : '';
+        const userSources = (Array.isArray(row.restoreSourceEvidence) ? row.restoreSourceEvidence : []).map(item => ({ ...item, userId }));
+        sourceEvidence.push(...userSources);
+        userCoreEvidence.push({
+          userId,
+          baseAnchorKind:normalizeCouponRestoreAuditText(row.baseAnchorKind || 'NONE', 80),
+          baseAnchorId:normalizeCouponRestoreAuditText(row.baseAnchorId || '', 240),
+          baseAnchorRevision:normalizeCouponRestoreAuditText(row.baseAnchorRevision || '', 240),
+          baseAnchorTimestamp:normalizeCouponRestoreAuditText(row.baseAnchorTimestamp || '', 240),
+          seedCoupons:Number(row.baseSeedCoupons || 0),
+          baseCoupons:row.baseCoupons === null ? beforeBalance : Number(row.baseCoupons || 0),
+          beforeCoupons:beforeBalance,
+          targetCoupons:targetBalance,
+          actualDelta:targetBalance - beforeBalance,
+          finalCoupons:targetBalance,
+          restoreOrderDeduct:Number(row.orderDeduct || 0),
+          restoreOrderRefund:Number(row.orderRefund || 0),
+          restoreOrderEditDelta:Number(row.orderEditDelta || 0),
+          restoreManualCharge:Number(row.manualCharge || 0),
+          restoreManualDeduct:Number(row.manualDeduct || 0),
+          sourceEvidenceCount:userSources.length,
+          userEvidenceDigest:`restore_${hashCouponRestoreIdentity(userSources.slice().sort((left, right) => String(left.evidenceId || '').localeCompare(String(right.evidenceId || ''))))}`
+        });
+        userLinkageEvidence.push({
+          userId,
+          eventRequired:!!generatedRestoreEventId,
+          generatedRestoreEventId,
+          generatedRestoreEventDocId:generatedRestoreEventId ? `coupon_event_${generatedRestoreEventId}` : '',
+          restoreLogId,
+          restoreOperationId,
+          sourceEvidenceCount:userSources.length,
+          linkageDigest:`restore_${hashCouponRestoreIdentity({ userId, generatedRestoreEventId, restoreLogId, restoreOperationId, sourceEvidenceCount:userSources.length })}`
+        });
+      });
+      const guard = window.HaetsalRuntimeGuard;
+      return {
+        restoreBatchId,
+        restoreManifestId,
+        restorePolicyVersion:COUPON_RESTORE_AUDIT_POLICY_VERSION,
+        appVersion:ORDER_APP_VERSION,
+        appBuildNumber:Number(guard && guard.APP_BUILD_NUMBER || 0),
+        writeSchemaVersion:Number(guard && guard.WRITE_SCHEMA_VERSION || 0),
+        baseAt:normalizeCouponRestoreAuditText(state.couponRestoreBaseAt, 240),
+        applyFrom:normalizeCouponRestoreAuditText(state.couponRestoreApplyFrom, 240),
+        includeOptions:{
+          includeOrderDeduct:!!state.couponRestoreIncludeOrderDeduct,
+          includeManualDeduct:!!state.couponRestoreIncludeManualDeduct,
+          includeOrderRefund:!!state.couponRestoreIncludeOrderRefund,
+          includeManualCharge:!!state.couponRestoreIncludeManualCharge,
+          includeOrderEdit:!!state.couponRestoreIncludeOrderEdit
+        },
+        actorLabel:normalizeCouponRestoreAuditText(getCurrentActorLabel(), 160),
+        createdAtClient:normalizeCouponRestoreAuditText(createdAtClient, 240),
+        userCoreEvidence,
+        userLinkageEvidence,
+        sourceEvidence
+      };
+    }
+
     function applyCouponRestoreProfileFields(user, backupUser, timestamp){
       if(!user || !backupUser) return false;
       let changed = false;
@@ -34213,20 +34930,78 @@ body.mobile-tablet-device .pos-keyboard-btn{
           String(backupUser && backupUser.id || '').trim(),
           String(user && user.id || '').trim()
         ].filter(Boolean)));
+        const backupAnchorTimestamp = getCouponRestoreEventDate((backup && backup.createdAt) || (backupUser && backupUser.couponsUpdatedAt) || state.couponRestoreBaseAt);
+        const backupAnchorId = backupUser ? `backup_${hashCouponRestoreIdentity(JSON.stringify({
+          sourceKey:String(backup && backup.sourceKey || COUPON_RESTORE_BACKUP_KEY),
+          createdAt:String(backup && backup.createdAt || ''),
+          userId:String(backupUser.id || user.id || '')
+        }))}` : '';
         const baseRecord = backupUser
           ? {
-              timestamp: getCouponRestoreEventDate((backup && backup.createdAt) || backupUser.couponsUpdatedAt || state.couponRestoreBaseAt),
+              timestamp: backupAnchorTimestamp,
               seedCoupons: Number(backupUser.coupons || 0),
               remainingCoupons: Number(backupUser.coupons || 0),
-              source: '2026-06-30 backup'
+              source: '2026-06-30 backup',
+              anchorKind:'BACKUP_BALANCE',
+              anchorId:backupAnchorId,
+              anchorRevision:normalizeCouponRestoreAuditText((backup && backup.createdAt) || backupUser.couponsUpdatedAt || '', 240),
+              baseEvidence:[createCouponRestoreSourceEvidence(
+                user.id,
+                backupUser.id || user.id,
+                'BASE_ANCHOR',
+                { id:backupAnchorId, updatedAt:(backup && backup.createdAt) || backupUser.couponsUpdatedAt || '' },
+                backupAnchorTimestamp,
+                Number(backupUser.coupons || 0),
+                true,
+                '',
+                'BACKUP_BALANCE',
+                'BASE_ANCHOR'
+              )]
             }
           : findCouponRestoreBaseRecord(user.id, baseDate);
+        const currentCoupons = currentUser ? Number(currentUser.coupons || 0) : 0;
+        const currentAnchorTimestamp = getCouponRestoreEventDate((currentUser && currentUser.couponsUpdatedAt) || state.couponRestoreBaseAt);
+        const currentAnchorId = `current_balance_${hashCouponRestoreIdentity(JSON.stringify({
+          userId:String(user.id || ''),
+          coupons:currentCoupons,
+          couponBalanceVersion:Number(currentUser && currentUser.couponBalanceVersion || 0),
+          couponsUpdatedAt:String(currentUser && currentUser.couponsUpdatedAt || '')
+        }))}`;
+        const auditBaseRecord = baseRecord || {
+          timestamp:currentAnchorTimestamp,
+          seedCoupons:currentCoupons,
+          remainingCoupons:currentCoupons,
+          anchorKind:'CURRENT_BALANCE_NO_RESTORE',
+          anchorId:currentAnchorId,
+          anchorRevision:normalizeCouponRestoreAuditText(`${Number(currentUser && currentUser.couponBalanceVersion || 0)}:${String(currentUser && currentUser.couponsUpdatedAt || '')}`, 240),
+          baseEvidence:[createCouponRestoreSourceEvidence(
+            user.id,
+            user.id,
+            'BASE_ANCHOR',
+            { id:currentAnchorId, updatedAt:String(currentUser && currentUser.couponsUpdatedAt || '') },
+            currentAnchorTimestamp,
+            currentCoupons,
+            true,
+            '',
+            'CURRENT_BALANCE_NO_RESTORE',
+            'BASE_ANCHOR'
+          )]
+        };
         const orderDeduct = restoreUserIds.reduce((sum, id) => sum + sumCouponRestoreOrderDeduct(id, applyFromDate, null, true), 0);
         const orderRefund = restoreUserIds.reduce((sum, id) => sum + sumCouponRestoreOrderRefund(id, applyFromDate, null, true), 0);
         const manualDeduct = restoreUserIds.reduce((sum, id) => sum + sumCouponRestoreLogAmount(id, 'DEDUCT_COUPON', applyFromDate, null, true), 0);
         const manualCharge = restoreUserIds.reduce((sum, id) => sum + sumCouponRestoreLogAmount(id, 'CHARGE_COUPON', applyFromDate, null, true), 0);
         const orderEditDelta = restoreUserIds.reduce((sum, id) => sum + sumCouponRestoreOrderEditDelta(id, applyFromDate, null, true), 0);
-        const currentCoupons = currentUser ? Number(currentUser.coupons || 0) : 0;
+        let applyEvidence = buildCouponRestoreRangeEvidence(user.id, restoreUserIds, applyFromDate, null, true, {
+          includeOrderDeduct:!!state.couponRestoreIncludeOrderDeduct,
+          includeOrderRefund:!!state.couponRestoreIncludeOrderRefund,
+          includeManualCharge:!!state.couponRestoreIncludeManualCharge,
+          includeManualDeduct:!!state.couponRestoreIncludeManualDeduct,
+          includeOrderEdit:!!state.couponRestoreIncludeOrderEdit
+        }, 'APPLY_RANGE');
+        if(!baseRecord){
+          applyEvidence = applyEvidence.map(item => ({ ...item, included:false, exclusionReason:'NO_BASE_ANCHOR' }));
+        }
         let restoreCoupons = null;
         if(baseRecord){
           restoreCoupons = Number(baseRecord.remainingCoupons || 0);
@@ -34251,6 +35026,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
           canRestore: !!baseRecord || getCouponRestoreProfileChange(currentUser, backupUser),
           hasRestoreChange: (!!baseRecord && Number(restoreCoupons || 0) !== currentCoupons) || getCouponRestoreProfileChange(currentUser, backupUser),
           baseSource: baseRecord ? baseRecord.source : '기준 일시 이전 잔여쿠폰 근거 부족',
+          baseAnchorKind:String(auditBaseRecord.anchorKind || 'UNKNOWN'),
+          baseAnchorId:String(auditBaseRecord.anchorId || ''),
+          baseAnchorRevision:String(auditBaseRecord.anchorRevision || ''),
+          baseAnchorTimestamp:auditBaseRecord.timestamp ? auditBaseRecord.timestamp.toISOString() : '',
+          baseSeedCoupons:Number(auditBaseRecord.seedCoupons != null ? auditBaseRecord.seedCoupons : auditBaseRecord.remainingCoupons || 0),
+          restoreSourceEvidence:[...(Array.isArray(auditBaseRecord.baseEvidence) ? auditBaseRecord.baseEvidence : []), ...applyEvidence],
           orderDeduct,
           orderRefund,
           manualDeduct,
@@ -34331,6 +35112,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
       const now = new Date().toISOString();
       const restoreBatchId = getCouponRestoreDeterministicBatchId(changedRows);
+      const restoreManifestId = getCouponRestoreManifestId(restoreBatchId);
+      const restoreAudit = buildCouponRestoreAuditDefinition(restoreBatchId, changedRows, now);
       const preparedRows = [];
       for(const row of changedRows){
         const existingUser = getUserById(row.currentUserId || row.userId);
@@ -34366,6 +35149,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           let history = null;
           if(row.restoreCoupons !== null && nextCoupons !== oldCoupons){
             const couponLogId = getCouponRestoreDeterministicLogId(restoreBatchId, user.id);
+            const restoreOperationId = `coupon-restore:${restoreBatchId}:${user.id}`;
             couponLog = {
               id:couponLogId,
               userId:user.id,
@@ -34385,6 +35169,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
               restoreManualChargeIncluded:state.couponRestoreIncludeManualCharge,
               restoreOrderRefund:row.orderRefund,
               restoreOrderEditDelta:row.orderEditDelta,
+              restoreBatchId,
+              restoreManifestId,
+              restoreOperationId,
+              restorePolicyVersion:COUPON_RESTORE_AUDIT_POLICY_VERSION,
               backupKey
             };
             history = recordManualCouponHistory(user, 'RESTORE_COUPON', couponLog.amount, oldCoupons, nextCoupons, {
@@ -34401,6 +35189,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
               restoreManualChargeIncluded:couponLog.restoreManualChargeIncluded,
               restoreOrderRefund:couponLog.restoreOrderRefund,
               restoreOrderEditDelta:couponLog.restoreOrderEditDelta,
+              restoreBatchId:couponLog.restoreBatchId,
+              restoreManifestId:couponLog.restoreManifestId,
+              restoreOperationId:couponLog.restoreOperationId,
+              restorePolicyVersion:couponLog.restorePolicyVersion,
               sourceLogId:couponLog.id,
               source:'coupon-restore',
               prepareOnly:true
@@ -34415,6 +35207,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const nextCoupons = Number(item.nextCoupons || 0);
         if(!item.couponChange) return;
         const couponLogId = getCouponRestoreDeterministicLogId(restoreBatchId, item.userId);
+        const restoreOperationId = `coupon-restore:${restoreBatchId}:${item.userId}`;
         const couponLog = {
           id:couponLogId,
           userId:item.userId,
@@ -34434,6 +35227,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
           restoreManualChargeIncluded:state.couponRestoreIncludeManualCharge,
           restoreOrderRefund:row.orderRefund,
           restoreOrderEditDelta:row.orderEditDelta,
+          restoreBatchId,
+          restoreManifestId,
+          restoreOperationId,
+          restorePolicyVersion:COUPON_RESTORE_AUDIT_POLICY_VERSION,
           backupKey
         };
         const history = recordManualCouponHistory(user, 'RESTORE_COUPON', couponLog.amount, oldCoupons, nextCoupons, {
@@ -34451,6 +35248,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
           restoreManualChargeIncluded:couponLog.restoreManualChargeIncluded,
           restoreOrderRefund:couponLog.restoreOrderRefund,
           restoreOrderEditDelta:couponLog.restoreOrderEditDelta,
+          restoreBatchId:couponLog.restoreBatchId,
+          restoreManifestId:couponLog.restoreManifestId,
+          restoreOperationId:couponLog.restoreOperationId,
+          restorePolicyVersion:couponLog.restorePolicyVersion,
           sourceLogId:couponLog.id,
           source:'coupon-restore',
           prepareOnly:true
@@ -34487,7 +35288,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             ...preparedRows.map(item => item.history).filter(Boolean),
             ...missingPreparedRows.map(item => item.history).filter(Boolean)
           ],
-          { reason:'coupon-restore-combined-atomic', batchId:restoreBatchId }
+          { reason:'coupon-restore-combined-atomic', batchId:restoreBatchId, audit:restoreAudit }
         );
         if(!restoreResult || restoreResult.ok !== true || restoreResult.commitConfirmed !== true){
           throw new Error('쿠폰 복구 transaction 결과를 확인하지 못했습니다.');
@@ -38074,6 +38875,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!Array.isArray(state.selectedUserIds)) state.selectedUserIds = [];
       if(!state.offlineCouponUseData || typeof state.offlineCouponUseData !== 'object') state.offlineCouponUseData = { usedDate:getTodayString(), userId:'', amount:1, reason:'앱 미사용일 수기 차감' };
       if(typeof state.offlineCouponUseEditId !== 'string') state.offlineCouponUseEditId = '';
+      if(!Number.isInteger(Number(state.offlineCouponUseEditBaseRevision)) || Number(state.offlineCouponUseEditBaseRevision) < 0) state.offlineCouponUseEditBaseRevision = 0;
+      if(state.offlineCouponUseEditBaseState && typeof state.offlineCouponUseEditBaseState !== 'object') state.offlineCouponUseEditBaseState = null;
+      if(!state.offlineCouponUseEditCurrentByRecordId || typeof state.offlineCouponUseEditCurrentByRecordId !== 'object') state.offlineCouponUseEditCurrentByRecordId = {};
       if(typeof state.offlineCouponUseSearch !== 'string') state.offlineCouponUseSearch = '';
       if(typeof state.showOfflineCouponUseModal !== 'boolean') state.showOfflineCouponUseModal = false;
       if(typeof state.showCouponRecalcModal !== 'boolean') state.showCouponRecalcModal = false;
@@ -40612,6 +41416,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function resetOfflineCouponUseForm(){
       state.offlineCouponUseEditId = '';
+      state.offlineCouponUseEditBaseRevision = 0;
+      state.offlineCouponUseEditBaseState = null;
       state.offlineCouponUseSearch = '';
       state.offlineCouponUseData = { usedDate:getTodayString(), userId:'', amount:1, reason:'앱 미사용일 수기 차감' };
     }
@@ -40619,6 +41425,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function getOfflineCouponUseRecords(){
       return mergeCouponHistoryRecords(Array.isArray(state.couponHistory) ? state.couponHistory : [])
         .filter(record => record && record.type === 'COUPON_OFFLINE_USE')
+        .map(record => materializeOfflineCouponUseCurrentRecord(record))
+        .filter(Boolean)
         .sort(compareCouponHistoryRecordsByTimeDesc);
     }
 
@@ -40856,113 +41664,46 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const timestamp = getOfflineCouponUseTimestamp(usedDate);
       const editId = String(state.offlineCouponUseEditId || '').trim();
       const existing = editId ? getOfflineCouponUseRecordById(editId) : null;
-      const oldUserId = String(existing && existing.userId || '').trim();
-      const oldAmount = existing ? Math.abs(Number(existing.amount || existing.delta || 0)) : 0;
+      let editOperation = null;
 
       try{
-        const targetIds = Array.from(new Set([userId, existing ? oldUserId : ''].filter(Boolean)));
-        const preparedByUserId = {};
-        for(const targetId of targetIds){
-          const targetUser = getUserById(targetId);
-          if(!targetUser) throw new Error('서버 확인 대상 사용자를 찾을 수 없습니다.');
-          const prepared = await prepareCouponBalanceMutation(targetUser, '앱 미사용일 차감');
-          if(!prepared) return;
-          preparedByUserId[targetId] = prepared;
-        }
-        user = getUserById(userId);
-        const oldUser = existing ? getUserById(oldUserId) : null;
-        if(!user) throw new Error('최신 사용자 정보를 찾을 수 없습니다.');
-
         if(existing){
-          let oldUserNextCoupons = null;
-          let newUserNextCoupons = null;
-          let beforeForRecord = null;
-          const couponMutations = [];
-          if(oldUser && String(oldUser.id || '') !== String(user.id || '')){
-            const oldPrepared = preparedByUserId[String(oldUser.id || '')];
-            const newPrepared = preparedByUserId[String(user.id || '')];
-            const oldBefore = Number(oldPrepared.currentCoupons || 0);
-            const newBefore = Number(newPrepared.currentCoupons || 0);
-            oldUserNextCoupons = oldBefore + oldAmount;
-            newUserNextCoupons = newBefore - amount;
-            beforeForRecord = newBefore;
-            couponMutations.push({
-              userId:String(oldUser.id || ''),
-              expectedCoupons:oldBefore,
-              expectedCouponsUpdatedAt:String(oldPrepared.expectedCouponsUpdatedAt || ''),
-              expectedVersion:Number(oldPrepared.expectedVersion || 0),
-              expectedLastRecalcRunId:String(oldPrepared.expectedLastRecalcRunId || ''),
-              nextCoupons:oldUserNextCoupons,
-              updatedAt:now,
-              operationId:`offline-coupon-edit-refund:${existing.id}:${now}`
-            });
-            couponMutations.push({
-              userId:String(user.id || ''),
-              expectedCoupons:newBefore,
-              expectedCouponsUpdatedAt:String(newPrepared.expectedCouponsUpdatedAt || ''),
-              expectedVersion:Number(newPrepared.expectedVersion || 0),
-              expectedLastRecalcRunId:String(newPrepared.expectedLastRecalcRunId || ''),
-              nextCoupons:newUserNextCoupons,
-              updatedAt:now,
-              operationId:`offline-coupon-edit-deduct:${existing.id}:${now}`
-            });
-          }else{
-            const prepared = preparedByUserId[String(user.id || '')];
-            const before = Number(prepared.currentCoupons || 0);
-            const diff = amount - oldAmount;
-            newUserNextCoupons = before - diff;
-            beforeForRecord = newUserNextCoupons + amount;
-            couponMutations.push({
-              userId:String(user.id || ''),
-              expectedCoupons:before,
-              expectedCouponsUpdatedAt:String(prepared.expectedCouponsUpdatedAt || ''),
-              expectedVersion:Number(prepared.expectedVersion || 0),
-              expectedLastRecalcRunId:String(prepared.expectedLastRecalcRunId || ''),
-              nextCoupons:newUserNextCoupons,
-              updatedAt:now,
-              operationId:`offline-coupon-edit:${existing.id}:${now}`
-            });
-          }
-          const updatedRecord = normalizeCouponHistoryRecord({
-            ...existing,
-            id: existing.id,
-            type:'COUPON_OFFLINE_USE',
-            userId: user.id,
-            userName: user.name || '',
-            userDept: user.dept || user.department || '',
-            timestamp,
-            usedDate,
+          const baseRevision = Math.max(0, Math.floor(Number(state.offlineCouponUseEditBaseRevision || 0)) || 0);
+          const beforeState = normalizeOfflineCouponEditEffectiveState(
+            state.offlineCouponUseEditBaseState,
+            existing
+          );
+          const afterState = normalizeOfflineCouponEditEffectiveState({
+            userId:user.id,
+            userName:user.name || '',
+            userDept:user.dept || user.department || '',
             amount,
-            delta:-amount,
-            beforeCoupons: beforeForRecord,
-            remainingCoupons: newUserNextCoupons,
-            reason,
-            changedBy: existing.changedBy || getCurrentActorLabel(),
-            registeredAt: existing.registeredAt || existing.timestamp || now,
-            editedAt: now,
-            editedBy: getCurrentActorLabel(),
-            editCount: Number(existing.editCount || 0) + 1,
-            source:'offline-coupon-use'
+            usedDate,
+            reason
           });
-          const savedRecord = await saveOfflineCouponUseCloudRecord(updatedRecord, 'offline-coupon-use-edit', couponMutations);
-          state.couponHistory = (Array.isArray(state.couponHistory) ? state.couponHistory : []).filter(record => String(record && record.id || '') !== String(existing.id || ''));
-          if(savedRecord){
-            state.couponHistory = mergeCouponHistoryRecords(state.couponHistory, [savedRecord]);
-            rememberOfflineCouponUseHistoryGuardRecord(savedRecord);
-            enqueueCouponEventCloudRecord({ ...savedRecord, appVersion:ORDER_APP_VERSION }, 'offline-coupon-use-edit');
+          if(!beforeState || !afterState) throw new Error('앱 미사용일 차감 수정 정보를 확인할 수 없습니다.');
+          editOperation = buildOfflineCouponEditPendingOperation(existing.id, baseRevision, beforeState, afterState, now);
+          if(!rememberOfflineCouponEditPendingOperation(editOperation)){
+            throw new Error('앱 미사용일 차감 수정 재시도 정보를 저장하지 못했습니다.');
           }
+          await saveOfflineCouponEditOperation(editOperation, 'offline-coupon-use-edit');
+          removeOfflineCouponEditPendingOperation(editOperation.operationId);
           addAuditLog('COUPON_OFFLINE_USE_EDITED', {
             recordId: existing.id,
-            oldUserId: existing.userId,
+            operationId:editOperation.operationId,
+            baseRevision,
+            newRevision:baseRevision + 1,
+            oldUserId: beforeState.userId,
             newUserId: user.id,
-            oldAmount,
+            oldAmount:beforeState.amount,
             newAmount: amount,
-            oldUsedDate: existing.usedDate || getDateString(existing.timestamp),
+            oldUsedDate: beforeState.usedDate,
             newUsedDate: usedDate,
             reason
           });
         }else{
-          const prepared = preparedByUserId[String(user.id || '')];
+          const prepared = await prepareCouponBalanceMutation(user, '앱 미사용일 차감');
+          if(!prepared) return;
           const beforeCoupons = Number(prepared.currentCoupons || 0);
           const remainingCoupons = beforeCoupons - amount;
           const createdRecord = normalizeCouponHistoryRecord({
@@ -40999,6 +41740,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
           addAuditLog('COUPON_OFFLINE_USE_CREATED', { userId:user.id, amount, usedDate, reason });
         }
       }catch(error){
+        if(editOperation && isOfflineCouponEditNonRetryableError(error)){
+          removeOfflineCouponEditPendingOperation(editOperation.operationId);
+        }
         console.error('앱 미사용일 차감 전용 기록 저장 실패', error);
         showMessage('앱 미사용일 차감 기록 저장에 실패하여 쿠폰을 차감하지 않았습니다.');
         return;
@@ -44129,6 +44873,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         resetOfflineCouponUseForm();
         render();
         hydrateOfflineCouponUseCloudRecords('offline-coupon-use-modal-open', { renderAfter:true });
+        hydrateOfflineCouponEditCurrentRecords('offline-coupon-edit-modal-open', { renderAfter:true })
+          .finally(() => flushOfflineCouponEditPendingOperations('offline-coupon-edit-modal-open-retry', { renderAfter:true }));
       }
       else if(action === 'close-offline-coupon-use'){
         state.showOfflineCouponUseModal = false;
@@ -44142,7 +44888,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       else if(action === 'edit-offline-coupon-use'){
         const record = getOfflineCouponUseRecordById(btn.dataset.recordId);
         if(!record){ showMessage('차감 기록을 찾을 수 없습니다.'); return; }
+        const baseState = normalizeOfflineCouponEditEffectiveState(record);
+        if(!baseState){ showMessage('차감 기록을 찾을 수 없습니다.'); return; }
         state.offlineCouponUseEditId = record.id;
+        state.offlineCouponUseEditBaseRevision = Math.max(0, Math.floor(Number(record.offlineEditRevision || 0)) || 0);
+        state.offlineCouponUseEditBaseState = baseState;
         state.offlineCouponUseSearch = '';
         state.offlineCouponUseData = {
           usedDate: record.usedDate || getDateString(record.timestamp),
@@ -49138,6 +49888,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   const closedOrderGuardCollectionRef = collection(db, 'haetsalOrderClosedGuards');
   const revivedOrderGuardCollectionRef = collection(db, 'haetsalOrderRevivedGuards');
   const combinedAppCollectionRef = collection(db, 'haetsalCombinedApp');
+  const offlineCouponEditCollectionRef = collection(db, 'haetsalOfflineCouponEdits');
   const liveOrderDocPrefix = 'live_order_';
   const LIVE_OPEN_ORDER_QUERY_LIMIT = 300;
   const liveOrderQueryRef = query(liveOrderCollectionRef, where(documentId(), '>=', liveOrderDocPrefix), where(documentId(), '<', liveOrderDocPrefix + '\uf8ff'));
@@ -49167,7 +49918,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   const closedOrderGuardDocPrefix = 'closed_guard_';
   const revivedOrderGuardDocPrefix = 'revived_guard_';
   const offlineCouponUseDocPrefix = 'offline_coupon_use_';
+  const offlineCouponEditCurrentDocPrefix = 'offline_coupon_edit_current_';
+  const offlineCouponEditAuditDocPrefix = 'offline_coupon_edit_audit_';
   const couponEventDocPrefix = 'coupon_event_';
+  const couponRestoreRunDocPrefix = 'coupon_restore_run_';
+  const couponRestoreAuditRunCollection = 'haetsalRestoreAuditRuns';
   const couponRecalcRunDocPrefix = 'coupon_recalc_run_';
   const couponRecalcItemDocPrefix = 'coupon_recalc_item_';
   const couponRecalcLatestDocPrefix = 'coupon_recalc_latest_';
@@ -52295,6 +53050,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const totalCups = items.reduce((sum, item) => sum + Math.max(0, Number(item && item.quantity || 0)), 0) || Number(order.totalCups || order.quantity || 0);
     const orderLite = {
       id:orderId,
+      ...(Object.prototype.hasOwnProperty.call(order, 'couponPolicyVersion') ? { couponPolicyVersion:order.couponPolicyVersion } : {}),
+      ...(Object.prototype.hasOwnProperty.call(order, 'couponCostTotal') ? { couponCostTotal:order.couponCostTotal } : {}),
       orderNumber:String(order.orderNumber || order.seq || ''),
       seq:order.seq || '',
       status,
@@ -53433,6 +54190,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(String(expected.correctionOfEventId || '').trim()
       && String(actual.correctionOfEventId || '') !== String(expected.correctionOfEventId || '')){
       throw new Error('서버 쿠폰 정정 기록의 원본 ID가 저장 요청과 일치하지 않습니다.');
+    }
+    ['restoreBatchId','restoreManifestId','restoreOperationId'].forEach(field => {
+      if(Object.prototype.hasOwnProperty.call(expected, field)
+        && String(actual[field] || '') !== String(expected[field] || '')){
+        throw new Error(`서버 쿠폰 복구 기록의 ${field}가 저장 요청과 일치하지 않습니다.`);
+      }
+    });
+    if(Object.prototype.hasOwnProperty.call(expected, 'restorePolicyVersion')
+      && Number(actual.restorePolicyVersion) !== Number(expected.restorePolicyVersion)){
+      throw new Error('서버 쿠폰 복구 기록의 policy version이 저장 요청과 일치하지 않습니다.');
     }
     if(!couponEventNumericFieldMatches(expected, actual, 'delta')) throw new Error('서버 쿠폰 변동 수량이 저장 요청과 일치하지 않습니다.');
     if(!couponEventNumericFieldMatches(expected, actual, 'beforeCoupons')) throw new Error('서버 쿠폰 변경 전 수량이 저장 요청과 일치하지 않습니다.');
@@ -54767,7 +55534,414 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return { applied:true, users:authoritativeUsers };
   }
 
-  async function verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries){
+  function getCouponRestoreRunRef(batchId){
+    return doc(db, couponRestoreAuditRunCollection, sanitizeCouponRecalcDocPart(batchId));
+  }
+
+  function getCouponRestoreAuditUserKey(userId){
+    const source = String(userId || '').trim();
+    const prefix = sanitizeCouponRecalcDocPart(source).slice(0, 140) || 'user';
+    return `${prefix}_${makeCouponRestoreAuditFingerprint(source).slice(8)}`;
+  }
+
+  function getCouponRestoreCoreRef(batchId, userKey){
+    return doc(db, couponRestoreAuditRunCollection, sanitizeCouponRecalcDocPart(batchId), 'userCore', sanitizeCouponRecalcDocPart(userKey));
+  }
+
+  function getCouponRestoreLinkageRef(batchId, userKey){
+    return doc(db, couponRestoreAuditRunCollection, sanitizeCouponRecalcDocPart(batchId), 'userLinkage', sanitizeCouponRecalcDocPart(userKey));
+  }
+
+  function getCouponRestoreSourceRef(batchId, sourceDocId){
+    return doc(db, couponRestoreAuditRunCollection, sanitizeCouponRecalcDocPart(batchId), 'sources', sanitizeCouponRecalcDocPart(sourceDocId));
+  }
+
+  function stableCouponRestoreAuditJson(value){
+    if(Array.isArray(value)) return '[' + value.map(stableCouponRestoreAuditJson).join(',') + ']';
+    if(value && typeof value === 'object'){
+      return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + stableCouponRestoreAuditJson(value[key])).join(',') + '}';
+    }
+    return JSON.stringify(value);
+  }
+
+  function makeCouponRestoreAuditFingerprint(value){
+    const source = stableCouponRestoreAuditJson(value);
+    let forward = 2166136261;
+    let reverse = 2166136261;
+    for(let index = 0; index < source.length; index += 1){
+      forward ^= source.charCodeAt(index);
+      forward = Math.imul(forward, 16777619);
+      reverse ^= source.charCodeAt(source.length - index - 1);
+      reverse = Math.imul(reverse, 16777619);
+    }
+    return `restore_${(forward >>> 0).toString(36).padStart(7, '0')}${(reverse >>> 0).toString(36).padStart(7, '0')}`;
+  }
+
+  function assertCouponRestoreAuditInteger(value, label, minValue, maxValue){
+    if(!Number.isInteger(value)) throw new Error(label + ' 값이 정수가 아닙니다.');
+    if(Number.isFinite(minValue) && value < minValue) throw new Error(label + ' 값이 안전 범위보다 작습니다.');
+    if(Number.isFinite(maxValue) && value > maxValue) throw new Error(label + ' 값이 안전 범위보다 큽니다.');
+    return value;
+  }
+
+  function assertCouponRestoreAuditText(value, label, maxLength, required){
+    if(typeof value !== 'string') throw new Error(label + ' 값이 문자열이 아닙니다.');
+    if((required && !value) || value.length > maxLength) throw new Error(label + ' 문자열 범위를 확인할 수 없습니다.');
+    return value;
+  }
+
+  function assertCouponRestoreAuditExactKeys(value, expectedKeys, label){
+    if(!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(label + ' 형식이 올바르지 않습니다.');
+    const actual = Object.keys(value).sort().join('|');
+    const expected = expectedKeys.slice().sort().join('|');
+    if(actual !== expected) throw new Error(label + ' field 구성이 올바르지 않습니다.');
+    return value;
+  }
+
+  function assertCouponRestoreAuditEnum(value, allowed, label){
+    assertCouponRestoreAuditText(value, label, 120, true);
+    if(!allowed.includes(value)) throw new Error(label + ' enum을 확인할 수 없습니다.');
+    return value;
+  }
+
+  function validateCouponRestoreAuditCore(data){
+    assertCouponRestoreAuditExactKeys(data, [
+      'payloadKind','schemaGuard','runId','restoreBatchId','restorePolicyVersion',
+      'actorUid','userId','userKey','baseAnchorKind','baseAnchorId',
+      'baseAnchorRevision','baseAnchorTimestamp','seedCoupons','baseCoupons',
+      'beforeCoupons','targetCoupons','actualDelta','finalCoupons',
+      'restoreOrderDeduct','restoreOrderRefund','restoreOrderEditDelta',
+      'restoreManualCharge','restoreManualDeduct','sourceEvidenceCount',
+      'userEvidenceDigest','createdAtClient','storageLocation'
+    ], '쿠폰 복구 userCore');
+    if(data.payloadKind !== 'coupon-restore-user-core' || data.schemaGuard !== 'R3_RESTORE_USER_CORE_V1') throw new Error('쿠폰 복구 userCore schema를 확인할 수 없습니다.');
+    ['runId','restoreBatchId','actorUid','userId','userKey'].forEach(field => assertCouponRestoreAuditText(data[field], '쿠폰 복구 userCore ' + field, 200, true));
+    if(data.runId !== data.restoreBatchId) throw new Error('쿠폰 복구 userCore run identity가 일치하지 않습니다.');
+    assertCouponRestoreAuditInteger(data.restorePolicyVersion, '쿠폰 복구 userCore policy', 1, 100);
+    assertCouponRestoreAuditEnum(data.baseAnchorKind, [
+      'BACKUP_BALANCE','ORDER_BALANCE','ADMIN_CHARGE_BALANCE',
+      'ADMIN_DEDUCT_BALANCE','RESTORE_BALANCE','CURRENT_BALANCE_NO_RESTORE'
+    ], '쿠폰 복구 anchor 종류');
+    assertCouponRestoreAuditText(data.baseAnchorId, '쿠폰 복구 anchor ID', 240, true);
+    assertCouponRestoreAuditText(data.baseAnchorRevision, '쿠폰 복구 anchor revision', 240, false);
+    assertCouponRestoreAuditText(data.baseAnchorTimestamp, '쿠폰 복구 anchor timestamp', 240, true);
+    ['seedCoupons','baseCoupons','beforeCoupons','targetCoupons','actualDelta','finalCoupons','restoreOrderEditDelta']
+      .forEach(field => assertCouponRestoreAuditInteger(data[field], '쿠폰 복구 userCore ' + field, -1000000, 1000000));
+    ['restoreOrderDeduct','restoreOrderRefund','restoreManualCharge','restoreManualDeduct']
+      .forEach(field => assertCouponRestoreAuditInteger(data[field], '쿠폰 복구 userCore ' + field, 0, 1000000));
+    assertCouponRestoreAuditInteger(data.sourceEvidenceCount, '쿠폰 복구 userCore source 수', 1, 100000);
+    assertCouponRestoreAuditText(data.userEvidenceDigest, '쿠폰 복구 userCore digest', 40, true);
+    assertCouponRestoreAuditText(data.createdAtClient, '쿠폰 복구 userCore 생성 시각', 240, true);
+    if(data.storageLocation !== couponRestoreAuditRunCollection) throw new Error('쿠폰 복구 userCore 저장 위치가 일치하지 않습니다.');
+    if(data.beforeCoupons + data.actualDelta !== data.finalCoupons || data.targetCoupons !== data.finalCoupons){
+      throw new Error('쿠폰 복구 userCore 잔액 invariant가 일치하지 않습니다.');
+    }
+    return data;
+  }
+
+  function validateCouponRestoreAuditLinkage(data){
+    assertCouponRestoreAuditExactKeys(data, [
+      'payloadKind','schemaGuard','runId','restoreBatchId','restorePolicyVersion',
+      'actorUid','userId','userKey','eventRequired','generatedRestoreEventId',
+      'generatedRestoreEventDocId','restoreLogId','restoreOperationId',
+      'sourceEvidenceCount','linkageDigest','createdAtClient','storageLocation'
+    ], '쿠폰 복구 userLinkage');
+    if(data.payloadKind !== 'coupon-restore-user-linkage' || data.schemaGuard !== 'R3_RESTORE_USER_LINKAGE_V1') throw new Error('쿠폰 복구 userLinkage schema를 확인할 수 없습니다.');
+    ['runId','restoreBatchId','actorUid','userId','userKey'].forEach(field => assertCouponRestoreAuditText(data[field], '쿠폰 복구 userLinkage ' + field, 200, true));
+    if(data.runId !== data.restoreBatchId) throw new Error('쿠폰 복구 userLinkage run identity가 일치하지 않습니다.');
+    assertCouponRestoreAuditInteger(data.restorePolicyVersion, '쿠폰 복구 userLinkage policy', 1, 100);
+    if(typeof data.eventRequired !== 'boolean') throw new Error('쿠폰 복구 userLinkage eventRequired가 boolean이 아닙니다.');
+    assertCouponRestoreAuditText(data.generatedRestoreEventId, '쿠폰 복구 생성 event ID', 240, false);
+    assertCouponRestoreAuditText(data.generatedRestoreEventDocId, '쿠폰 복구 생성 event 문서 ID', 260, false);
+    if(data.eventRequired){
+      if(!data.generatedRestoreEventId || data.generatedRestoreEventDocId !== 'coupon_event_' + data.generatedRestoreEventId){
+        throw new Error('쿠폰 복구 userLinkage event pair가 일치하지 않습니다.');
+      }
+    }else if(data.generatedRestoreEventId || data.generatedRestoreEventDocId){
+      throw new Error('쿠폰 복구 userLinkage empty event pair가 일치하지 않습니다.');
+    }
+    assertCouponRestoreAuditText(data.restoreLogId, '쿠폰 복구 log ID', 240, true);
+    assertCouponRestoreAuditText(data.restoreOperationId, '쿠폰 복구 operation ID', 400, true);
+    assertCouponRestoreAuditInteger(data.sourceEvidenceCount, '쿠폰 복구 userLinkage source 수', 1, 100000);
+    assertCouponRestoreAuditText(data.linkageDigest, '쿠폰 복구 userLinkage digest', 40, true);
+    assertCouponRestoreAuditText(data.createdAtClient, '쿠폰 복구 userLinkage 생성 시각', 240, true);
+    if(data.storageLocation !== couponRestoreAuditRunCollection) throw new Error('쿠폰 복구 userLinkage 저장 위치가 일치하지 않습니다.');
+    return data;
+  }
+
+  function validateCouponRestoreAuditSource(data){
+    assertCouponRestoreAuditExactKeys(data, [
+      'payloadKind','schemaGuard','runId','restoreBatchId','restorePolicyVersion',
+      'actorUid','userId','userKey','sourceDocId','evidenceType','evidenceId',
+      'sourceUserId','sourceKind','sourceRecordId','sourceRevision',
+      'sourceTimestamp','normalizedContribution','included','exclusionReason',
+      'fallbackKind','phase','evidenceDigest','createdAtClient','storageLocation'
+    ], '쿠폰 복구 SOURCE');
+    if(data.payloadKind !== 'coupon-restore-source' || data.schemaGuard !== 'R3_RESTORE_SOURCE_C1_V1' || data.evidenceType !== 'SOURCE'){
+      throw new Error('쿠폰 복구 SOURCE schema를 확인할 수 없습니다.');
+    }
+    ['runId','restoreBatchId','actorUid','userId','userKey','sourceDocId','evidenceId','sourceUserId','sourceRecordId']
+      .forEach(field => assertCouponRestoreAuditText(data[field], '쿠폰 복구 SOURCE ' + field, 240, true));
+    if(data.runId !== data.restoreBatchId || data.sourceDocId !== data.evidenceId) throw new Error('쿠폰 복구 SOURCE path identity가 일치하지 않습니다.');
+    assertCouponRestoreAuditInteger(data.restorePolicyVersion, '쿠폰 복구 SOURCE policy', 1, 100);
+    assertCouponRestoreAuditEnum(data.sourceKind, [
+      'BASE_ANCHOR','ORDER_DEDUCT','ORDER_REFUND','ORDER_EDIT',
+      'ADMIN_CHARGE','ADMIN_DEDUCT','OFFLINE_EDIT_ADJUSTMENT_EXCLUDED'
+    ], '쿠폰 복구 SOURCE 종류');
+    assertCouponRestoreAuditText(data.sourceRevision, '쿠폰 복구 SOURCE revision', 240, false);
+    assertCouponRestoreAuditText(data.sourceTimestamp, '쿠폰 복구 SOURCE timestamp', 240, true);
+    assertCouponRestoreAuditInteger(data.normalizedContribution, '쿠폰 복구 SOURCE contribution', -1000000, 1000000);
+    if(typeof data.included !== 'boolean') throw new Error('쿠폰 복구 SOURCE included가 boolean이 아닙니다.');
+    assertCouponRestoreAuditText(data.exclusionReason, '쿠폰 복구 SOURCE exclusion reason', 160, false);
+    assertCouponRestoreAuditEnum(data.fallbackKind, [
+      'BACKUP_BALANCE','CURRENT_BALANCE','ORDER_COUPON_COST_TOTAL',
+      'ITEM_COUPON_COST_TOTAL','ITEM_COUPON_COST_PER_CUP',
+      'ORDER_COUPON_COST_PER_CUP','LEGACY_ORDER_QUANTITY','COUPON_EVENT',
+      'LEGACY_LOG','COUPON_ORDER_EDIT_HISTORY','LEGACY_ORDER_EDITED',
+      'ORDER_BALANCE','ADMIN_CHARGE_BALANCE','ADMIN_DEDUCT_BALANCE',
+      'RESTORE_BALANCE','CURRENT_BALANCE_NO_RESTORE'
+    ], '쿠폰 복구 SOURCE fallback');
+    assertCouponRestoreAuditEnum(data.phase, ['BASE_ANCHOR','BASE_ADJUSTMENT','APPLY_RANGE'], '쿠폰 복구 SOURCE phase');
+    if((data.included && data.exclusionReason) || (!data.included && !data.exclusionReason)){
+      throw new Error('쿠폰 복구 SOURCE 포함/제외 invariant가 일치하지 않습니다.');
+    }
+    if(data.sourceKind === 'BASE_ANCHOR' && (data.phase !== 'BASE_ANCHOR' || !data.included || data.exclusionReason)){
+      throw new Error('쿠폰 복구 anchor SOURCE invariant가 일치하지 않습니다.');
+    }
+    if(data.sourceKind === 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED'
+      && (data.included || data.exclusionReason !== 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED')){
+      throw new Error('쿠폰 복구 offline edit 제외 SOURCE invariant가 일치하지 않습니다.');
+    }
+    assertCouponRestoreAuditText(data.evidenceDigest, '쿠폰 복구 SOURCE digest', 40, true);
+    assertCouponRestoreAuditText(data.createdAtClient, '쿠폰 복구 SOURCE 생성 시각', 240, true);
+    if(data.storageLocation !== couponRestoreAuditRunCollection) throw new Error('쿠폰 복구 SOURCE 저장 위치가 일치하지 않습니다.');
+    return data;
+  }
+
+  function prepareCouponRestoreAuditEntries(options, eventEntries){
+    const audit = options && options.audit;
+    const batchId = sanitizeCouponRecalcDocPart(options && options.batchId);
+    if(!audit || typeof audit !== 'object' || !batchId) throw new Error('쿠폰 복구 manifest 입력을 확인할 수 없습니다.');
+    const restoreManifestId = couponRestoreRunDocPrefix + batchId;
+    if(String(audit.restoreBatchId || '') !== batchId || String(audit.restoreManifestId || '') !== restoreManifestId){
+      throw new Error('쿠폰 복구 manifest identity가 batch와 일치하지 않습니다.');
+    }
+    const restorePolicyVersion = assertCouponRestoreAuditInteger(Number(audit.restorePolicyVersion), '쿠폰 복구 policy version', 1, 100);
+    const actorUid = assertCouponRestoreAuditText(String(auth.currentUser && auth.currentUser.uid || ''), '쿠폰 복구 actor UID', 200, true);
+    const createdAtClient = assertCouponRestoreAuditText(audit.createdAtClient, '쿠폰 복구 생성 시각', 240, true);
+    const sourceCores = Array.isArray(audit.userCoreEvidence) ? JSON.parse(JSON.stringify(audit.userCoreEvidence)) : [];
+    const sourceLinkages = Array.isArray(audit.userLinkageEvidence) ? JSON.parse(JSON.stringify(audit.userLinkageEvidence)) : [];
+    const sourceEvidence = Array.isArray(audit.sourceEvidence) ? JSON.parse(JSON.stringify(audit.sourceEvidence)) : [];
+    if(!sourceCores.length || sourceCores.length > 400 || sourceLinkages.length !== sourceCores.length){
+      throw new Error('쿠폰 복구 manifest 대상 사용자 수가 안전 범위를 벗어났습니다.');
+    }
+    const includeOptions = audit.includeOptions && typeof audit.includeOptions === 'object' ? audit.includeOptions : {};
+    const optionKeys = ['includeOrderDeduct','includeManualDeduct','includeOrderRefund','includeManualCharge','includeOrderEdit'];
+    if(Object.keys(includeOptions).sort().join('|') !== optionKeys.slice().sort().join('|')
+      || optionKeys.some(key => typeof includeOptions[key] !== 'boolean')){
+      throw new Error('쿠폰 복구 manifest 옵션 snapshot이 올바르지 않습니다.');
+    }
+    const eventByUserId = new Map((Array.isArray(eventEntries) ? eventEntries : []).map(entry => [String(entry && entry.finalPayload && entry.finalPayload.userId || ''), entry]));
+    if(eventByUserId.size !== (Array.isArray(eventEntries) ? eventEntries.length : 0)) throw new Error('쿠폰 복구 canonical event 사용자 ID가 중복되었습니다.');
+    const coreEntries = sourceCores.map(core => {
+      const userId = assertCouponRestoreAuditText(core.userId, '쿠폰 복구 core 사용자 ID', 200, true);
+      const userKey = getCouponRestoreAuditUserKey(userId);
+      const data = validateCouponRestoreAuditCore({
+        payloadKind:'coupon-restore-user-core',
+        schemaGuard:'R3_RESTORE_USER_CORE_V1',
+        runId:batchId,
+        restoreBatchId:batchId,
+        restorePolicyVersion,
+        actorUid,
+        userId,
+        userKey,
+        baseAnchorKind:core.baseAnchorKind,
+        baseAnchorId:core.baseAnchorId,
+        baseAnchorRevision:core.baseAnchorRevision,
+        baseAnchorTimestamp:core.baseAnchorTimestamp,
+        seedCoupons:core.seedCoupons,
+        baseCoupons:core.baseCoupons,
+        beforeCoupons:core.beforeCoupons,
+        targetCoupons:core.targetCoupons,
+        actualDelta:core.actualDelta,
+        finalCoupons:core.finalCoupons,
+        restoreOrderDeduct:core.restoreOrderDeduct,
+        restoreOrderRefund:core.restoreOrderRefund,
+        restoreOrderEditDelta:core.restoreOrderEditDelta,
+        restoreManualCharge:core.restoreManualCharge,
+        restoreManualDeduct:core.restoreManualDeduct,
+        sourceEvidenceCount:core.sourceEvidenceCount,
+        userEvidenceDigest:core.userEvidenceDigest,
+        createdAtClient,
+        storageLocation:couponRestoreAuditRunCollection
+      });
+      return { data, ref:getCouponRestoreCoreRef(batchId, userKey), docId:userKey };
+    }).sort((left, right) => left.docId.localeCompare(right.docId));
+    const coreByUserId = new Map(coreEntries.map(entry => [entry.data.userId, entry]));
+    if(coreByUserId.size !== coreEntries.length) throw new Error('쿠폰 복구 userCore 사용자 ID가 중복되었습니다.');
+    const linkageEntries = sourceLinkages.map(linkage => {
+      const userId = assertCouponRestoreAuditText(linkage.userId, '쿠폰 복구 linkage 사용자 ID', 200, true);
+      const coreEntry = coreByUserId.get(userId);
+      if(!coreEntry) throw new Error('쿠폰 복구 userLinkage의 userCore를 확인할 수 없습니다.');
+      const userKey = coreEntry.data.userKey;
+      const data = validateCouponRestoreAuditLinkage({
+        payloadKind:'coupon-restore-user-linkage',
+        schemaGuard:'R3_RESTORE_USER_LINKAGE_V1',
+        runId:batchId,
+        restoreBatchId:batchId,
+        restorePolicyVersion,
+        actorUid,
+        userId,
+        userKey,
+        eventRequired:linkage.eventRequired,
+        generatedRestoreEventId:linkage.generatedRestoreEventId,
+        generatedRestoreEventDocId:linkage.generatedRestoreEventDocId,
+        restoreLogId:linkage.restoreLogId,
+        restoreOperationId:linkage.restoreOperationId,
+        sourceEvidenceCount:linkage.sourceEvidenceCount,
+        linkageDigest:linkage.linkageDigest,
+        createdAtClient,
+        storageLocation:couponRestoreAuditRunCollection
+      });
+      const eventEntry = eventByUserId.get(userId);
+      if(data.eventRequired){
+        if(!eventEntry || String(eventEntry.docId || '') !== data.generatedRestoreEventDocId || String(eventEntry.recordId || '') !== data.generatedRestoreEventId){
+          throw new Error('쿠폰 복구 userLinkage와 canonical event가 일치하지 않습니다.');
+        }
+      }else if(eventEntry){
+        throw new Error('쿠폰 복구 userLinkage에 불필요한 canonical event가 있습니다.');
+      }
+      if(data.sourceEvidenceCount !== coreEntry.data.sourceEvidenceCount) throw new Error('쿠폰 복구 core/linkage source 수가 일치하지 않습니다.');
+      return { data, ref:getCouponRestoreLinkageRef(batchId, userKey), docId:userKey };
+    }).sort((left, right) => left.docId.localeCompare(right.docId));
+    const linkageByUserId = new Map(linkageEntries.map(entry => [entry.data.userId, entry]));
+    if(linkageByUserId.size !== linkageEntries.length || linkageByUserId.size !== coreByUserId.size) throw new Error('쿠폰 복구 userLinkage 사용자 ID가 중복되거나 누락되었습니다.');
+    const evidenceIds = new Set();
+    const sourceEntries = sourceEvidence.map(source => {
+      const userId = assertCouponRestoreAuditText(source.userId, '쿠폰 복구 SOURCE 사용자 ID', 200, true);
+      const coreEntry = coreByUserId.get(userId);
+      if(!coreEntry) throw new Error('쿠폰 복구 SOURCE의 userCore를 확인할 수 없습니다.');
+      const evidenceId = assertCouponRestoreAuditText(source.evidenceId, '쿠폰 복구 SOURCE evidence ID', 180, true);
+      const sourceDocId = sanitizeCouponRecalcDocPart(evidenceId);
+      if(sourceDocId !== evidenceId || evidenceIds.has(evidenceId)) throw new Error('쿠폰 복구 SOURCE evidence ID가 중복되었거나 path-safe 형식이 아닙니다.');
+      evidenceIds.add(evidenceId);
+      const data = validateCouponRestoreAuditSource({
+        payloadKind:'coupon-restore-source',
+        schemaGuard:'R3_RESTORE_SOURCE_C1_V1',
+        runId:batchId,
+        restoreBatchId:batchId,
+        restorePolicyVersion,
+        actorUid,
+        userId,
+        userKey:coreEntry.data.userKey,
+        sourceDocId,
+        evidenceType:source.evidenceType,
+        evidenceId,
+        sourceUserId:source.sourceUserId,
+        sourceKind:source.sourceKind,
+        sourceRecordId:source.sourceRecordId,
+        sourceRevision:source.sourceRevision,
+        sourceTimestamp:source.sourceTimestamp,
+        normalizedContribution:source.normalizedContribution,
+        included:source.included,
+        exclusionReason:source.exclusionReason,
+        fallbackKind:source.fallbackKind,
+        phase:source.phase,
+        evidenceDigest:makeCouponRestoreAuditFingerprint(source),
+        createdAtClient,
+        storageLocation:couponRestoreAuditRunCollection
+      });
+      return { data, ref:getCouponRestoreSourceRef(batchId, sourceDocId), docId:sourceDocId };
+    }).sort((left, right) => left.docId.localeCompare(right.docId));
+    coreEntries.forEach(coreEntry => {
+      const count = sourceEntries.filter(sourceEntry => sourceEntry.data.userId === coreEntry.data.userId).length;
+      if(count !== coreEntry.data.sourceEvidenceCount) throw new Error('쿠폰 복구 사용자별 SOURCE evidence 수가 일치하지 않습니다.');
+    });
+    const evidenceDigest = makeCouponRestoreAuditFingerprint([
+      ...coreEntries.map(entry => entry.data),
+      ...linkageEntries.map(entry => entry.data),
+      ...sourceEntries.map(entry => entry.data)
+    ]);
+    const documentCount = 2 + (2 * coreEntries.length) + eventByUserId.size + sourceEntries.length;
+    const appBuildNumber = assertCouponRestoreAuditInteger(Number(audit.appBuildNumber), '쿠폰 복구 app build', 100000000000, 999999999999);
+    const writeSchemaVersion = assertCouponRestoreAuditInteger(Number(audit.writeSchemaVersion), '쿠폰 복구 write schema', 1, 1000000);
+    const manifestData = {
+      payloadKind:'coupon-restore-run',
+      schemaGuard:'R3_RESTORE_RUN_V1',
+      runId:batchId,
+      restoreBatchId:batchId,
+      restoreManifestId,
+      restorePolicyVersion,
+      appVersion:assertCouponRestoreAuditText(audit.appVersion, '쿠폰 복구 app version', 120, false),
+      appBuildNumber,
+      writeSchemaVersion,
+      baseAt:assertCouponRestoreAuditText(audit.baseAt, '쿠폰 복구 기준 시각', 240, true),
+      applyFrom:assertCouponRestoreAuditText(audit.applyFrom, '쿠폰 복구 반영 시각', 240, true),
+      includeOptions:JSON.parse(JSON.stringify(includeOptions)),
+      actorUid,
+      createdAtClient,
+      targetUserCount:coreEntries.length,
+      eventCount:eventByUserId.size,
+      userCoreCount:coreEntries.length,
+      userLinkageCount:linkageEntries.length,
+      sourceCount:sourceEntries.length,
+      includedSourceCount:sourceEntries.filter(entry => entry.data.included).length,
+      excludedSourceCount:sourceEntries.filter(entry => !entry.data.included).length,
+      documentCount,
+      evidenceDigest,
+      status:'APPLIED',
+      storageLocation:couponRestoreAuditRunCollection
+    };
+    const manifestKeys = [
+      'payloadKind','schemaGuard','runId','restoreBatchId','restoreManifestId',
+      'restorePolicyVersion','appVersion','appBuildNumber','writeSchemaVersion',
+      'baseAt','applyFrom','includeOptions','actorUid','createdAtClient',
+      'targetUserCount','eventCount','userCoreCount','userLinkageCount',
+      'sourceCount','includedSourceCount','excludedSourceCount','documentCount',
+      'evidenceDigest','status','storageLocation'
+    ];
+    assertCouponRestoreAuditExactKeys(manifestData, manifestKeys, '쿠폰 복구 manifest');
+    if(manifestData.userCoreCount !== manifestData.targetUserCount
+      || manifestData.userLinkageCount !== manifestData.targetUserCount
+      || manifestData.includedSourceCount + manifestData.excludedSourceCount !== manifestData.sourceCount
+      || manifestData.documentCount !== 2 + (2 * manifestData.targetUserCount) + manifestData.eventCount + manifestData.sourceCount){
+      throw new Error('쿠폰 복구 manifest count invariant가 일치하지 않습니다.');
+    }
+    const allAuditEntries = [
+      { data:manifestData, ref:getCouponRestoreRunRef(batchId), docId:batchId, kind:'run' },
+      ...coreEntries.map(entry => ({ ...entry, kind:'core' })),
+      ...linkageEntries.map(entry => ({ ...entry, kind:'linkage' })),
+      ...sourceEntries.map(entry => ({ ...entry, kind:'source' }))
+    ];
+    allAuditEntries.forEach(entry => {
+      if(getArchiveJsonBytes(buildPayload(entry.data)) > ORDER_ARCHIVE_CLOUD_SAFE_DOC_BYTES){
+        throw new Error('쿠폰 복구 ' + entry.kind + ' 문서가 안전 크기를 초과했습니다.');
+      }
+    });
+    return {
+      manifest:allAuditEntries[0],
+      cores:coreEntries,
+      linkages:linkageEntries,
+      sources:sourceEntries,
+      all:allAuditEntries,
+      evidenceDigest,
+      documentCount
+    };
+  }
+
+  function assertCouponRestoreAuditDocMatches(snapshot, expected, label){
+    if(!snapshot || !snapshot.exists()) throw new Error(`${label} 서버 문서를 확인하지 못했습니다.`);
+    const actual = unwrapCouponRecalcDocData(snapshot);
+    if(!actual || typeof actual !== 'object') throw new Error(`${label} 서버 문서 형식을 확인하지 못했습니다.`);
+    const comparable = JSON.parse(JSON.stringify(actual));
+    delete comparable.__haetsalDataGuard;
+    if(stableCouponRestoreAuditJson(comparable) !== stableCouponRestoreAuditJson(expected)){
+      throw new Error(`${label} 서버 문서가 저장 요청과 일치하지 않습니다.`);
+    }
+    return actual;
+  }
+
+  async function verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries, auditEntries){
     const sharedSnapshot = await runArchiveCloudPromiseWithTimeout(
       getDocFromServer(cloudDocRefs.shared),
       ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
@@ -54788,11 +55962,34 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const actual = assertCouponEventServerRecordMatches(entry.finalPayload, eventSnapshot);
       saved.push({ ...entry.finalPayload, ...actual, cloudStored:true, serverVerified:true });
     }
+    const manifestSnapshot = await runArchiveCloudPromiseWithTimeout(
+      getDocFromServer(auditEntries.manifest.ref),
+      ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+      '쿠폰 복구 manifest 서버 확인 시간이 초과되었습니다.'
+    );
+    const manifest = assertCouponRestoreAuditDocMatches(manifestSnapshot, auditEntries.manifest.data, '쿠폰 복구 manifest');
+    const auditDocuments = [];
+    for(const entry of auditEntries.all){
+      if(entry.kind === 'run') continue;
+      const auditSnapshot = await runArchiveCloudPromiseWithTimeout(
+        getDocFromServer(entry.ref),
+        ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+        '쿠폰 복구 audit 서버 확인 시간이 초과되었습니다.'
+      );
+      auditDocuments.push({
+        kind:entry.kind,
+        data:assertCouponRestoreAuditDocMatches(auditSnapshot, entry.data, '쿠폰 복구 ' + entry.kind)
+      });
+    }
     return {
       committed:true,
       sharedData:JSON.parse(JSON.stringify(sharedData)),
       users:appliedState.users,
-      saved
+      saved,
+      restoreManifest:manifest,
+      restoreUserCore:auditDocuments.filter(entry => entry.kind === 'core').map(entry => entry.data),
+      restoreUserLinkage:auditDocuments.filter(entry => entry.kind === 'linkage').map(entry => entry.data),
+      restoreSources:auditDocuments.filter(entry => entry.kind === 'source').map(entry => entry.data)
     };
   }
 
@@ -54827,7 +56024,6 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
     if(sourceRecords.length) await checkCouponEventCloudWriteAccess({ reason:String(options && options.reason || 'coupon-restore-combined-atomic') });
     const entries = sourceRecords.map(record => prepareCouponEventCloudEntry(record, options));
-    if(entries.length + 1 > 450) throw new Error('쿠폰 복구 대상 수가 안전 한도를 초과했습니다.');
     const eventEntryByUserId = new Map();
     entries.forEach(entry => {
       const event = entry && entry.finalPayload;
@@ -54866,27 +56062,61 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
     });
     if(eventEntryByUserId.size !== requiredEventCount) throw new Error('쿠폰 복구 대상과 기록 수가 일치하지 않습니다.');
+    const auditEntries = prepareCouponRestoreAuditEntries(options, entries);
+    const restoreAuditDocCount = auditEntries.all.length;
+    const plannedRefs = [
+      cloudDocRefs.shared,
+      ...entries.map(entry => entry.eventRef),
+      ...auditEntries.all.map(entry => entry.ref)
+    ];
+    const plannedPaths = plannedRefs.map(ref => String(ref && ref.path || ''));
+    const expectedDocumentCount = 2 + (2 * auditEntries.cores.length) + entries.length + auditEntries.sources.length;
+    if(!plannedPaths.every(Boolean)
+      || new Set(plannedPaths).size !== plannedPaths.length
+      || plannedRefs.length !== expectedDocumentCount
+      || auditEntries.documentCount !== expectedDocumentCount
+      || auditEntries.cores.length !== existingRows.length + missingRows.length
+      || auditEntries.linkages.length !== auditEntries.cores.length){
+      throw new Error('쿠폰 복구 transaction planned ref 구성이 R3 count와 일치하지 않습니다.');
+    }
+    if(plannedRefs.length > 450){
+      throw new Error('쿠폰 복구 transaction 문서 수가 안전 한도를 초과했습니다.');
+    }
 
     const transactionPromise = runTransaction(db, async transaction => {
       const sharedSnapshot = await transaction.get(cloudDocRefs.shared);
       const existingEventSnapshots = [];
       for(const entry of entries) existingEventSnapshots.push(await transaction.get(entry.eventRef));
+      const existingAuditSnapshots = [];
+      for(const entry of auditEntries.all) existingAuditSnapshots.push(await transaction.get(entry.ref));
+      const existingManifestSnapshot = existingAuditSnapshots[0];
       if(!sharedSnapshot.exists()) throw new Error('서버 사용자 명단 문서를 찾을 수 없습니다.');
       const sharedData = unwrapCouponRecalcDocData(sharedSnapshot);
       if(!Array.isArray(sharedData.users)) throw new Error('서버 사용자 명단 형식을 확인할 수 없습니다.');
       const existingEventCount = existingEventSnapshots.filter(snapshot => snapshot.exists()).length;
+      const existingAuditCount = existingAuditSnapshots.filter(snapshot => snapshot.exists()).length;
       if(existingEventCount > 0 && existingEventCount !== entries.length){
         throw new Error('기존 쿠폰 복구 기록의 완료 상태가 일치하지 않습니다.');
       }
-      if(existingEventCount === entries.length && entries.length){
+      if(existingAuditCount > 0 && existingAuditCount !== restoreAuditDocCount){
+        throw new Error('기존 쿠폰 복구 manifest/evidence 완료 상태가 일치하지 않습니다.');
+      }
+      if((existingEventCount > 0) !== (existingAuditCount > 0) && entries.length){
+        throw new Error('기존 쿠폰 복구 event와 manifest 완료 상태가 일치하지 않습니다.');
+      }
+      if(existingAuditCount === restoreAuditDocCount){
+        auditEntries.all.forEach((entry, index) => {
+          assertCouponRestoreAuditDocMatches(existingAuditSnapshots[index], entry.data, '기존 쿠폰 복구 ' + entry.kind);
+        });
+      }
+      if(existingAuditCount === restoreAuditDocCount && existingEventCount === entries.length){
         entries.forEach((entry, index) => assertCouponEventServerRecordMatches(entry.finalPayload, existingEventSnapshots[index]));
         const appliedState = inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows);
         if(!appliedState.applied) throw new Error('기존 쿠폰 복구 기록과 현재 사용자 상태가 일치하지 않습니다.');
         return { idempotent:true, users:appliedState.users, sharedData };
       }
-      if(!entries.length){
-        const appliedState = inspectCouponRestoreTransactionAppliedState(sharedData, existingRows, missingRows);
-        if(appliedState.applied) return { idempotent:true, users:appliedState.users, sharedData };
+      if(existingEventCount || existingAuditCount){
+        throw new Error('기존 쿠폰 복구 원자 저장 상태가 완전하지 않습니다.');
       }
       let nextSharedData = JSON.parse(JSON.stringify(sharedData));
       const updatedUsers = [];
@@ -54928,7 +56158,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         updatedUsers.push(normalizedUser);
       });
       const sharedPayload = buildPayload(nextSharedData);
-      const estimatedBytes = getArchiveJsonBytes(sharedPayload) + entries.reduce((sum, entry) => sum + getArchiveJsonBytes(buildPayload(entry.finalPayload)), 0);
+      const auditPayloads = auditEntries.all.map(entry => buildPayload(entry.data));
+      const estimatedBytes = getArchiveJsonBytes(sharedPayload)
+        + entries.reduce((sum, entry) => sum + getArchiveJsonBytes(buildPayload(entry.finalPayload)), 0)
+        + auditPayloads.reduce((sum, payload) => sum + getArchiveJsonBytes(payload), 0);
       if(estimatedBytes > 8 * 1024 * 1024) throw new Error('쿠폰 복구 요청 크기가 안전 한도를 초과했습니다.');
       transaction.set(cloudDocRefs.shared, sharedPayload);
       entries.forEach(entry => {
@@ -54936,6 +56169,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         builtPayload.serverCreatedAt = serverTimestamp();
         builtPayload.serverUpdatedAt = serverTimestamp();
         transaction.set(entry.eventRef, builtPayload);
+      });
+      auditEntries.all.forEach((entry, index) => {
+        const builtPayload = auditPayloads[index];
+        builtPayload.serverCreatedAt = serverTimestamp();
+        transaction.set(entry.ref, builtPayload);
       });
       return { idempotent:false, users:updatedUsers, sharedData:nextSharedData, estimatedBytes };
     });
@@ -54951,7 +56189,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       timeoutObserved = true;
       let timeoutVerification = null;
       try{
-        timeoutVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+        timeoutVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries, auditEntries);
       }catch(verificationError){}
       if(timeoutVerification && timeoutVerification.committed){
         return {
@@ -54962,6 +56200,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           sharedData:timeoutVerification.sharedData,
           saved:timeoutVerification.saved,
           count:timeoutVerification.saved.length,
+          restoreManifest:timeoutVerification.restoreManifest,
+          restoreUserCore:timeoutVerification.restoreUserCore,
+          restoreUserLinkage:timeoutVerification.restoreUserLinkage,
+          restoreSources:timeoutVerification.restoreSources,
           timeoutObserved:true
         };
       }
@@ -54974,7 +56216,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       let finalVerification = null;
       try{
-        finalVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+        finalVerification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries, auditEntries);
       }catch(verificationError){}
       if(finalVerification && finalVerification.committed){
         return {
@@ -54985,6 +56227,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           sharedData:finalVerification.sharedData,
           saved:finalVerification.saved,
           count:finalVerification.saved.length,
+          restoreManifest:finalVerification.restoreManifest,
+          restoreUserCore:finalVerification.restoreUserCore,
+          restoreUserLinkage:finalVerification.restoreUserLinkage,
+          restoreSources:finalVerification.restoreSources,
           transactionResult,
           timeoutObserved:true
         };
@@ -54997,7 +56243,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     try{
-      const verification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries);
+      const verification = await verifyCouponRestoreTransactionCommit(existingRows, missingRows, entries, auditEntries);
       if(!verification.committed){
         return {
           ok:false,
@@ -55020,6 +56266,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         sharedData:verification.sharedData,
         saved:verification.saved,
         count:verification.saved.length,
+        restoreManifest:verification.restoreManifest,
+        restoreUserCore:verification.restoreUserCore,
+        restoreUserLinkage:verification.restoreUserLinkage,
+        restoreSources:verification.restoreSources,
         transactionResult,
         timeoutObserved
       };
@@ -55034,6 +56284,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           sharedData:transactionResult.sharedData ? JSON.parse(JSON.stringify(transactionResult.sharedData)) : null,
           saved:entries.map(entry => ({ ...entry.finalPayload, cloudStored:true, serverVerified:false })),
           count:entries.length,
+          restoreManifest:auditEntries.manifest.data,
+          restoreUserCore:auditEntries.cores.map(entry => entry.data),
+          restoreUserLinkage:auditEntries.linkages.map(entry => entry.data),
+          restoreSources:auditEntries.sources.map(entry => entry.data),
           transactionResult,
           verificationError
         };
@@ -55888,6 +57142,518 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   window.HaetsalOfflineCouponUseCloud = {
     saveRecord: saveOfflineCouponUseCloudRecord,
     readRecords: readOfflineCouponUseCloudRecords
+  };
+
+  function makeOfflineCouponEditError(code, message){
+    const error = new Error(String(message || '앱 미사용일 차감 수정 처리에 실패했습니다.'));
+    error.code = String(code || 'OFFLINE_EDIT_INVALID');
+    return error;
+  }
+
+  function makeOfflineCouponEditCurrentDocId(originalRecordId){
+    const safeId = sanitizeOfflineCouponUseDocPart(originalRecordId);
+    if(!safeId) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 차감 원본 ID가 없습니다.');
+    return offlineCouponEditCurrentDocPrefix + safeId;
+  }
+
+  function makeOfflineCouponEditAuditDocId(operationId){
+    const safeId = sanitizeOfflineCouponUseDocPart(operationId);
+    if(!safeId) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 차감 수정 operation ID가 없습니다.');
+    return offlineCouponEditAuditDocPrefix + safeId;
+  }
+
+  function makeOfflineCouponEditEventRecordId(operationId, role){
+    const safeOperationId = sanitizeOfflineCouponUseDocPart(operationId).slice(0, 140);
+    const safeRole = sanitizeOfflineCouponUseDocPart(role).slice(0, 30);
+    if(!safeOperationId || !safeRole) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 차감 수정 event ID를 만들 수 없습니다.');
+    return `offline_edit_adjustment_${safeOperationId}_${safeRole}`;
+  }
+
+  function normalizeOfflineCouponEditCloudEffectiveState(source){
+    const row = source && typeof source === 'object' ? source : {};
+    const userId = String(row.userId || '').trim();
+    const amount = Math.floor(Math.abs(Number(row.amount || 0)));
+    const usedDate = String(row.usedDate || '').trim();
+    const reason = String(row.reason || '').trim();
+    if(!userId || !Number.isInteger(amount) || amount <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(usedDate) || !reason) return null;
+    return {
+      userId,
+      userName:String(row.userName || '').trim(),
+      userDept:String(row.userDept || '').trim(),
+      amount,
+      usedDate,
+      reason
+    };
+  }
+
+  function getOfflineCouponEditCloudOriginalState(record){
+    const source = record && typeof record === 'object' ? record : {};
+    return normalizeOfflineCouponEditCloudEffectiveState({
+      userId:source.userId,
+      userName:source.userName,
+      userDept:source.userDept,
+      amount:Math.abs(Number(source.amount || source.delta || 0)),
+      usedDate:String(source.usedDate || '').trim() || String(source.timestamp || '').slice(0, 10),
+      reason:source.reason
+    });
+  }
+
+  function normalizeOfflineCouponEditCloudCurrentPayload(docSnap){
+    const raw = docSnap && typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+    const data = raw && raw.data && typeof raw.data === 'object' ? raw.data : raw;
+    if(!data || typeof data !== 'object' || data.payloadKind !== 'offline-coupon-edit-current') return null;
+    const effectiveState = normalizeOfflineCouponEditCloudEffectiveState({
+      userId:data.effectiveUserId,
+      userName:data.effectiveUserName,
+      userDept:data.effectiveUserDept,
+      amount:data.effectiveAmount,
+      usedDate:data.effectiveUsedDate,
+      reason:data.effectiveReason
+    });
+    const revision = Math.max(0, Math.floor(Number(data.revision || 0)) || 0);
+    const originalRecordId = String(data.originalRecordId || '').trim();
+    if(!effectiveState || !originalRecordId || revision < 1) return null;
+    return {
+      ...data,
+      originalRecordId,
+      revision,
+      effectiveUserId:effectiveState.userId,
+      effectiveUserName:effectiveState.userName,
+      effectiveUserDept:effectiveState.userDept,
+      effectiveAmount:effectiveState.amount,
+      effectiveUsedDate:effectiveState.usedDate,
+      effectiveReason:effectiveState.reason,
+      docId:String(data.docId || (docSnap && docSnap.id) || ''),
+      serverUpdatedAtIso:firestoreTimestampToIso(raw && raw.serverUpdatedAt)
+    };
+  }
+
+  function normalizeOfflineCouponEditCloudAuditPayload(docSnap){
+    const raw = docSnap && typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+    const data = raw && raw.data && typeof raw.data === 'object' ? raw.data : raw;
+    if(!data || typeof data !== 'object' || data.payloadKind !== 'offline-coupon-edit-audit') return null;
+    const beforeState = normalizeOfflineCouponEditCloudEffectiveState(data.beforeState);
+    const afterState = normalizeOfflineCouponEditCloudEffectiveState(data.afterState);
+    if(!beforeState || !afterState) return null;
+    return {
+      ...data,
+      beforeState,
+      afterState,
+      docId:String(data.docId || (docSnap && docSnap.id) || ''),
+      serverCreatedAtIso:firestoreTimestampToIso(raw && raw.serverCreatedAt)
+    };
+  }
+
+  function normalizeOfflineCouponEditCloudOperation(operation){
+    const source = operation && typeof operation === 'object' ? operation : {};
+    const operationId = String(source.operationId || '').trim();
+    const originalRecordId = String(source.originalRecordId || '').trim();
+    const baseRevision = Math.max(0, Math.floor(Number(source.baseRevision || 0)) || 0);
+    const newRevision = Math.max(0, Math.floor(Number(source.newRevision || 0)) || 0);
+    const beforeState = normalizeOfflineCouponEditCloudEffectiveState(source.beforeState);
+    const afterState = normalizeOfflineCouponEditCloudEffectiveState(source.afterState);
+    const intentFingerprint = String(source.intentFingerprint || '').trim();
+    const createdAtClient = String(source.createdAtClient || '').trim();
+    if(!operationId || !originalRecordId || newRevision !== baseRevision + 1 || !beforeState || !afterState || !intentFingerprint || !createdAtClient){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 차감 수정 operation 형식이 올바르지 않습니다.');
+    }
+    return {
+      operationId,
+      originalRecordId,
+      baseRevision,
+      newRevision,
+      beforeState,
+      afterState,
+      intentFingerprint,
+      actorLabel:String(source.actorLabel || '').trim(),
+      createdAtClient,
+      appVersion:String(source.appVersion || '')
+    };
+  }
+
+  function offlineCouponEditStatesMatch(left, right){
+    const a = normalizeOfflineCouponEditCloudEffectiveState(left);
+    const b = normalizeOfflineCouponEditCloudEffectiveState(right);
+    return !!(a && b && JSON.stringify(a) === JSON.stringify(b));
+  }
+
+  function buildOfflineCouponEditEventDescriptors(operation){
+    const before = operation.beforeState;
+    const after = operation.afterState;
+    const rows = [];
+    if(before.userId === after.userId){
+      const delta = before.amount - after.amount;
+      if(delta !== 0) rows.push({ userId:after.userId, delta, role:'same_user_adjustment' });
+    }else{
+      rows.push({ userId:before.userId, delta:before.amount, role:'old_user_refund' });
+      rows.push({ userId:after.userId, delta:-after.amount, role:'new_user_deduct' });
+    }
+    return rows.map(row => {
+      const eventId = makeOfflineCouponEditEventRecordId(operation.operationId, row.role);
+      return {
+        ...row,
+        eventId,
+        eventDocId:makeCouponEventDocId(eventId),
+        eventRef:doc(db, 'haetsalCombinedApp', makeCouponEventDocId(eventId))
+      };
+    });
+  }
+
+  function assertOfflineCouponEditExistingAuditMatches(actual, operation, descriptors){
+    if(!actual) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '기존 앱 미사용일 수정 감사 기록을 확인할 수 없습니다.');
+    const expectedEventDocIds = descriptors.map(row => row.eventDocId);
+    if(String(actual.operationId || '') !== operation.operationId
+      || String(actual.originalRecordId || '') !== operation.originalRecordId
+      || Number(actual.baseRevision) !== operation.baseRevision
+      || Number(actual.newRevision) !== operation.newRevision
+      || String(actual.intentFingerprint || '') !== operation.intentFingerprint
+      || !offlineCouponEditStatesMatch(actual.beforeState, operation.beforeState)
+      || !offlineCouponEditStatesMatch(actual.afterState, operation.afterState)
+      || JSON.stringify(Array.isArray(actual.generatedEventIds) ? actual.generatedEventIds : []) !== JSON.stringify(expectedEventDocIds)){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '동일 operation ID의 기존 앱 미사용일 수정 내용이 현재 요청과 일치하지 않습니다.');
+    }
+    const actualMutations = Array.isArray(actual.balanceMutations) ? actual.balanceMutations : [];
+    if(actualMutations.length !== descriptors.length) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '기존 앱 미사용일 수정 잔액 기록이 현재 요청과 일치하지 않습니다.');
+    descriptors.forEach((descriptor, index) => {
+      const mutation = actualMutations[index] || {};
+      if(String(mutation.userId || '') !== descriptor.userId
+        || Number(mutation.delta) !== descriptor.delta
+        || String(mutation.eventId || '') !== descriptor.eventId
+        || String(mutation.eventRole || '') !== descriptor.role){
+        throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '기존 앱 미사용일 수정 event 연결이 현재 요청과 일치하지 않습니다.');
+      }
+    });
+    return actual;
+  }
+
+  function applyOfflineCouponEditBalanceDescriptor(sharedData, descriptor, operation){
+    const users = Array.isArray(sharedData && sharedData.users) ? sharedData.users : [];
+    const userIndex = users.findIndex(user => String((user && user.id) || '') === descriptor.userId);
+    if(userIndex < 0) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '서버 사용자 명단에서 앱 미사용일 수정 사용자를 찾을 수 없습니다.');
+    const currentUser = users[userIndex] || {};
+    const beforeCoupons = Number(currentUser.coupons || 0);
+    const delta = Number(descriptor.delta);
+    const remainingCoupons = beforeCoupons + delta;
+    if(!Number.isInteger(beforeCoupons) || !Number.isInteger(delta) || delta === 0 || !Number.isInteger(remainingCoupons)){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '앱 미사용일 수정 잔액 증감값이 올바르지 않습니다.');
+    }
+    const nextVersion = normalizeCouponBalanceVersionValue(currentUser.couponBalanceVersion) + 1;
+    sharedData.users[userIndex] = {
+      ...currentUser,
+      coupons:remainingCoupons,
+      couponsUpdatedAt:operation.createdAtClient,
+      couponBalanceVersion:nextVersion,
+      updatedAt:operation.createdAtClient
+    };
+    return {
+      userId:descriptor.userId,
+      delta,
+      beforeCoupons,
+      remainingCoupons,
+      eventId:descriptor.eventId,
+      eventDocId:descriptor.eventDocId,
+      eventRole:descriptor.role,
+      couponBalanceVersion:nextVersion
+    };
+  }
+
+  function buildOfflineCouponEditAdjustmentEvent(operation, descriptor, balanceMutation, sharedData){
+    const user = getCouponRecalcSharedUserFromData(sharedData, descriptor.userId) || {};
+    const delta = Number(balanceMutation.delta);
+    const record = {
+      id:descriptor.eventId,
+      eventId:descriptor.eventId,
+      type:delta > 0 ? 'COUPON_CHARGE' : 'COUPON_DEDUCT',
+      userId:descriptor.userId,
+      userName:String(user.name || (descriptor.userId === operation.afterState.userId ? operation.afterState.userName : operation.beforeState.userName) || ''),
+      userDept:String(user.dept || user.department || (descriptor.userId === operation.afterState.userId ? operation.afterState.userDept : operation.beforeState.userDept) || ''),
+      timestamp:operation.createdAtClient,
+      usedDate:operation.afterState.usedDate,
+      amount:Math.abs(delta),
+      delta,
+      beforeCoupons:Number(balanceMutation.beforeCoupons),
+      remainingCoupons:Number(balanceMutation.remainingCoupons),
+      reason:operation.afterState.reason,
+      changedBy:operation.actorLabel,
+      source:'offline-coupon-use-edit-adjustment',
+      sourceLogId:operation.operationId,
+      sourceEventId:operation.originalRecordId,
+      operationId:operation.operationId,
+      editOperationId:operation.operationId,
+      offlineEditEventRole:descriptor.role,
+      originalOfflineRecordId:operation.originalRecordId,
+      createdAtClient:operation.createdAtClient,
+      appVersion:operation.appVersion
+    };
+    const invariant = window.HaetsalCouponInvariant;
+    if(invariant && typeof invariant.assertRecord === 'function') invariant.assertRecord(record);
+    assertCouponEventMatchesMutation({
+      userId:descriptor.userId,
+      expectedCoupons:balanceMutation.beforeCoupons,
+      nextCoupons:balanceMutation.remainingCoupons
+    }, record);
+    return record;
+  }
+
+  function buildOfflineCouponEditCurrentPayload(operation, currentDocId, originalOfflineDocId, auditDocId){
+    return {
+      payloadKind:'offline-coupon-edit-current',
+      docId:currentDocId,
+      originalRecordId:operation.originalRecordId,
+      originalOfflineDocId,
+      effectiveUserId:operation.afterState.userId,
+      effectiveUserName:operation.afterState.userName,
+      effectiveUserDept:operation.afterState.userDept,
+      effectiveAmount:operation.afterState.amount,
+      effectiveUsedDate:operation.afterState.usedDate,
+      effectiveReason:operation.afterState.reason,
+      revision:operation.newRevision,
+      lastOperationId:operation.operationId,
+      lastAuditDocId:auditDocId,
+      updatedByUid:String((auth.currentUser && auth.currentUser.uid) || ''),
+      updatedByLabel:operation.actorLabel,
+      updatedAtClient:operation.createdAtClient,
+      storageLocation:'haetsalOfflineCouponEdits'
+    };
+  }
+
+  function buildOfflineCouponEditAuditPayload(operation, auditDocId, currentDocId, originalOfflineDocId, balanceMutations, descriptors){
+    return {
+      payloadKind:'offline-coupon-edit-audit',
+      docId:auditDocId,
+      currentDocId,
+      originalRecordId:operation.originalRecordId,
+      originalOfflineDocId,
+      operationId:operation.operationId,
+      baseRevision:operation.baseRevision,
+      newRevision:operation.newRevision,
+      beforeState:operation.beforeState,
+      afterState:operation.afterState,
+      balanceMutations,
+      generatedEventIds:descriptors.map(row => row.eventDocId),
+      actorUid:String((auth.currentUser && auth.currentUser.uid) || ''),
+      actorLabel:operation.actorLabel,
+      createdAtClient:operation.createdAtClient,
+      intentFingerprint:operation.intentFingerprint,
+      storageLocation:'haetsalOfflineCouponEdits'
+    };
+  }
+
+  function assertOfflineCouponEditEventMatchesAudit(eventSnapshot, operation, descriptor, mutation){
+    if(!eventSnapshot || !eventSnapshot.exists()) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 canonical event를 확인할 수 없습니다.');
+    const actual = normalizeCouponEventCloudPayload(eventSnapshot);
+    if(!actual
+      || String(actual.id || actual.eventId || '') !== descriptor.eventId
+      || String(actual.userId || '') !== descriptor.userId
+      || Number(actual.delta) !== Number(mutation.delta)
+      || Number(actual.beforeCoupons) !== Number(mutation.beforeCoupons)
+      || Number(actual.remainingCoupons) !== Number(mutation.remainingCoupons)
+      || String(actual.source || '') !== 'offline-coupon-use-edit-adjustment'
+      || String(actual.sourceLogId || '') !== operation.operationId
+      || String(actual.sourceEventId || '') !== operation.originalRecordId
+      || String(actual.offlineEditEventRole || '') !== descriptor.role){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 canonical event가 감사 기록과 일치하지 않습니다.');
+    }
+    return actual;
+  }
+
+  async function saveOfflineCouponEditCloudOperation(operation, options){
+    const source = normalizeOfflineCouponEditCloudOperation(operation);
+    if(!window.HaetsalAdminAuth || typeof window.HaetsalAdminAuth.isVerified !== 'function' || !window.HaetsalAdminAuth.isVerified()){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', 'Firebase 관리자 권한이 확인되지 않았습니다.');
+    }
+    await checkCouponEventCloudWriteAccess({ reason:String((options && options.reason) || 'offline-coupon-use-edit') });
+    const originalOfflineDocId = makeOfflineCouponUseDocId(source.originalRecordId);
+    const currentDocId = makeOfflineCouponEditCurrentDocId(source.originalRecordId);
+    const auditDocId = makeOfflineCouponEditAuditDocId(source.operationId);
+    const originalRef = doc(db, 'haetsalCombinedApp', originalOfflineDocId);
+    const currentRef = doc(offlineCouponEditCollectionRef, currentDocId);
+    const auditRef = doc(offlineCouponEditCollectionRef, auditDocId);
+    const descriptors = buildOfflineCouponEditEventDescriptors(source);
+
+    const transactionResult = await runArchiveCloudPromiseWithTimeout(
+      runTransaction(db, async transaction => {
+        const originalSnapshot = await transaction.get(originalRef);
+        const currentSnapshot = await transaction.get(currentRef);
+        const auditSnapshot = await transaction.get(auditRef);
+        const sharedSnapshot = descriptors.length ? await transaction.get(cloudDocRefs.shared) : null;
+        const eventSnapshots = [];
+        for(const descriptor of descriptors) eventSnapshots.push(await transaction.get(descriptor.eventRef));
+
+        if(!originalSnapshot.exists()) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '수정할 앱 미사용일 차감 원본 문서를 찾을 수 없습니다.');
+        const originalRecord = normalizeOfflineCouponUseCloudPayload(originalSnapshot);
+        if(!originalRecord || String(originalRecord.id || '') !== source.originalRecordId){
+          throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 차감 원본 문서가 수정 요청과 일치하지 않습니다.');
+        }
+
+        if(auditSnapshot.exists()){
+          const existingAudit = assertOfflineCouponEditExistingAuditMatches(
+            normalizeOfflineCouponEditCloudAuditPayload(auditSnapshot),
+            source,
+            descriptors
+          );
+          const existingCurrent = normalizeOfflineCouponEditCloudCurrentPayload(currentSnapshot);
+          if(!existingCurrent
+            || existingCurrent.originalRecordId !== source.originalRecordId
+            || Number(existingCurrent.revision) < source.newRevision){
+            throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '기존 앱 미사용일 수정 operation과 현재 상태가 일치하지 않습니다.');
+          }
+          const mutations = Array.isArray(existingAudit.balanceMutations) ? existingAudit.balanceMutations : [];
+          descriptors.forEach((descriptor, index) => {
+            assertOfflineCouponEditEventMatchesAudit(eventSnapshots[index], source, descriptor, mutations[index]);
+          });
+          return {
+            idempotent:true,
+            currentRecord:existingCurrent,
+            auditRecord:existingAudit,
+            sharedData:sharedSnapshot && sharedSnapshot.exists() ? unwrapCouponRecalcDocData(sharedSnapshot) : null,
+            balanceMutations:mutations
+          };
+        }
+
+        if(eventSnapshots.some(snapshot => snapshot.exists())){
+          throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '감사 기록 없이 동일한 앱 미사용일 수정 event가 이미 존재합니다.');
+        }
+
+        const currentRecord = currentSnapshot.exists() ? normalizeOfflineCouponEditCloudCurrentPayload(currentSnapshot) : null;
+        if(currentSnapshot.exists() && !currentRecord){
+          throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '기존 앱 미사용일 수정 현재 상태 형식을 확인할 수 없습니다.');
+        }
+        const serverRevision = currentRecord ? Number(currentRecord.revision) : 0;
+        const serverBeforeState = currentRecord
+          ? normalizeOfflineCouponEditCloudEffectiveState({
+              userId:currentRecord.effectiveUserId,
+              userName:currentRecord.effectiveUserName,
+              userDept:currentRecord.effectiveUserDept,
+              amount:currentRecord.effectiveAmount,
+              usedDate:currentRecord.effectiveUsedDate,
+              reason:currentRecord.effectiveReason
+            })
+          : getOfflineCouponEditCloudOriginalState(originalRecord);
+        if(serverRevision !== source.baseRevision || !offlineCouponEditStatesMatch(serverBeforeState, source.beforeState)){
+          throw makeOfflineCouponEditError('OFFLINE_EDIT_STALE', '앱 미사용일 차감 기록이 다른 수정으로 변경되었습니다.');
+        }
+
+        let nextSharedData = null;
+        const balanceMutations = [];
+        const eventRecords = [];
+        if(descriptors.length){
+          if(!sharedSnapshot || !sharedSnapshot.exists()) throw makeOfflineCouponEditError('OFFLINE_EDIT_INVALID', '서버 사용자 명단 문서를 찾을 수 없습니다.');
+          nextSharedData = JSON.parse(JSON.stringify(unwrapCouponRecalcDocData(sharedSnapshot)));
+          descriptors.forEach(descriptor => {
+            const mutation = applyOfflineCouponEditBalanceDescriptor(nextSharedData, descriptor, source);
+            balanceMutations.push(mutation);
+            eventRecords.push(buildOfflineCouponEditAdjustmentEvent(source, descriptor, mutation, nextSharedData));
+          });
+        }
+
+        const currentPayload = buildOfflineCouponEditCurrentPayload(source, currentDocId, originalOfflineDocId, auditDocId);
+        const auditPayload = buildOfflineCouponEditAuditPayload(
+          source,
+          auditDocId,
+          currentDocId,
+          originalOfflineDocId,
+          balanceMutations,
+          descriptors
+        );
+        if(nextSharedData) transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        const builtCurrent = buildPayload(currentPayload);
+        builtCurrent.serverUpdatedAt = serverTimestamp();
+        if(!currentSnapshot.exists()) builtCurrent.serverCreatedAt = serverTimestamp();
+        transaction.set(currentRef, builtCurrent);
+        const builtAudit = buildPayload(auditPayload);
+        builtAudit.serverCreatedAt = serverTimestamp();
+        builtAudit.serverUpdatedAt = serverTimestamp();
+        transaction.set(auditRef, builtAudit);
+        eventRecords.forEach(record => {
+          const entry = prepareCouponEventCloudEntry(record, { reason:'offline-coupon-use-edit-adjustment' });
+          const builtEvent = buildPayload(entry.finalPayload);
+          builtEvent.serverCreatedAt = serverTimestamp();
+          builtEvent.serverUpdatedAt = serverTimestamp();
+          transaction.set(entry.eventRef, builtEvent);
+        });
+        return {
+          idempotent:false,
+          currentRecord:currentPayload,
+          auditRecord:auditPayload,
+          sharedData:nextSharedData,
+          balanceMutations
+        };
+      }),
+      30 * 1000,
+      '앱 미사용일 차감 수정 저장 시간이 초과되었습니다.'
+    );
+
+    const verifySnapshots = await Promise.all([
+      getDocFromServer(currentRef),
+      getDocFromServer(auditRef),
+      ...descriptors.map(descriptor => getDocFromServer(descriptor.eventRef)),
+      ...(descriptors.length ? [getDocFromServer(cloudDocRefs.shared)] : [])
+    ]);
+    const verifiedCurrent = normalizeOfflineCouponEditCloudCurrentPayload(verifySnapshots[0]);
+    const verifiedAudit = assertOfflineCouponEditExistingAuditMatches(
+      normalizeOfflineCouponEditCloudAuditPayload(verifySnapshots[1]),
+      source,
+      descriptors
+    );
+    if(!verifiedCurrent || Number(verifiedCurrent.revision) < source.newRevision){
+      throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 현재 상태를 서버에서 확인하지 못했습니다.');
+    }
+    const verifiedCouponRecords = [];
+    descriptors.forEach((descriptor, index) => {
+      const mutation = (Array.isArray(verifiedAudit.balanceMutations) ? verifiedAudit.balanceMutations : [])[index];
+      const actual = assertOfflineCouponEditEventMatchesAudit(verifySnapshots[index + 2], source, descriptor, mutation);
+      verifiedCouponRecords.push({ ...actual, cloudStored:true, serverVerified:true });
+    });
+    let verifiedSharedData = transactionResult && transactionResult.sharedData ? transactionResult.sharedData : null;
+    let verifiedUsers = [];
+    if(descriptors.length){
+      const sharedVerifySnapshot = verifySnapshots[verifySnapshots.length - 1];
+      if(!sharedVerifySnapshot || !sharedVerifySnapshot.exists()) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 후 서버 사용자 명단을 확인하지 못했습니다.');
+      verifiedSharedData = unwrapCouponRecalcDocData(sharedVerifySnapshot);
+      verifiedUsers = Array.from(new Set(descriptors.map(row => row.userId))).map(userId => {
+        const verifiedUser = getCouponRecalcSharedUserFromData(verifiedSharedData, userId);
+        if(!verifiedUser) throw makeOfflineCouponEditError('OFFLINE_EDIT_CONFLICT', '앱 미사용일 수정 후 서버 사용자를 확인하지 못했습니다.');
+        return JSON.parse(JSON.stringify(verifiedUser));
+      });
+    }
+    return {
+      ok:true,
+      idempotent:!!(transactionResult && transactionResult.idempotent),
+      currentRecord:{ ...verifiedCurrent, serverVerified:true },
+      auditRecord:{ ...verifiedAudit, serverVerified:true },
+      couponRecords:verifiedCouponRecords,
+      users:verifiedUsers,
+      sharedData:verifiedSharedData ? JSON.parse(JSON.stringify(verifiedSharedData)) : null,
+      balanceMutations:Array.isArray(verifiedAudit.balanceMutations) ? verifiedAudit.balanceMutations : []
+    };
+  }
+
+  async function readOfflineCouponEditCurrentCloudRecords(options){
+    await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
+    const q = query(
+      offlineCouponEditCollectionRef,
+      where(documentId(), '>=', offlineCouponEditCurrentDocPrefix),
+      where(documentId(), '<', offlineCouponEditCurrentDocPrefix + '\uf8ff')
+    );
+    const snap = await runArchiveCloudPromiseWithTimeout(
+      getDocsFromServer(q),
+      ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+      '앱 미사용일 수정 현재값 조회 시간이 초과되었습니다.'
+    );
+    const records = [];
+    if(snap && snap.forEach){
+      snap.forEach(docSnap => {
+        const normalized = normalizeOfflineCouponEditCloudCurrentPayload(docSnap);
+        if(normalized) records.push(normalized);
+      });
+    }
+    return { records, count:records.length, reason:String((options && options.reason) || 'offline-coupon-edit-current-read') };
+  }
+
+  window.HaetsalOfflineCouponEditCloud = {
+    saveOperation:saveOfflineCouponEditCloudOperation,
+    readCurrentRecords:readOfflineCouponEditCurrentCloudRecords
   };
 
   function sanitizeUserMessageDocPart(value){

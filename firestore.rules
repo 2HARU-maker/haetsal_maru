@@ -1,0 +1,2914 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && request.auth.token.keys().hasAny(['admin'])
+        && request.auth.token.admin == true;
+    }
+
+    function isManager() {
+      return isSignedIn()
+        && ((request.auth.token.keys().hasAny(['manager'])
+            && request.auth.token.manager == true)
+          || (request.auth.token.keys().hasAny(['admin'])
+            && request.auth.token.admin == true));
+    }
+
+    function isCouponEventDocId(docId) {
+      return docId.matches('coupon_event_.*');
+    }
+
+    function isOfflineCouponUseDocId(docId) {
+      return docId.matches('offline_coupon_use_.*');
+    }
+
+    function isOfflineCouponEditCurrentDocId(docId) {
+      return docId.matches('offline_coupon_edit_current_.*');
+    }
+
+    function isOfflineCouponEditAuditDocId(docId) {
+      return docId.matches('offline_coupon_edit_audit_.*');
+    }
+
+    function isOfflineCouponEditDocId(docId) {
+      return isOfflineCouponEditCurrentDocId(docId)
+        || isOfflineCouponEditAuditDocId(docId);
+    }
+
+    function isCouponRecordResolutionDocId(docId) {
+      return docId.matches('coupon_record_resolution_.*');
+    }
+
+    function isCouponLedgerDocId(docId) {
+      return isCouponEventDocId(docId)
+        || isOfflineCouponUseDocId(docId)
+        || isOfflineCouponEditDocId(docId)
+        || isCouponRecordResolutionDocId(docId);
+    }
+
+    function isCouponRestoreRunDocId(docId) {
+      return docId.matches('coupon_restore_run_.*');
+    }
+
+    function isCouponRestoreItemDocId(docId) {
+      return docId.matches('coupon_restore_item_.*');
+    }
+
+    function isCouponRestoreAuditDocId(docId) {
+      return isCouponRestoreRunDocId(docId)
+        || isCouponRestoreItemDocId(docId);
+    }
+
+    function isCouponRecalcRunDocId(docId) {
+      return docId.matches('coupon_recalc_run_.*');
+    }
+
+    function isCouponRecalcItemDocId(docId) {
+      return docId.matches('coupon_recalc_item_.*');
+    }
+
+    function isCouponRecalcLatestDocId(docId) {
+      return docId.matches('coupon_recalc_latest_.*');
+    }
+
+    function isCouponRecalcDocId(docId) {
+      return isCouponRecalcRunDocId(docId)
+        || isCouponRecalcItemDocId(docId)
+        || isCouponRecalcLatestDocId(docId);
+    }
+
+    function isOrderEditDiagnosticDocId(docId) {
+      return docId.matches('order_edit_diagnostic_.*');
+    }
+
+    function runtimePolicy() {
+      return get(
+        /databases/$(database)/documents/haetsalCombinedApp/app_runtime_policy
+      ).data;
+    }
+
+    function hasValidClientEnvelope() {
+      let policy = runtimePolicy();
+      return isSignedIn()
+        && policy.writeEnabled is bool
+        && policy.writeEnabled == true
+        && policy.minAllowedBuildNumber is int
+        && policy.requiredWriteSchemaVersion is int
+        && request.resource.data.clientBuildNumber is int
+        && request.resource.data.clientBuildLabel is string
+        && request.resource.data.writeSchemaVersion is int
+        && request.resource.data.clientWriteAt is string
+        && request.resource.data.clientWriteId is string
+        && request.resource.data.clientWriteId.size() > 0
+        && request.resource.data.clientBuildNumber >= policy.minAllowedBuildNumber
+        && request.resource.data.writeSchemaVersion >= policy.requiredWriteSchemaVersion;
+    }
+
+    function isFreshClientCreate() {
+      return hasValidClientEnvelope();
+    }
+
+    function isFreshClientUpdate() {
+      return hasValidClientEnvelope()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasAll(['clientWriteId', 'clientWriteAt']);
+    }
+
+    function hasPayloadMap() {
+      return request.resource.data.data is map;
+    }
+
+    function isSharedPeopleAuthDocId(docId) {
+      return docId == 'shared_people_auth';
+    }
+
+    function hasValidSharedPeopleAuthShape(data) {
+      return data is map
+        && data.keys().hasAll([
+          'auth',
+          'users',
+          'deletedUserIds',
+          'deletedUserKeys'
+        ])
+        && data.auth is map
+        && data.users is list
+        && data.deletedUserIds is map
+        && data.deletedUserKeys is map;
+    }
+
+    function validSharedPeopleAuthCreate(docId) {
+      let data = request.resource.data.data;
+      return isSharedPeopleAuthDocId(docId)
+        && isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && hasValidSharedPeopleAuthShape(data);
+    }
+
+    function validSharedPeopleAuthUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isSharedPeopleAuthDocId(docId)
+        && isFreshClientUpdate()
+        && hasPayloadMap()
+        && before is map
+        && hasValidSharedPeopleAuthShape(after)
+        && (
+          isAdmin()
+          || (
+            after.auth == before.auth
+            && after.deletedUserIds == before.deletedUserIds
+            && after.deletedUserKeys == before.deletedUserKeys
+          )
+        );
+    }
+
+    function isLiveOrderDocId(docId) {
+      return docId.matches('live_order_.*');
+    }
+
+    function isCouponBalanceGuardedDocId(docId) {
+      return docId == 'shared_people_auth'
+        || isLiveOrderDocId(docId)
+        || isCouponLedgerDocId(docId)
+        || isCouponRecalcDocId(docId);
+    }
+
+    function hasCouponBalanceGuardSchema(docId) {
+      return !isCouponBalanceGuardedDocId(docId)
+        || (
+          request.resource.data.writeSchemaVersion is int
+          && request.resource.data.writeSchemaVersion >= 5
+        );
+    }
+
+    function isDoneStatus(status) {
+      return status is string
+        && (status == 'PICKUP_DONE' || status == 'DELIVERY_DONE');
+    }
+
+    function isCompletionRequestStatus(status) {
+      return status is string
+        && (
+          status == 'PENDING'
+          || status == 'PROCESSING'
+          || status == 'COMPLETED'
+          || status == 'NEEDS_CHECK'
+        );
+    }
+
+    function hasValidCompletionIdentity(data, docId) {
+      return data is map
+        && data.orderId is string
+        && data.orderId.size() > 0
+        && data.liveOrderDocId is string
+        && data.liveOrderDocId.matches('live_order_.*')
+        && data.productionCycle is int
+        && data.productionCycle >= 1
+        && data.completionEventId is string
+        && data.completionEventId == docId;
+    }
+
+    function completionRequestMatchesCommittedState(data, docId) {
+      let live = getAfter(
+        /databases/$(database)/documents/haetsalCombinedApp/$(data.liveOrderDocId)
+      ).data.data;
+      return data.status == 'COMPLETED'
+        && isDoneStatus(live.status)
+        && live.orderId == data.orderId
+        && live.liveOrderDocId == data.liveOrderDocId
+        && live.productionCycle == data.productionCycle
+        && live.completionCommitted == true
+        && live.completionEventId == docId;
+    }
+
+    function validCompletionRequestCreate(docId) {
+      let data = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && hasValidCompletionIdentity(data, docId)
+        && data.type == 'ORDER_COMPLETION_REQUEST'
+        && data.status is string
+        && (data.status == 'PENDING' || data.status == 'PROCESSING')
+        && data.completionOperationId is string
+        && data.requestedAt is string
+        && data.requestedBy is string
+        && data.attemptCount is int
+        && data.attemptCount >= 0
+        && data.lastAttemptAt is string
+        && data.lastError is string;
+    }
+
+    function allowedCompletionRequestTransition(beforeStatus, afterStatus) {
+      return (
+          beforeStatus == 'PENDING'
+          && (
+            afterStatus == 'PENDING'
+            || afterStatus == 'PROCESSING'
+            || afterStatus == 'COMPLETED'
+            || afterStatus == 'NEEDS_CHECK'
+          )
+        )
+        || (
+          beforeStatus == 'PROCESSING'
+          && (
+            afterStatus == 'PENDING'
+            || afterStatus == 'PROCESSING'
+            || afterStatus == 'COMPLETED'
+            || afterStatus == 'NEEDS_CHECK'
+          )
+        )
+        || (
+          beforeStatus == 'NEEDS_CHECK'
+          && (
+            afterStatus == 'PENDING'
+            || afterStatus == 'PROCESSING'
+            || afterStatus == 'COMPLETED'
+            || afterStatus == 'NEEDS_CHECK'
+          )
+        )
+        || (beforeStatus == 'COMPLETED' && afterStatus == 'COMPLETED');
+    }
+
+    function validCompletionRequestUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isFreshClientUpdate()
+        && hasPayloadMap()
+        && before is map
+        && hasValidCompletionIdentity(after, docId)
+        && before.type == 'ORDER_COMPLETION_REQUEST'
+        && after.type == 'ORDER_COMPLETION_REQUEST'
+        && before.orderId == after.orderId
+        && before.liveOrderDocId == after.liveOrderDocId
+        && before.productionCycle == after.productionCycle
+        && before.completionEventId == after.completionEventId
+        && before.completionOperationId == after.completionOperationId
+        && before.requestedAt == after.requestedAt
+        && before.requestedBy == after.requestedBy
+        && isCompletionRequestStatus(before.status)
+        && isCompletionRequestStatus(after.status)
+        && allowedCompletionRequestTransition(before.status, after.status)
+        && after.attemptCount is int
+        && before.attemptCount is int
+        && after.attemptCount >= before.attemptCount
+        && after.lastAttemptAt is string
+        && after.lastError is string
+        && (
+          after.status != 'COMPLETED'
+          || completionRequestMatchesCommittedState(after, docId)
+        );
+    }
+
+    function completionEventMatchesCommittedState(data, docId) {
+      let live = getAfter(
+        /databases/$(database)/documents/haetsalCombinedApp/$(data.liveOrderDocId)
+      ).data.data;
+      let completionRequest = getAfter(
+        /databases/$(database)/documents/haetsalOrderCompletionRequests/$(docId)
+      ).data.data;
+      return isDoneStatus(data.status)
+        && isDoneStatus(live.status)
+        && live.orderId == data.orderId
+        && live.liveOrderDocId == data.liveOrderDocId
+        && live.productionCycle == data.productionCycle
+        && live.statusRevision == data.statusRevision
+        && live.completionCommitted == true
+        && live.completionEventId == docId
+        && live.isOpen == false
+        && live.workStage == 'DONE'
+        && completionRequest.orderId == data.orderId
+        && completionRequest.liveOrderDocId == data.liveOrderDocId
+        && completionRequest.productionCycle == data.productionCycle
+        && completionRequest.completionEventId == docId
+        && completionRequest.status == 'COMPLETED';
+    }
+
+    function validCompletionEventCreate(docId) {
+      let data = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && hasValidCompletionIdentity(data, docId)
+        && data.type == 'ORDER_COMPLETED'
+        && data.operationType == 'production-complete'
+        && data.statusRevision is int
+        && data.statusRevision >= 1
+        && data.workStage == 'DONE'
+        && data.processedAt is string
+        && data.processedBy is string
+        && data.createdAt is string
+        && completionEventMatchesCommittedState(data, docId);
+    }
+
+    function liveCompletionPairMatches(after) {
+      let event = getAfter(
+        /databases/$(database)/documents/haetsalOrderCompletionEvents/$(after.completionEventId)
+      ).data.data;
+      let completionRequest = getAfter(
+        /databases/$(database)/documents/haetsalOrderCompletionRequests/$(after.completionEventId)
+      ).data.data;
+      return event.orderId == after.orderId
+        && event.liveOrderDocId == after.liveOrderDocId
+        && event.productionCycle == after.productionCycle
+        && event.completionEventId == after.completionEventId
+        && event.status == after.status
+        && event.statusRevision == after.statusRevision
+        && completionRequest.orderId == after.orderId
+        && completionRequest.liveOrderDocId == after.liveOrderDocId
+        && completionRequest.productionCycle == after.productionCycle
+        && completionRequest.completionEventId == after.completionEventId
+        && completionRequest.status == 'COMPLETED';
+    }
+
+    function hasValidCompletedLiveShape(after, docId) {
+      return after is map
+        && after.order is map
+        && after.orderId is string
+        && after.orderId.size() > 0
+        && after.liveOrderDocId is string
+        && after.liveOrderDocId == docId
+        && isDoneStatus(after.status)
+        && after.isOpen == false
+        && after.workStage == 'DONE'
+        && after.productionCycle is int
+        && after.productionCycle >= 1
+        && after.statusRevision is int
+        && after.statusRevision >= 1
+        && after.completionCommitted == true
+        && after.completionEventId is string
+        && after.completionEventId.size() > 0
+        && after.order.id == after.orderId
+        && after.order.status == after.status
+        && after.order.isOpen == false
+        && after.order.workStage == 'DONE'
+        && after.order.productionCycle == after.productionCycle
+        && after.order.statusRevision == after.statusRevision
+        && after.order.completionCommitted == true
+        && after.order.completionEventId == after.completionEventId;
+    }
+
+    function validCompletedLiveCreate(docId) {
+      let after = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && hasValidCompletedLiveShape(after, docId)
+        && liveCompletionPairMatches(after);
+    }
+
+    function hasOfficialSequence(data) {
+      return data is map
+        && data.keys().hasAll(['sequenceAllocationSource'])
+        && data.sequenceAllocationSource == 'FIRESTORE_TRANSACTION';
+    }
+
+    function preservesOfficialSequence(before, after) {
+      return !hasOfficialSequence(before)
+        || (
+          after.sequenceAllocationSource == before.sequenceAllocationSource
+          && after.sequenceReservationId == before.sequenceReservationId
+          && after.sequenceDate == before.sequenceDate
+          && after.seq == before.seq
+          && after.orderNumber == before.orderNumber
+          && after.order is map
+          && before.order is map
+          && after.order.sequenceAllocationSource == before.order.sequenceAllocationSource
+          && after.order.sequenceReservationId == before.order.sequenceReservationId
+          && after.order.sequenceDate == before.order.sequenceDate
+          && after.order.seq == before.order.seq
+          && after.order.orderNumber == before.order.orderNumber
+        );
+    }
+
+    function preservesOrInitializesOpenLifecycle(before, after) {
+      return (
+          (
+            before.keys().hasAll(['productionCycle'])
+            && after.productionCycle == before.productionCycle
+          )
+          || (
+            !before.keys().hasAll(['productionCycle'])
+            && after.productionCycle == 1
+          )
+        )
+        && (
+          (
+            before.keys().hasAll(['statusRevision'])
+            && after.statusRevision == before.statusRevision
+          )
+          || (
+            !before.keys().hasAll(['statusRevision'])
+            && after.statusRevision == 1
+          )
+        )
+        && (
+          (
+            before.keys().hasAll(['completionCommitted'])
+            && after.completionCommitted == before.completionCommitted
+          )
+          || (
+            !before.keys().hasAll(['completionCommitted'])
+            && after.completionCommitted == false
+          )
+        )
+        && (
+          (
+            before.keys().hasAll(['completionEventId'])
+            && after.completionEventId == before.completionEventId
+          )
+          || (
+            !before.keys().hasAll(['completionEventId'])
+            && after.completionEventId == ''
+          )
+        );
+    }
+
+    function advancesOrInitializesCompletionLifecycle(before, after) {
+      return (
+          (
+            before.keys().hasAll(['productionCycle'])
+            && after.productionCycle == before.productionCycle
+          )
+          || (
+            !before.keys().hasAll(['productionCycle'])
+            && after.productionCycle == 1
+          )
+        )
+        && (
+          (
+            before.keys().hasAll(['statusRevision'])
+            && after.statusRevision == before.statusRevision + 1
+          )
+          || (
+            !before.keys().hasAll(['statusRevision'])
+            && after.statusRevision == 2
+          )
+        );
+    }
+
+    function orderEditCouponCost(order) {
+      return order.couponPolicyVersion >= 2
+        ? order.couponCostTotal
+        : order.quantity;
+    }
+
+    function hasValidOrderEditCouponCost(order) {
+      return order is map
+        && order.couponPolicyVersion is int
+        && order.quantity is int
+        && order.quantity >= 1
+        && (
+          order.couponPolicyVersion < 2
+          || (
+            order.couponCostTotal is int
+            && order.couponCostTotal >= 1
+          )
+        );
+    }
+
+    function orderEditCouponOperationUnchanged(before, after) {
+      return hasValidOrderEditCouponCost(before.order)
+        && hasValidOrderEditCouponCost(after.order)
+        && orderEditCouponCost(after.order) == orderEditCouponCost(before.order)
+        && (
+          (
+            !after.order.keys().hasAny(['couponBalanceOperationId'])
+            && !before.order.keys().hasAny(['couponBalanceOperationId'])
+          )
+          || (
+            after.order.keys().hasAll(['couponBalanceOperationId'])
+            && before.order.keys().hasAll(['couponBalanceOperationId'])
+            && after.order.couponBalanceOperationId == before.order.couponBalanceOperationId
+            && (
+              !after.order.keys().hasAny(['remainingCoupons'])
+              || (
+                before.order.keys().hasAll(['remainingCoupons'])
+                && after.order.remainingCoupons == before.order.remainingCoupons
+              )
+            )
+          )
+        );
+    }
+
+    function validOrderEditCouponMutation(before, after) {
+      let event = getAfter(
+        /databases/$(database)/documents/haetsalCombinedApp/$(after.order.orderEditCouponEventId)
+      ).data.data;
+      return after.order.keys().hasAll([
+          'couponBalanceOperationId', 'orderEditCouponEventId',
+          'remainingCoupons', 'couponBalanceVersion'
+        ])
+        && after.order.couponBalanceOperationId == after.orderEditOperationId
+        && after.order.orderEditCouponEventId.matches('coupon_event_.*')
+        && event.payloadKind == 'coupon-event'
+        && event.type == 'COUPON_ORDER_EDIT'
+        && event.orderId == after.orderId
+        && event.userId == after.order.userId
+        && event.sourceLogId == after.orderEditOperationId
+        && event.delta is int
+        && event.delta != 0
+        && event.beforeCoupons is int
+        && event.remainingCoupons is int
+        && hasValidOrderEditCouponCost(before.order)
+        && hasValidOrderEditCouponCost(after.order)
+        && event.delta == -(orderEditCouponCost(after.order) - orderEditCouponCost(before.order))
+        && event.beforeCoupons + event.delta == event.remainingCoupons
+        && event.remainingCoupons == after.order.remainingCoupons;
+    }
+
+    function validOrderEditLiveUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && before is map
+        && before.order is map
+        && after.order is map
+        && after.reason == 'order-edited-transaction'
+        && after.orderEditOperationId is string
+        && after.orderEditOperationId.size() > 0
+        && after.order.orderEditOperationId == after.orderEditOperationId
+        && after.orderId == before.orderId
+        && after.liveOrderDocId == docId
+        && after.order.id == before.order.id
+        && after.order.id == after.orderId
+        && after.order.userId == before.order.userId
+        && !isDoneStatus(before.status)
+        && before.status != 'CANCELLED'
+        && !isDoneStatus(after.status)
+        && after.status != 'CANCELLED'
+        && after.status == before.status
+        && after.isOpen == true
+        && after.isOpen == before.isOpen
+        && after.workStage == before.workStage
+        && after.stageRevision == before.stageRevision
+        && after.stageUpdatedAt == before.stageUpdatedAt
+        && after.orderNumber == before.orderNumber
+        && preservesOrInitializesOpenLifecycle(before, after)
+        && preservesOfficialSequence(before, after)
+        && after.diff(before).affectedKeys().hasOnly([
+          'version', 'appVersion', 'reason', 'orderId', 'liveOrderDocId',
+          'orderNumber', 'status', 'isOpen', 'statusUpdatedAt',
+          'productionCycle', 'statusRevision', 'workStage', 'stageRevision',
+          'stageUpdatedAt', 'completionCommitted', 'completionEventId',
+          'updatedAt', 'orderEditOperationId', 'order', '__haetsalDataGuard'
+        ])
+        && after.order.diff(before.order).affectedKeys().hasOnly([
+          'items', 'quantity', 'couponPolicyVersion', 'couponCostTotal',
+          'deliveryType', 'deliveryLocation', 'cupType', 'tumblerInfo', 'memo',
+          'remainingCoupons', 'couponsUpdatedAt', 'couponBalanceOperationId',
+          'couponBalanceVersion', 'lastRecalcRunId', 'editedAt', 'editedBy',
+          'orderEditOperationId', 'orderEditCouponEventId'
+        ])
+        && orderEditCouponOperationUnchanged(before, after);
+    }
+
+    function validOpenLiveUpdate() {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && before is map
+        && !isDoneStatus(before.status)
+        && !isDoneStatus(after.status)
+        && after.reason != 'order-edited-transaction'
+        && after.orderId == before.orderId
+        && preservesOrInitializesOpenLifecycle(before, after)
+        && preservesOfficialSequence(before, after);
+    }
+
+    function isDeliveryLivePayload(data) {
+      return data is map
+        && (
+          (data.keys().hasAll(['deliveryType']) && data.deliveryType == 'DELIVERY')
+          || (data.keys().hasAll(['order']) && data.order is map && data.order.keys().hasAll(['deliveryType']) && data.order.deliveryType == 'DELIVERY')
+        );
+    }
+
+    function hasDeliveryCompletionSourceStage(data) {
+      return data is map
+        && (
+          (data.keys().hasAll(['workStage']) && data.workStage == 'DELIVERING')
+          || (data.keys().hasAll(['order']) && data.order is map && data.order.keys().hasAll(['workStage']) && data.order.workStage == 'DELIVERING')
+          || (
+            (
+              (data.keys().hasAll(['workStage']) && data.workStage == 'DELIVERY_WAITING')
+              || (data.keys().hasAll(['order']) && data.order is map && data.order.keys().hasAll(['workStage']) && data.order.workStage == 'DELIVERY_WAITING')
+            )
+            && (
+              (data.keys().hasAll(['productionCompleted']) && data.productionCompleted == true)
+              || (data.keys().hasAll(['productionCompletedAt']) && data.productionCompletedAt is string && data.productionCompletedAt.size() > 0)
+              || (data.keys().hasAll(['order']) && data.order is map && data.order.keys().hasAll(['productionCompleted']) && data.order.productionCompleted == true)
+              || (data.keys().hasAll(['order']) && data.order is map && data.order.keys().hasAll(['productionCompletedAt']) && data.order.productionCompletedAt is string && data.order.productionCompletedAt.size() > 0)
+            )
+          )
+        );
+    }
+
+    function validLiveCompletionUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && before is map
+        && !isDoneStatus(before.status)
+        && before.status != 'CANCELLED'
+        && (!isDeliveryLivePayload(before) || hasDeliveryCompletionSourceStage(before))
+        && after.orderId == before.orderId
+        && hasValidCompletedLiveShape(after, docId)
+        && advancesOrInitializesCompletionLifecycle(before, after)
+        && preservesOfficialSequence(before, after);
+    }
+
+    function hasLegacyCompletionNormalizationMarker(after) {
+      return after is map
+        && after.order is map
+        && after.legacyCompletionNormalizedAt is string
+        && after.legacyCompletionNormalizedAt.size() > 0
+        && after.legacyCompletionNormalizedBy is string
+        && after.legacyCompletionNormalizedSourceAppVersion is string
+        && after.legacyCompletionNormalizedCurrentAppVersion is string
+        && after.legacyCompletionNormalizedCurrentAppVersion.size() > 0
+        && after.order.legacyCompletionNormalizedAt == after.legacyCompletionNormalizedAt
+        && after.order.legacyCompletionNormalizedBy == after.legacyCompletionNormalizedBy
+        && after.order.legacyCompletionNormalizedSourceAppVersion == after.legacyCompletionNormalizedSourceAppVersion
+        && after.order.legacyCompletionNormalizedCurrentAppVersion == after.legacyCompletionNormalizedCurrentAppVersion;
+    }
+
+    function hasExplicitPositiveProductionCycle(data) {
+      return data is map
+        && data.keys().hasAll(['productionCycle'])
+        && data.productionCycle is int
+        && data.productionCycle >= 1;
+    }
+
+    function beforeHasNoClosedLegacyCompletionState(before, after) {
+      return before is map
+        && !isDoneStatus(before.status)
+        && before.status != 'CANCELLED'
+        && (!before.keys().hasAll(['orderId']) || before.orderId == after.orderId)
+        && (!before.keys().hasAll(['liveOrderDocId']) || before.liveOrderDocId == after.liveOrderDocId)
+        && (!hasExplicitPositiveProductionCycle(before) || before.productionCycle == after.productionCycle)
+        && (!before.keys().hasAll(['completionCommitted']) || before.completionCommitted == false)
+        && (!before.keys().hasAll(['completionEventId']) || before.completionEventId == '')
+        && (
+          !before.keys().hasAll(['order'])
+          || (
+            before.order is map
+            && !isDoneStatus(before.order.status)
+            && before.order.status != 'CANCELLED'
+            && (!before.order.keys().hasAll(['completionCommitted']) || before.order.completionCommitted == false)
+            && (!before.order.keys().hasAll(['completionEventId']) || before.order.completionEventId == '')
+          )
+        );
+    }
+
+    function validLegacyCompletionNormalizedLiveCompletionUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && beforeHasNoClosedLegacyCompletionState(before, after)
+        && hasValidCompletedLiveShape(after, docId)
+        && hasLegacyCompletionNormalizationMarker(after)
+        && after.reason == 'order-completed-transaction'
+        && docId == 'live_order_' + after.orderId
+        && preservesOfficialSequence(before, after);
+    }
+
+    function validLegacyCompletionNormalizedLiveCompletionCreate(docId) {
+      let after = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && hasValidCompletedLiveShape(after, docId)
+        && hasLegacyCompletionNormalizationMarker(after)
+        && after.reason == 'order-completed-transaction'
+        && docId == 'live_order_' + after.orderId;
+    }
+
+    function preservesCompletedLiveState(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && before is map
+        && isDoneStatus(before.status)
+        && after.order is map
+        && after.orderId == before.orderId
+        && after.liveOrderDocId == docId
+        && (
+          !before.keys().hasAll(['liveOrderDocId'])
+          || after.liveOrderDocId == before.liveOrderDocId
+        )
+        && after.status == before.status
+        && after.isOpen == false
+        && after.workStage == 'DONE'
+        && after.productionCycle == before.productionCycle
+        && after.statusRevision == before.statusRevision
+        && after.completionCommitted == before.completionCommitted
+        && after.completionEventId == before.completionEventId
+        && after.order.id == after.orderId
+        && after.order.status == after.status
+        && after.order.isOpen == false
+        && after.order.workStage == 'DONE'
+        && after.order.productionCycle == after.productionCycle
+        && after.order.statusRevision == after.statusRevision
+        && after.order.completionCommitted == after.completionCommitted
+        && after.order.completionEventId == after.completionEventId
+        && preservesOfficialSequence(before, after);
+    }
+
+    function validLiveReopenUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return hasPayloadMap()
+        && before is map
+        && isDoneStatus(before.status)
+        && after.order is map
+        && after.orderId == before.orderId
+        && after.liveOrderDocId == docId
+        && (
+          !before.keys().hasAll(['liveOrderDocId'])
+          || after.liveOrderDocId == before.liveOrderDocId
+        )
+        && after.status == 'PENDING'
+        && after.isOpen == true
+        && after.workStage != 'DONE'
+        && after.productionCycle == before.productionCycle + 1
+        && after.statusRevision == before.statusRevision + 1
+        && after.completionCommitted == false
+        && after.completionEventId == ''
+        && after.order.id == after.orderId
+        && after.order.status == 'PENDING'
+        && after.order.isOpen == true
+        && after.order.workStage != 'DONE'
+        && after.order.productionCycle == after.productionCycle
+        && after.order.statusRevision == after.statusRevision
+        && after.order.completionCommitted == false
+        && after.order.completionEventId == ''
+        && preservesOfficialSequence(before, after);
+    }
+
+    function isNewOrderCreateReason(after) {
+      return after.reason is string
+        && (
+          after.reason == 'order-created'
+          || after.reason.matches('^order-created-retry-[0-9]+$')
+        );
+    }
+
+    function validReservedSequenceCreate(after, docId) {
+      let reservation = getAfter(
+        /databases/$(database)/documents/haetsalOrderSequenceReservations/$(after.sequenceReservationId)
+      ).data.data;
+      return after is map
+        && after.order is map
+        && after.orderId is string
+        && after.orderId.size() > 0
+        && docId == 'live_order_' + after.orderId
+        && after.liveOrderDocId == docId
+        && after.sequenceAllocationSource == 'FIRESTORE_TRANSACTION'
+        && after.sequenceReservationId == after.orderId
+        && after.sequenceDate is string
+        && after.sequenceDate.matches('^[0-9]{8}$')
+        && after.seq is int
+        && after.seq >= 1
+        && after.orderNumber is string
+        && after.orderNumber.size() > 0
+        && after.order.id == after.orderId
+        && after.order.sequenceAllocationSource == after.sequenceAllocationSource
+        && after.order.sequenceReservationId == after.sequenceReservationId
+        && after.order.sequenceDate == after.sequenceDate
+        && after.order.seq == after.seq
+        && after.order.orderNumber == after.orderNumber
+        && reservation.type == 'ORDER_SEQUENCE_RESERVATION'
+        && reservation.status == 'ALLOCATED'
+        && reservation.allocationSource == 'FIRESTORE_TRANSACTION'
+        && reservation.reservationId == after.sequenceReservationId
+        && reservation.orderId == after.orderId
+        && reservation.liveOrderDocId == docId
+        && reservation.dateKey == after.sequenceDate
+        && reservation.seq == after.seq
+        && reservation.orderNumber == after.orderNumber;
+    }
+
+    function validLiveOrderCreate(docId) {
+      let after = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && (
+          !isNewOrderCreateReason(after)
+          || (
+            after.order is map
+            && after.order.userId is string
+            && after.order.userId.size() > 0
+            && (
+              !exists(/databases/$(database)/documents/haetsalUserAccountStatus/$(after.order.userId))
+              || get(/databases/$(database)/documents/haetsalUserAccountStatus/$(after.order.userId)).data.status == 'ACTIVE'
+            )
+          )
+        )
+        && (
+          (isDoneStatus(after.status) && (validCompletedLiveCreate(docId) || validLegacyCompletionNormalizedLiveCompletionCreate(docId)))
+          || (!isDoneStatus(after.status) && !isNewOrderCreateReason(after))
+          || (!isDoneStatus(after.status) && isNewOrderCreateReason(after) && validReservedSequenceCreate(after, docId))
+        );
+    }
+
+    function validLiveOrderUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isFreshClientUpdate()
+        && hasPayloadMap()
+        && before is map
+        && (
+          (
+            after.reason == 'order-edited-transaction'
+            && validOrderEditLiveUpdate(docId)
+          )
+          || (
+            after.reason == 'order-completed-transaction'
+            && !isDoneStatus(before.status)
+            && isDoneStatus(after.status)
+            && (
+              (
+                after.keys().hasAll([
+                  'legacyCompletionNormalizedAt',
+                  'legacyCompletionNormalizedBy',
+                  'legacyCompletionNormalizedSourceAppVersion',
+                  'legacyCompletionNormalizedCurrentAppVersion'
+                ])
+                && validLegacyCompletionNormalizedLiveCompletionUpdate(docId)
+              )
+              || (
+                !after.keys().hasAny([
+                  'legacyCompletionNormalizedAt',
+                  'legacyCompletionNormalizedBy',
+                  'legacyCompletionNormalizedSourceAppVersion',
+                  'legacyCompletionNormalizedCurrentAppVersion'
+                ])
+                && validLiveCompletionUpdate(docId)
+              )
+            )
+          )
+          || (
+            isDoneStatus(before.status)
+            && isDoneStatus(after.status)
+            && preservesCompletedLiveState(docId)
+          )
+          || (
+            after.reason == 'order-reopened-transaction'
+            && isDoneStatus(before.status)
+            && !isDoneStatus(after.status)
+            && validLiveReopenUpdate(docId)
+          )
+          || (
+            after.reason != 'order-edited-transaction'
+            && after.reason != 'order-completed-transaction'
+            && after.reason != 'order-reopened-transaction'
+            && !isDoneStatus(before.status)
+            && !isDoneStatus(after.status)
+            && validOpenLiveUpdate()
+          )
+        );
+    }
+
+    function validSequenceCounterShape(data, dateKey) {
+      return data is map
+        && data.type == 'ORDER_SEQUENCE_COUNTER'
+        && data.dateKey == dateKey
+        && dateKey.matches('^[0-9]{8}$')
+        && data.lastSeq is int
+        && data.lastSeq >= 1
+        && data.lastOrderId is string
+        && data.lastOrderId.size() > 0
+        && data.lastOrderNumber is string
+        && data.lastOrderNumber.size() > 0
+        && data.createdAt is string
+        && data.updatedAt is string;
+    }
+
+    function sequenceCounterMatchesReservation(data, dateKey) {
+      let reservation = getAfter(
+        /databases/$(database)/documents/haetsalOrderSequenceReservations/$(data.lastOrderId)
+      ).data.data;
+      return reservation.type == 'ORDER_SEQUENCE_RESERVATION'
+        && reservation.status == 'ALLOCATED'
+        && reservation.allocationSource == 'FIRESTORE_TRANSACTION'
+        && reservation.reservationId == data.lastOrderId
+        && reservation.orderId == data.lastOrderId
+        && reservation.liveOrderDocId == 'live_order_' + data.lastOrderId
+        && reservation.dateKey == dateKey
+        && reservation.seq == data.lastSeq
+        && reservation.orderNumber == data.lastOrderNumber;
+    }
+
+    function validSequenceCounterCreate(dateKey) {
+      let data = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && validSequenceCounterShape(data, dateKey)
+        && sequenceCounterMatchesReservation(data, dateKey);
+    }
+
+    function validSequenceCounterUpdate(dateKey) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isFreshClientUpdate()
+        && hasPayloadMap()
+        && before is map
+        && validSequenceCounterShape(after, dateKey)
+        && before.type == 'ORDER_SEQUENCE_COUNTER'
+        && before.dateKey == after.dateKey
+        && before.createdAt == after.createdAt
+        && before.lastSeq is int
+        && after.lastSeq == before.lastSeq + 1
+        && sequenceCounterMatchesReservation(after, dateKey);
+    }
+
+    function validSequenceReservationCreate(docId) {
+      let data = request.resource.data.data;
+      let counter = getAfter(
+        /databases/$(database)/documents/haetsalOrderSequenceCounters/$(data.dateKey)
+      ).data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && data is map
+        && data.type == 'ORDER_SEQUENCE_RESERVATION'
+        && data.status == 'ALLOCATED'
+        && data.allocationSource == 'FIRESTORE_TRANSACTION'
+        && data.reservationId == docId
+        && data.orderId == docId
+        && data.liveOrderDocId == 'live_order_' + docId
+        && data.dateKey is string
+        && data.dateKey.matches('^[0-9]{8}$')
+        && data.seq is int
+        && data.seq >= 1
+        && data.orderNumber is string
+        && data.orderNumber.size() > 0
+        && data.clientSessionId is string
+        && data.allocatedAt is string
+        && data.createdAt is string
+        && data.updatedAt is string
+        && counter.type == 'ORDER_SEQUENCE_COUNTER'
+        && counter.dateKey == data.dateKey
+        && counter.lastSeq == data.seq
+        && counter.lastOrderId == data.orderId
+        && counter.lastOrderNumber == data.orderNumber;
+    }
+
+    function isAdminCouponAdjustmentType(data) {
+      return data is map
+        && data.type is string
+        && (data.type == 'COUPON_CHARGE' || data.type == 'COUPON_DEDUCT' || data.type == 'COUPON_RESTORE');
+    }
+
+    function validCouponCorrectionFields(data) {
+      return !data.keys().hasAny(['correctionOfEventId', 'correctionOriginalRecordKey', 'correctionKind'])
+        || (
+          isAdmin()
+          && data.keys().hasAll(['correctionOfEventId', 'correctionOriginalRecordKey', 'correctionKind'])
+          && data.correctionOfEventId is string
+          && data.correctionOfEventId.size() > 0
+          && data.correctionOriginalRecordKey is string
+          && data.correctionOriginalRecordKey.size() > 0
+          && (data.correctionKind == 'ZERO_FLOOR' || data.correctionKind == 'AMOUNT_CORRECTION')
+        );
+    }
+
+    function validOrderEditCouponEventTransaction(data) {
+      let liveDocId = 'live_order_' + data.orderId;
+      let live = getAfter(
+        /databases/$(database)/documents/haetsalCombinedApp/$(liveDocId)
+      ).data.data;
+      return data.orderId is string
+          && data.orderId.size() > 0
+          && data.sourceLogId is string
+          && data.sourceLogId.size() > 0
+          && data.delta is int
+          && data.delta != 0
+          && data.beforeCoupons is int
+          && data.remainingCoupons is int
+          && data.beforeCoupons + data.delta == data.remainingCoupons
+          && live.reason == 'order-edited-transaction'
+          && live.orderId == data.orderId
+          && live.order is map
+          && live.order.userId == data.userId
+          && live.orderEditOperationId == data.sourceLogId
+          && live.order.orderEditOperationId == data.sourceLogId
+          && live.order.couponBalanceOperationId == data.sourceLogId
+          && live.order.remainingCoupons == data.remainingCoupons;
+    }
+
+    function validCouponRestoreEventProvenance(data) {
+      return (
+          data.type != 'COUPON_RESTORE'
+          && !data.keys().hasAny([
+            'restoreBatchId', 'restoreManifestId', 'restoreOperationId', 'restorePolicyVersion'
+          ])
+        )
+        || (
+          data.type == 'COUPON_RESTORE'
+          && data.keys().hasAll([
+            'restoreBatchId', 'restoreManifestId', 'restoreOperationId', 'restorePolicyVersion'
+          ])
+          && data.restoreBatchId is string
+          && data.restoreBatchId.size() > 0
+          && data.restoreBatchId.size() <= 180
+          && data.restoreManifestId == 'coupon_restore_run_' + data.restoreBatchId
+          && data.restoreOperationId == 'coupon-restore:' + data.restoreBatchId + ':' + data.userId
+          && data.restoreOperationId.size() <= 400
+          && data.restorePolicyVersion is int
+          && data.restorePolicyVersion >= 1
+        );
+    }
+
+    function validCouponEventCreate(docId) {
+      let data = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponEventDocId(docId)
+        && data is map
+        && data.payloadKind == 'coupon-event'
+        && data.id is string
+        && data.id.size() > 0
+        && data.eventId is string
+        && data.eventId == data.id
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.type is string
+        && validCouponCorrectionFields(data)
+        && validCouponRestoreEventProvenance(data)
+        && (
+          data.type != 'COUPON_ORDER_EDIT'
+          || validOrderEditCouponEventTransaction(data)
+        )
+        && (
+          !isAdminCouponAdjustmentType(data)
+          || isAdmin()
+        );
+    }
+
+    function validCouponRecordResolutionCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRecordResolutionDocId(docId)
+        && data is map
+        && data.payloadKind == 'coupon-record-resolution'
+        && data.resolutionId is string
+        && data.resolutionId.size() > 0
+        && (data.resolutionType == 'DUPLICATE_VOID' || data.resolutionType == 'AMOUNT_CORRECTION')
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.originalRecordKey is string
+        && data.originalRecordKey.size() > 0
+        && data.reason is string
+        && data.reason.size() > 0
+        && validCouponRecoveryConflictResolutionFields(data)
+        && data.docId == docId;
+    }
+
+    function validCouponRecoveryConflictResolutionFields(data) {
+      return !data.keys().hasAny([
+          'resolutionScope', 'conflictIdentityKey', 'variantSetHash',
+          'selectedVariantFingerprint', 'rejectedVariantFingerprints'
+        ])
+        || (
+          data.keys().hasAll([
+            'resolutionScope', 'conflictIdentityKey', 'variantSetHash',
+            'selectedVariantFingerprint', 'rejectedVariantFingerprints'
+          ])
+          && data.resolutionScope == 'RECOVERY_IDENTITY_CONFLICT'
+          && data.conflictIdentityKey is string
+          && data.conflictIdentityKey.size() > 0
+          && data.originalRecordKey == data.conflictIdentityKey
+          && data.variantSetHash is string
+          && data.variantSetHash.size() > 0
+          && data.selectedVariantFingerprint is string
+          && data.selectedVariantFingerprint.size() > 0
+          && data.rejectedVariantFingerprints is list
+          && data.rejectedVariantFingerprints.size() > 0
+        );
+    }
+
+    function validOfflineCouponUseCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isOfflineCouponUseDocId(docId)
+        && data is map
+        && data.payloadKind == 'offline-coupon-use'
+        && data.id is string
+        && data.id.size() > 0
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.type == 'COUPON_OFFLINE_USE';
+    }
+
+    function validOfflineCouponEditEffectiveState(data) {
+      return data is map
+        && data.keys().hasOnly([
+          'userId', 'userName', 'userDept', 'amount', 'usedDate', 'reason'
+        ])
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.userName is string
+        && data.userDept is string
+        && data.amount is int
+        && data.amount > 0
+        && data.usedDate is string
+        && data.usedDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.reason is string
+        && data.reason.size() > 0;
+    }
+
+    function validOfflineCouponEditOriginalLink(data) {
+      let original = get(
+        /databases/$(database)/documents/haetsalCombinedApp/$(data.originalOfflineDocId)
+      ).data.data;
+      return data.originalOfflineDocId.matches('offline_coupon_use_.*')
+        && original is map
+        && original.payloadKind == 'offline-coupon-use'
+        && original.id == data.originalRecordId
+        && original.type == 'COUPON_OFFLINE_USE';
+    }
+
+    function validOfflineCouponEditCurrentShape(data, docId) {
+      return data is map
+        && data.keys().hasOnly([
+          'payloadKind', 'docId', 'originalRecordId', 'originalOfflineDocId',
+          'effectiveUserId', 'effectiveUserName', 'effectiveUserDept',
+          'effectiveAmount', 'effectiveUsedDate', 'effectiveReason',
+          'revision', 'lastOperationId', 'lastAuditDocId',
+          'updatedByUid', 'updatedByLabel', 'updatedAtClient',
+          'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'offline-coupon-edit-current'
+        && data.docId == docId
+        && data.originalRecordId is string
+        && data.originalRecordId.size() > 0
+        && data.originalOfflineDocId is string
+        && data.effectiveUserId is string
+        && data.effectiveUserId.size() > 0
+        && data.effectiveUserName is string
+        && data.effectiveUserDept is string
+        && data.effectiveAmount is int
+        && data.effectiveAmount > 0
+        && data.effectiveUsedDate is string
+        && data.effectiveUsedDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.effectiveReason is string
+        && data.effectiveReason.size() > 0
+        && data.revision is int
+        && data.revision >= 1
+        && data.lastOperationId is string
+        && data.lastOperationId.size() > 0
+        && data.lastAuditDocId is string
+        && data.lastAuditDocId.matches('offline_coupon_edit_audit_.*')
+        && data.updatedByUid == request.auth.uid
+        && data.updatedByLabel is string
+        && data.updatedAtClient is string
+        && data.updatedAtClient.size() > 0
+        && data.storageLocation == 'haetsalOfflineCouponEdits';
+    }
+
+    function validOfflineCouponEditCurrentAuditLink(data) {
+      let audit = getAfter(
+        /databases/$(database)/documents/haetsalOfflineCouponEdits/$(data.lastAuditDocId)
+      ).data.data;
+      return audit is map
+        && audit.payloadKind == 'offline-coupon-edit-audit'
+        && audit.operationId == data.lastOperationId
+        && audit.originalRecordId == data.originalRecordId
+        && audit.originalOfflineDocId == data.originalOfflineDocId
+        && audit.currentDocId == data.docId
+        && audit.newRevision == data.revision
+        && audit.afterState is map
+        && audit.afterState.userId == data.effectiveUserId
+        && audit.afterState.userName == data.effectiveUserName
+        && audit.afterState.userDept == data.effectiveUserDept
+        && audit.afterState.amount == data.effectiveAmount
+        && audit.afterState.usedDate == data.effectiveUsedDate
+        && audit.afterState.reason == data.effectiveReason;
+    }
+
+    function validOfflineCouponEditCurrentCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isOfflineCouponEditCurrentDocId(docId)
+        && validOfflineCouponEditCurrentShape(data, docId)
+        && data.revision == 1
+        && validOfflineCouponEditOriginalLink(data)
+        && validOfflineCouponEditCurrentAuditLink(data);
+    }
+
+    function validOfflineCouponEditCurrentUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientUpdate()
+        && hasPayloadMap()
+        && isOfflineCouponEditCurrentDocId(docId)
+        && before is map
+        && validOfflineCouponEditCurrentShape(after, docId)
+        && after.originalRecordId == before.originalRecordId
+        && after.originalOfflineDocId == before.originalOfflineDocId
+        && after.revision == before.revision + 1
+        && after.diff(before).affectedKeys().hasOnly([
+          'effectiveUserId', 'effectiveUserName', 'effectiveUserDept',
+          'effectiveAmount', 'effectiveUsedDate', 'effectiveReason',
+          'revision', 'lastOperationId', 'lastAuditDocId',
+          'updatedByUid', 'updatedByLabel', 'updatedAtClient',
+          '__haetsalDataGuard'
+        ])
+        && validOfflineCouponEditCurrentAuditLink(after);
+    }
+
+    function validOfflineCouponEditBalanceMutation(data) {
+      return data is map
+        && data.keys().hasOnly([
+          'userId', 'delta', 'beforeCoupons', 'remainingCoupons',
+          'eventId', 'eventDocId', 'eventRole', 'couponBalanceVersion'
+        ])
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.delta is int
+        && data.delta != 0
+        && data.beforeCoupons is int
+        && data.remainingCoupons is int
+        && data.beforeCoupons + data.delta == data.remainingCoupons
+        && data.eventId is string
+        && data.eventId.size() > 0
+        && data.eventDocId is string
+        && data.eventDocId.matches('coupon_event_.*')
+        && data.eventRole is string
+        && (
+          data.eventRole == 'same_user_adjustment'
+          || data.eventRole == 'old_user_refund'
+          || data.eventRole == 'new_user_deduct'
+        )
+        && data.couponBalanceVersion is int
+        && data.couponBalanceVersion >= 1;
+    }
+
+    function validOfflineCouponEditAuditShape(data, docId) {
+      return data is map
+        && data.keys().hasOnly([
+          'payloadKind', 'docId', 'currentDocId',
+          'originalRecordId', 'originalOfflineDocId', 'operationId',
+          'baseRevision', 'newRevision', 'beforeState', 'afterState',
+          'balanceMutations', 'generatedEventIds',
+          'actorUid', 'actorLabel', 'createdAtClient',
+          'intentFingerprint', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'offline-coupon-edit-audit'
+        && data.docId == docId
+        && data.currentDocId is string
+        && data.currentDocId.matches('offline_coupon_edit_current_.*')
+        && data.originalRecordId is string
+        && data.originalRecordId.size() > 0
+        && data.originalOfflineDocId is string
+        && data.operationId is string
+        && data.operationId.size() > 0
+        && data.baseRevision is int
+        && data.baseRevision >= 0
+        && data.newRevision == data.baseRevision + 1
+        && validOfflineCouponEditEffectiveState(data.beforeState)
+        && validOfflineCouponEditEffectiveState(data.afterState)
+        && data.balanceMutations is list
+        && data.balanceMutations.size() <= 2
+        && (
+          data.balanceMutations.size() == 0
+          || validOfflineCouponEditBalanceMutation(data.balanceMutations[0])
+        )
+        && (
+          data.balanceMutations.size() <= 1
+          || validOfflineCouponEditBalanceMutation(data.balanceMutations[1])
+        )
+        && data.generatedEventIds is list
+        && data.generatedEventIds.size() == data.balanceMutations.size()
+        && (
+          data.generatedEventIds.size() == 0
+          || (
+            data.generatedEventIds[0] is string
+            && data.generatedEventIds[0].matches('coupon_event_.*')
+          )
+        )
+        && (
+          data.generatedEventIds.size() <= 1
+          || (
+            data.generatedEventIds[1] is string
+            && data.generatedEventIds[1].matches('coupon_event_.*')
+          )
+        )
+        && data.actorUid == request.auth.uid
+        && data.actorLabel is string
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.intentFingerprint is string
+        && data.intentFingerprint.size() > 0
+        && data.storageLocation == 'haetsalOfflineCouponEdits';
+    }
+
+    function validOfflineCouponEditAuditCurrentLink(data) {
+      let current = getAfter(
+        /databases/$(database)/documents/haetsalOfflineCouponEdits/$(data.currentDocId)
+      ).data.data;
+      return current is map
+        && current.payloadKind == 'offline-coupon-edit-current'
+        && current.lastOperationId == data.operationId
+        && current.lastAuditDocId == data.docId
+        && current.revision == data.newRevision;
+    }
+
+    function validOfflineCouponEditAuditCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isOfflineCouponEditAuditDocId(docId)
+        && validOfflineCouponEditAuditShape(data, docId)
+        && validOfflineCouponEditAuditCurrentLink(data);
+    }
+
+    function validCouponRestoreIncludeOptions(options) {
+      return options is map
+        && options.keys().hasAll([
+          'includeOrderDeduct', 'includeManualDeduct', 'includeOrderRefund',
+          'includeManualCharge', 'includeOrderEdit'
+        ])
+        && options.keys().hasOnly([
+          'includeOrderDeduct', 'includeManualDeduct', 'includeOrderRefund',
+          'includeManualCharge', 'includeOrderEdit'
+        ])
+        && options.includeOrderDeduct is bool
+        && options.includeManualDeduct is bool
+        && options.includeOrderRefund is bool
+        && options.includeManualCharge is bool
+        && options.includeOrderEdit is bool;
+    }
+
+    function validCouponRestoreEvidenceItem(item) {
+      return item is map
+        && item.userId is string
+        && item.userId.size() > 0
+        && item.userId.size() <= 200
+        && (
+          (
+            item.evidenceType == 'USER_SUMMARY'
+            && item.keys().hasOnly([
+              'evidenceType', 'userId', 'baseAnchorKind', 'baseAnchorId',
+              'baseAnchorRevision', 'baseAnchorTimestamp', 'seedBalance', 'baseBalance',
+              'beforeBalance', 'targetBalance', 'actualDelta', 'finalBalance',
+              'orderDeductTotal', 'orderRefundTotal', 'orderEditDeltaTotal',
+              'adminChargeTotal', 'adminDeductTotal', 'includeOrderDeduct',
+              'includeOrderRefund', 'includeOrderEdit', 'includeManualCharge',
+              'includeManualDeduct', 'generatedRestoreEventId',
+              'generatedRestoreEventDocId', 'restoreLogId', 'restoreOperationId',
+              'sourceEvidenceCount'
+            ])
+            && item.baseAnchorKind is string
+            && item.baseAnchorKind.size() > 0
+            && item.baseAnchorKind.size() <= 80
+            && item.baseAnchorId is string
+            && item.baseAnchorId.size() > 0
+            && item.baseAnchorId.size() <= 240
+            && item.beforeBalance is int
+            && item.targetBalance is int
+            && item.actualDelta is int
+            && item.finalBalance is int
+            && item.beforeBalance + item.actualDelta == item.finalBalance
+            && item.targetBalance == item.finalBalance
+            && item.restoreOperationId is string
+            && item.restoreOperationId.size() > 0
+            && item.restoreOperationId.size() <= 400
+            && item.sourceEvidenceCount is int
+            && item.sourceEvidenceCount > 0
+          )
+          || (
+            item.evidenceType == 'SOURCE'
+            && item.keys().hasOnly([
+              'evidenceType', 'evidenceId', 'userId', 'sourceUserId', 'sourceKind',
+              'sourceRecordId', 'sourceRevision', 'sourceTimestamp',
+              'normalizedContribution', 'included', 'exclusionReason',
+              'fallbackKind', 'phase'
+            ])
+            && item.evidenceId is string
+            && item.evidenceId.size() > 0
+            && item.evidenceId.size() <= 240
+            && item.sourceKind is string
+            && item.sourceKind.size() > 0
+            && item.sourceKind.size() <= 80
+            && item.sourceRecordId is string
+            && item.sourceRecordId.size() > 0
+            && item.sourceRecordId.size() <= 240
+            && item.normalizedContribution is int
+            && item.included is bool
+            && item.exclusionReason is string
+            && item.exclusionReason.size() <= 160
+            && (item.included == true || item.exclusionReason.size() > 0)
+          )
+        );
+    }
+
+    function validCouponRestoreEvidenceList(items) {
+      return items is list
+        && items.size() > 0
+        && items.size() <= 80
+        && validCouponRestoreEvidenceItem(items[0])
+        && (items.size() < 2 || validCouponRestoreEvidenceItem(items[items.size() - 1]));
+    }
+
+    function validCouponRestoreRunCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRestoreRunDocId(docId)
+        && data is map
+        && data.keys().hasAll([
+          'payloadKind', 'docId', 'restoreBatchId', 'restoreManifestId',
+          'restorePolicyVersion', 'appVersion', 'appBuildNumber',
+          'writeSchemaVersion', 'baseAt', 'applyFrom', 'includeOptions',
+          'actorUid', 'actorLabel', 'createdAtClient', 'targetUserCount',
+          'userEvidenceCount', 'sourceEvidenceCount', 'includedSourceCount',
+          'excludedSourceCount', 'generatedEventCount', 'chunkCount',
+          'chunkDocIds', 'evidenceDigest', 'status', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'docId', 'restoreBatchId', 'restoreManifestId',
+          'restorePolicyVersion', 'appVersion', 'appBuildNumber',
+          'writeSchemaVersion', 'baseAt', 'applyFrom', 'includeOptions',
+          'actorUid', 'actorLabel', 'createdAtClient', 'targetUserCount',
+          'userEvidenceCount', 'sourceEvidenceCount', 'includedSourceCount',
+          'excludedSourceCount', 'generatedEventCount', 'chunkCount',
+          'chunkDocIds', 'evidenceDigest', 'status', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-run'
+        && data.restoreBatchId is string
+        && data.restoreBatchId.size() > 0
+        && data.restoreBatchId.size() <= 180
+        && data.restoreManifestId == 'coupon_restore_run_' + data.restoreBatchId
+        && data.docId == data.restoreManifestId
+        && docId == data.restoreManifestId
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.appVersion is string
+        && data.appVersion.size() <= 120
+        && data.appBuildNumber is int
+        && data.appBuildNumber >= 0
+        && data.writeSchemaVersion is int
+        && data.writeSchemaVersion >= 0
+        && data.baseAt is string
+        && data.baseAt.size() > 0
+        && data.baseAt.size() <= 240
+        && data.applyFrom is string
+        && data.applyFrom.size() > 0
+        && data.applyFrom.size() <= 240
+        && validCouponRestoreIncludeOptions(data.includeOptions)
+        && data.actorUid == request.auth.uid
+        && data.actorLabel is string
+        && data.actorLabel.size() > 0
+        && data.actorLabel.size() <= 160
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.targetUserCount is int
+        && data.targetUserCount > 0
+        && data.targetUserCount <= 400
+        && data.userEvidenceCount == data.targetUserCount
+        && data.sourceEvidenceCount is int
+        && data.sourceEvidenceCount >= data.targetUserCount
+        && data.includedSourceCount is int
+        && data.includedSourceCount >= data.targetUserCount
+        && data.excludedSourceCount is int
+        && data.excludedSourceCount >= 0
+        && data.includedSourceCount + data.excludedSourceCount == data.sourceEvidenceCount
+        && data.generatedEventCount is int
+        && data.generatedEventCount >= 0
+        && data.generatedEventCount <= data.targetUserCount
+        && data.chunkCount is int
+        && data.chunkCount > 0
+        && data.chunkCount <= 448
+        && data.chunkDocIds is list
+        && data.chunkDocIds.size() == data.chunkCount
+        && data.evidenceDigest is string
+        && data.evidenceDigest.matches('restore_.*')
+        && data.evidenceDigest.size() <= 40
+        && data.status == 'APPLIED'
+        && data.storageLocation == 'haetsalCombinedApp';
+    }
+
+    function validCouponRestoreItemCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRestoreItemDocId(docId)
+        && data is map
+        && data.keys().hasAll([
+          'payloadKind', 'docId', 'restoreBatchId', 'restoreManifestId',
+          'chunkId', 'chunkIndex', 'itemCount', 'items', 'evidenceDigest',
+          'restorePolicyVersion', 'createdAtClient', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'docId', 'restoreBatchId', 'restoreManifestId',
+          'chunkId', 'chunkIndex', 'itemCount', 'items', 'evidenceDigest',
+          'restorePolicyVersion', 'createdAtClient', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-item'
+        && data.restoreBatchId is string
+        && data.restoreBatchId.size() > 0
+        && data.restoreBatchId.size() <= 180
+        && data.restoreManifestId == 'coupon_restore_run_' + data.restoreBatchId
+        && data.chunkId is string
+        && data.chunkId.matches(data.restoreBatchId + '_[0-9][0-9][0-9]')
+        && data.docId == 'coupon_restore_item_' + data.chunkId
+        && docId == data.docId
+        && data.chunkIndex is int
+        && data.chunkIndex > 0
+        && data.chunkIndex <= 448
+        && data.itemCount is int
+        && data.itemCount == data.items.size()
+        && validCouponRestoreEvidenceList(data.items)
+        && data.evidenceDigest is string
+        && data.evidenceDigest.matches('restore_.*')
+        && data.evidenceDigest.size() <= 40
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.storageLocation == 'haetsalCombinedApp';
+    }
+
+    function validRestoreAuditIncludeOptions(options) {
+      return options is map
+        && options.keys().hasAll([
+          'includeOrderDeduct', 'includeManualDeduct', 'includeOrderRefund',
+          'includeManualCharge', 'includeOrderEdit'
+        ])
+        && options.keys().hasOnly([
+          'includeOrderDeduct', 'includeManualDeduct', 'includeOrderRefund',
+          'includeManualCharge', 'includeOrderEdit'
+        ])
+        && options.includeOrderDeduct is bool
+        && options.includeManualDeduct is bool
+        && options.includeOrderRefund is bool
+        && options.includeManualCharge is bool
+        && options.includeOrderEdit is bool;
+    }
+
+    function validRestoreAuditDataGuard(data) {
+      let guard = data.__haetsalDataGuard;
+      return guard is map
+        && guard.keys().hasAll([
+          'dataGuardVersion', 'appBuild', 'savedAt', 'deviceId'
+        ])
+        && guard.keys().hasOnly([
+          'dataGuardVersion', 'appBuild', 'savedAt', 'deviceId'
+        ])
+        && guard.dataGuardVersion == 1
+        && guard.appBuild == request.resource.data.appBuild
+        && guard.savedAt == request.resource.data.savedAt
+        && guard.deviceId == request.resource.data.deviceId;
+    }
+
+    function validRestoreAuditOuterEnvelope() {
+      let outer = request.resource.data;
+      return outer.keys().hasAll([
+          'data', 'updatedAt', 'dataGuardVersion', 'appBuild', 'savedAt',
+          'deviceId', 'clientBuildNumber', 'clientBuildLabel',
+          'writeSchemaVersion', 'clientWriteAt', 'clientWriteId',
+          'serverCreatedAt'
+        ])
+        && outer.keys().hasOnly([
+          'data', 'updatedAt', 'dataGuardVersion', 'appBuild', 'savedAt',
+          'deviceId', 'clientBuildNumber', 'clientBuildLabel',
+          'writeSchemaVersion', 'clientWriteAt', 'clientWriteId',
+          'serverCreatedAt'
+        ])
+        && outer.data is map
+        && outer.updatedAt is string
+        && outer.updatedAt.size() > 0
+        && outer.updatedAt.size() <= 240
+        && outer.savedAt == outer.updatedAt
+        && outer.clientWriteAt == outer.updatedAt
+        && outer.dataGuardVersion == 1
+        && outer.appBuild is string
+        && outer.appBuild.size() > 0
+        && outer.appBuild.size() <= 160
+        && outer.deviceId is string
+        && outer.deviceId.size() > 0
+        && outer.deviceId.size() <= 240
+        && outer.clientBuildNumber is int
+        && outer.clientBuildNumber >= 100000000000
+        && outer.clientBuildNumber <= 999999999999
+        && outer.clientBuildLabel is string
+        && outer.clientBuildLabel.size() > 0
+        && outer.clientBuildLabel.size() <= 160
+        && outer.writeSchemaVersion is int
+        && outer.writeSchemaVersion >= 1
+        && outer.writeSchemaVersion <= 1000000
+        && outer.clientWriteId is string
+        && outer.clientWriteId.size() > 0
+        && outer.clientWriteId.size() <= 240
+        && isFreshClientCreate()
+        && outer.serverCreatedAt == request.time;
+    }
+
+    function validRestoreAuditRunCreate(runId) {
+      let data = request.resource.data.data;
+      return data.keys().hasAll([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restoreManifestId', 'restorePolicyVersion', 'appVersion',
+          'appBuildNumber', 'writeSchemaVersion', 'baseAt', 'applyFrom',
+          'includeOptions', 'actorUid', 'createdAtClient', 'targetUserCount',
+          'eventCount', 'userCoreCount', 'userLinkageCount', 'sourceCount',
+          'includedSourceCount', 'excludedSourceCount', 'documentCount',
+          'evidenceDigest', 'status', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restoreManifestId', 'restorePolicyVersion', 'appVersion',
+          'appBuildNumber', 'writeSchemaVersion', 'baseAt', 'applyFrom',
+          'includeOptions', 'actorUid', 'createdAtClient', 'targetUserCount',
+          'eventCount', 'userCoreCount', 'userLinkageCount', 'sourceCount',
+          'includedSourceCount', 'excludedSourceCount', 'documentCount',
+          'evidenceDigest', 'status', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-run'
+        && data.schemaGuard == 'R3_RESTORE_RUN_V1'
+        && runId.matches('[A-Za-z0-9_-]+')
+        && runId.size() > 0
+        && runId.size() <= 180
+        && data.runId == runId
+        && data.restoreBatchId == runId
+        && data.restoreManifestId == 'coupon_restore_run_' + runId
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.restorePolicyVersion <= 100
+        && data.appVersion is string
+        && data.appVersion.size() <= 120
+        && data.appBuildNumber is int
+        && data.appBuildNumber >= 100000000000
+        && data.appBuildNumber <= 999999999999
+        && data.appBuildNumber == request.resource.data.clientBuildNumber
+        && data.writeSchemaVersion is int
+        && data.writeSchemaVersion >= 1
+        && data.writeSchemaVersion <= 1000000
+        && data.writeSchemaVersion == request.resource.data.writeSchemaVersion
+        && data.baseAt is string
+        && data.baseAt.size() > 0
+        && data.baseAt.size() <= 240
+        && data.applyFrom is string
+        && data.applyFrom.size() > 0
+        && data.applyFrom.size() <= 240
+        && validRestoreAuditIncludeOptions(data.includeOptions)
+        && data.actorUid == request.auth.uid
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.targetUserCount is int
+        && data.targetUserCount > 0
+        && data.targetUserCount <= 400
+        && data.eventCount is int
+        && data.eventCount >= 0
+        && data.eventCount <= data.targetUserCount
+        && data.userCoreCount == data.targetUserCount
+        && data.userLinkageCount == data.targetUserCount
+        && data.sourceCount is int
+        && data.sourceCount > 0
+        && data.sourceCount <= 447
+        && data.sourceCount >= data.targetUserCount
+        && data.includedSourceCount is int
+        && data.includedSourceCount > 0
+        && data.includedSourceCount <= 447
+        && data.excludedSourceCount is int
+        && data.excludedSourceCount >= 0
+        && data.excludedSourceCount <= 447
+        && data.includedSourceCount + data.excludedSourceCount == data.sourceCount
+        && data.documentCount == 2 + (2 * data.targetUserCount) + data.eventCount + data.sourceCount
+        && data.documentCount is int
+        && data.documentCount >= 5
+        && data.documentCount <= 450
+        && data.evidenceDigest is string
+        && data.evidenceDigest.matches('restore_.*')
+        && data.evidenceDigest.size() <= 40
+        && data.status == 'APPLIED'
+        && data.storageLocation == 'haetsalRestoreAuditRuns'
+        && validRestoreAuditDataGuard(data);
+    }
+
+    function validRestoreAuditCoreCreate(runId, userKey) {
+      let data = request.resource.data.data;
+      return data.keys().hasAll([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey',
+          'baseAnchorKind', 'baseAnchorId', 'baseAnchorRevision',
+          'baseAnchorTimestamp', 'seedCoupons', 'baseCoupons', 'beforeCoupons',
+          'targetCoupons', 'actualDelta', 'finalCoupons', 'restoreOrderDeduct',
+          'restoreOrderRefund', 'restoreOrderEditDelta', 'restoreManualCharge',
+          'restoreManualDeduct', 'sourceEvidenceCount', 'userEvidenceDigest',
+          'createdAtClient', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey',
+          'baseAnchorKind', 'baseAnchorId', 'baseAnchorRevision',
+          'baseAnchorTimestamp', 'seedCoupons', 'baseCoupons', 'beforeCoupons',
+          'targetCoupons', 'actualDelta', 'finalCoupons', 'restoreOrderDeduct',
+          'restoreOrderRefund', 'restoreOrderEditDelta', 'restoreManualCharge',
+          'restoreManualDeduct', 'sourceEvidenceCount', 'userEvidenceDigest',
+          'createdAtClient', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-user-core'
+        && data.schemaGuard == 'R3_RESTORE_USER_CORE_V1'
+        && data.runId == runId
+        && data.restoreBatchId == runId
+        && userKey.matches('[A-Za-z0-9_-]+')
+        && userKey.size() > 0
+        && userKey.size() <= 200
+        && data.userKey == userKey
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.restorePolicyVersion <= 100
+        && data.actorUid == request.auth.uid
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.userId.size() <= 200
+        && data.baseAnchorKind in [
+          'BACKUP_BALANCE', 'ORDER_BALANCE', 'ADMIN_CHARGE_BALANCE',
+          'ADMIN_DEDUCT_BALANCE', 'RESTORE_BALANCE', 'CURRENT_BALANCE_NO_RESTORE'
+        ]
+        && data.baseAnchorId is string
+        && data.baseAnchorId.size() > 0
+        && data.baseAnchorId.size() <= 240
+        && data.baseAnchorRevision is string
+        && data.baseAnchorRevision.size() <= 240
+        && data.baseAnchorTimestamp is string
+        && data.baseAnchorTimestamp.size() > 0
+        && data.baseAnchorTimestamp.size() <= 240
+        && data.seedCoupons is int
+        && data.seedCoupons >= -1000000
+        && data.seedCoupons <= 1000000
+        && data.baseCoupons is int
+        && data.baseCoupons >= -1000000
+        && data.baseCoupons <= 1000000
+        && data.beforeCoupons is int
+        && data.beforeCoupons >= -1000000
+        && data.beforeCoupons <= 1000000
+        && data.targetCoupons is int
+        && data.targetCoupons >= -1000000
+        && data.targetCoupons <= 1000000
+        && data.actualDelta is int
+        && data.actualDelta >= -1000000
+        && data.actualDelta <= 1000000
+        && data.finalCoupons is int
+        && data.finalCoupons >= -1000000
+        && data.finalCoupons <= 1000000
+        && data.restoreOrderDeduct is int
+        && data.restoreOrderDeduct >= 0
+        && data.restoreOrderDeduct <= 1000000
+        && data.restoreOrderRefund is int
+        && data.restoreOrderRefund >= 0
+        && data.restoreOrderRefund <= 1000000
+        && data.restoreOrderEditDelta is int
+        && data.restoreOrderEditDelta >= -1000000
+        && data.restoreOrderEditDelta <= 1000000
+        && data.restoreManualCharge is int
+        && data.restoreManualCharge >= 0
+        && data.restoreManualCharge <= 1000000
+        && data.restoreManualDeduct is int
+        && data.restoreManualDeduct >= 0
+        && data.restoreManualDeduct <= 1000000
+        && data.sourceEvidenceCount is int
+        && data.sourceEvidenceCount > 0
+        && data.sourceEvidenceCount <= 100000
+        && data.userEvidenceDigest is string
+        && data.userEvidenceDigest.size() > 0
+        && data.userEvidenceDigest.size() <= 40
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.beforeCoupons + data.actualDelta == data.finalCoupons
+        && data.targetCoupons == data.finalCoupons
+        && data.storageLocation == 'haetsalRestoreAuditRuns'
+        && validRestoreAuditDataGuard(data);
+    }
+
+    function validRestoreAuditLinkageCreate(runId, userKey) {
+      let data = request.resource.data.data;
+      return data.keys().hasAll([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey',
+          'eventRequired', 'generatedRestoreEventId', 'generatedRestoreEventDocId',
+          'restoreLogId', 'restoreOperationId', 'sourceEvidenceCount',
+          'linkageDigest', 'createdAtClient', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey',
+          'eventRequired', 'generatedRestoreEventId', 'generatedRestoreEventDocId',
+          'restoreLogId', 'restoreOperationId', 'sourceEvidenceCount',
+          'linkageDigest', 'createdAtClient', 'storageLocation', '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-user-linkage'
+        && data.schemaGuard == 'R3_RESTORE_USER_LINKAGE_V1'
+        && data.runId == runId
+        && data.restoreBatchId == runId
+        && userKey.matches('[A-Za-z0-9_-]+')
+        && userKey.size() > 0
+        && userKey.size() <= 200
+        && data.userKey == userKey
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.restorePolicyVersion <= 100
+        && data.actorUid == request.auth.uid
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.userId.size() <= 200
+        && data.eventRequired is bool
+        && data.generatedRestoreEventId is string
+        && data.generatedRestoreEventId.size() <= 240
+        && data.generatedRestoreEventDocId is string
+        && data.generatedRestoreEventDocId.size() <= 260
+        && (
+          (data.eventRequired == true
+            && data.generatedRestoreEventId.size() > 0
+            && data.generatedRestoreEventDocId == 'coupon_event_' + data.generatedRestoreEventId)
+          || (data.eventRequired == false
+            && data.generatedRestoreEventId.size() == 0
+            && data.generatedRestoreEventDocId.size() == 0)
+        )
+        && data.restoreLogId is string
+        && data.restoreLogId.size() > 0
+        && data.restoreLogId.size() <= 240
+        && data.restoreOperationId is string
+        && data.restoreOperationId.size() > 0
+        && data.restoreOperationId.size() <= 400
+        && data.sourceEvidenceCount is int
+        && data.sourceEvidenceCount > 0
+        && data.sourceEvidenceCount <= 100000
+        && data.linkageDigest is string
+        && data.linkageDigest.size() > 0
+        && data.linkageDigest.size() <= 40
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.storageLocation == 'haetsalRestoreAuditRuns'
+        && validRestoreAuditDataGuard(data);
+    }
+
+    function validRestoreAuditSourceCreate(runId, sourceDocId) {
+      let data = request.resource.data.data;
+      return data.keys().hasAll([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey', 'sourceDocId',
+          'evidenceType', 'evidenceId', 'sourceUserId', 'sourceKind',
+          'sourceRecordId', 'sourceRevision', 'sourceTimestamp',
+          'normalizedContribution', 'included', 'exclusionReason', 'fallbackKind',
+          'phase', 'evidenceDigest', 'createdAtClient', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'payloadKind', 'schemaGuard', 'runId', 'restoreBatchId',
+          'restorePolicyVersion', 'actorUid', 'userId', 'userKey', 'sourceDocId',
+          'evidenceType', 'evidenceId', 'sourceUserId', 'sourceKind',
+          'sourceRecordId', 'sourceRevision', 'sourceTimestamp',
+          'normalizedContribution', 'included', 'exclusionReason', 'fallbackKind',
+          'phase', 'evidenceDigest', 'createdAtClient', 'storageLocation',
+          '__haetsalDataGuard'
+        ])
+        && data.payloadKind == 'coupon-restore-source'
+        && data.schemaGuard == 'R3_RESTORE_SOURCE_C1_V1'
+        && data.runId == runId
+        && data.restoreBatchId == runId
+        && sourceDocId.matches('[A-Za-z0-9_-]+')
+        && sourceDocId.size() > 0
+        && sourceDocId.size() <= 180
+        && data.sourceDocId == sourceDocId
+        && data.evidenceId == sourceDocId
+        && data.restorePolicyVersion is int
+        && data.restorePolicyVersion >= 1
+        && data.restorePolicyVersion <= 100
+        && data.actorUid == request.auth.uid
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.userId.size() <= 200
+        && data.userKey is string
+        && data.userKey.matches('[A-Za-z0-9_-]+')
+        && data.userKey.size() > 0
+        && data.userKey.size() <= 200
+        && data.evidenceType == 'SOURCE'
+        && data.sourceUserId is string
+        && data.sourceUserId.size() > 0
+        && data.sourceUserId.size() <= 240
+        && data.sourceKind in [
+          'BASE_ANCHOR', 'ORDER_DEDUCT', 'ORDER_REFUND', 'ORDER_EDIT',
+          'ADMIN_CHARGE', 'ADMIN_DEDUCT', 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED'
+        ]
+        && data.sourceRecordId is string
+        && data.sourceRecordId.size() > 0
+        && data.sourceRecordId.size() <= 240
+        && data.sourceRevision is string
+        && data.sourceRevision.size() <= 240
+        && data.sourceTimestamp is string
+        && data.sourceTimestamp.size() > 0
+        && data.sourceTimestamp.size() <= 240
+        && data.normalizedContribution is int
+        && data.normalizedContribution >= -1000000
+        && data.normalizedContribution <= 1000000
+        && data.included is bool
+        && data.exclusionReason is string
+        && data.exclusionReason.size() <= 160
+        && data.fallbackKind in [
+          'BACKUP_BALANCE', 'CURRENT_BALANCE', 'ORDER_COUPON_COST_TOTAL',
+          'ITEM_COUPON_COST_TOTAL', 'ITEM_COUPON_COST_PER_CUP',
+          'ORDER_COUPON_COST_PER_CUP', 'LEGACY_ORDER_QUANTITY', 'COUPON_EVENT',
+          'LEGACY_LOG', 'COUPON_ORDER_EDIT_HISTORY', 'LEGACY_ORDER_EDITED',
+          'ORDER_BALANCE', 'ADMIN_CHARGE_BALANCE', 'ADMIN_DEDUCT_BALANCE',
+          'RESTORE_BALANCE', 'CURRENT_BALANCE_NO_RESTORE'
+        ]
+        && data.phase in ['BASE_ANCHOR', 'BASE_ADJUSTMENT', 'APPLY_RANGE']
+        && (
+          (data.included == true && data.exclusionReason.size() == 0)
+          || (data.included == false && data.exclusionReason.size() > 0)
+        )
+        && (
+          data.sourceKind != 'BASE_ANCHOR'
+          || (data.phase == 'BASE_ANCHOR' && data.included == true && data.exclusionReason.size() == 0)
+        )
+        && (
+          data.sourceKind != 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED'
+          || (data.included == false && data.exclusionReason == 'OFFLINE_EDIT_ADJUSTMENT_EXCLUDED')
+        )
+        && data.evidenceDigest is string
+        && data.evidenceDigest.size() > 0
+        && data.evidenceDigest.size() <= 40
+        && data.createdAtClient is string
+        && data.createdAtClient.size() > 0
+        && data.createdAtClient.size() <= 240
+        && data.storageLocation == 'haetsalRestoreAuditRuns'
+        && validRestoreAuditDataGuard(data);
+    }
+
+    function validCouponRecalcRunCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRecalcRunDocId(docId)
+        && data is map
+        && data.payloadKind == 'coupon-recalc-run'
+        && data.runId is string
+        && data.runId.size() > 0
+        && docId == 'coupon_recalc_run_' + data.runId
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.startDate is string
+        && data.startBalance is int
+        && data.finalBalance is int
+        && data.sourceFingerprint is string
+        && data.algorithmVersion is int
+        && data.status == 'APPLIED'
+        && data.appliedAtClient is string;
+    }
+
+    function validCouponRecalcItemCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRecalcItemDocId(docId)
+        && data is map
+        && data.payloadKind == 'coupon-recalc-item'
+        && data.runId is string
+        && data.runId.size() > 0
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.chunkId is string
+        && data.chunkId.size() > 0
+        && docId == 'coupon_recalc_item_' + data.chunkId
+        && data.chunkIndex is int
+        && data.chunkIndex >= 1
+        && data.items is list
+        && data.algorithmVersion is int
+        && data.appliedAtClient is string;
+    }
+
+    function validCouponRecalcLatestCreate(docId) {
+      let data = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientCreate()
+        && hasPayloadMap()
+        && isCouponRecalcLatestDocId(docId)
+        && data is map
+        && data.payloadKind == 'coupon-recalc-latest'
+        && data.runId is string
+        && data.runId.size() > 0
+        && data.userId is string
+        && data.userId.size() > 0
+        && data.finalBalance is int
+        && data.sourceFingerprint is string
+        && data.algorithmVersion is int
+        && data.appliedAtClient is string
+        && data.chunkDocIds is list;
+    }
+
+    function validCouponRecalcLatestUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isAdmin()
+        && isFreshClientUpdate()
+        && hasPayloadMap()
+        && isCouponRecalcLatestDocId(docId)
+        && before is map
+        && after is map
+        && before.payloadKind == 'coupon-recalc-latest'
+        && after.payloadKind == 'coupon-recalc-latest'
+        && before.userId == after.userId
+        && after.runId is string
+        && after.runId.size() > 0
+        && after.userId is string
+        && after.userId.size() > 0
+        && after.finalBalance is int
+        && after.sourceFingerprint is string
+        && after.algorithmVersion is int
+        && after.appliedAtClient is string
+        && after.chunkDocIds is list;
+    }
+
+    // 기존 Rules의 읽기 허용 범위는 유지합니다.
+    // 보호 대상 컬렉션 외의 기존 쓰기 동작도 그대로 유지합니다.
+    function validOrderEditDiagnosticCreate(docId) {
+      let data = request.resource.data.data;
+      return isFreshClientCreate()
+        && hasPayloadMap()
+        && isOrderEditDiagnosticDocId(docId)
+        && data is map
+        && data.payloadKind == 'order-edit-diagnostic'
+        && data.id is string
+        && data.id.size() > 0
+        && data.docId == docId
+        && data.orderId is string
+        && data.userId is string
+        && data.status is string
+        && data.clientAttemptAt is string;
+    }
+
+    function validOrderEditDiagnosticUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isFreshClientUpdate()
+        && hasPayloadMap()
+        && isOrderEditDiagnosticDocId(docId)
+        && before is map
+        && after is map
+        && before.payloadKind == 'order-edit-diagnostic'
+        && after.payloadKind == 'order-edit-diagnostic'
+        && before.id == after.id
+        && before.docId == after.docId
+        && before.orderId == after.orderId
+        && before.userId == after.userId
+        && after.id is string
+        && after.id.size() > 0
+        && after.docId == docId
+        && after.orderId is string
+        && after.userId is string
+        && after.status is string
+        && after.clientAttemptAt is string;
+    }
+
+    function hasProtectedExternalWriteEnvelope() {
+      return isSignedIn()
+        && request.resource.data.data is map
+        && request.resource.data.clientBuildNumber is int
+        && request.resource.data.clientBuildNumber >= 202607111414
+        && request.resource.data.clientBuildLabel is string
+        && request.resource.data.writeSchemaVersion is int
+        && request.resource.data.writeSchemaVersion >= 5
+        && request.resource.data.clientWriteAt is string
+        && request.resource.data.clientWriteId is string
+        && request.resource.data.clientWriteId.size() > 0
+        && request.resource.data.data.__haetsalDataGuard is map;
+    }
+
+    function isDeliveryRecordStatus(status) {
+      return status is string
+        && (status == 'WAITING' || status == 'STARTED' || status == 'COMPLETED' || status == 'CANCELLED');
+    }
+
+    function validDeliveryRecordData(docId, data) {
+      return data is map
+        && data.keys().hasAll([
+          'version', 'type', 'orderId', 'orderNumber', 'seq', 'userId',
+          'userName', 'userNameDisplay', 'userDept', 'deliveryLocation',
+          'quantity', 'totalQty', 'items', 'memo', 'status', 'createdAt',
+          'orderCreatedAt', 'startedAt', 'completedAt', 'cancelledAt',
+          'startedBy', 'completedBy', 'cancelledBy', 'reason', 'updatedAt',
+          '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'version', 'type', 'orderId', 'orderNumber', 'seq', 'userId',
+          'userName', 'userNameDisplay', 'userDept', 'deliveryLocation',
+          'quantity', 'totalQty', 'items', 'memo', 'status', 'createdAt',
+          'orderCreatedAt', 'startedAt', 'completedAt', 'cancelledAt',
+          'startedBy', 'completedBy', 'cancelledBy', 'reason', 'updatedAt',
+          '__haetsalDataGuard'
+        ])
+        && data.version is int
+        && data.version == 1
+        && data.type == 'ORDER_DELIVERY_RECORD'
+        && data.orderId is string
+        && data.orderId.size() > 0
+        && docId == data.orderId
+        && data.orderNumber is string
+        && (data.seq is int || data.seq is string)
+        && data.userId is string
+        && data.userName is string
+        && data.userNameDisplay is string
+        && data.userDept is string
+        && data.deliveryLocation is string
+        && data.quantity is int
+        && data.quantity >= 0
+        && data.totalQty is int
+        && data.totalQty >= 0
+        && data.items is list
+        && data.memo is string
+        && isDeliveryRecordStatus(data.status)
+        && data.createdAt is string
+        && data.orderCreatedAt is string
+        && data.startedAt is string
+        && data.completedAt is string
+        && data.cancelledAt is string
+        && data.startedBy is string
+        && data.completedBy is string
+        && data.cancelledBy is string
+        && data.reason is string
+        && data.updatedAt is string
+        && data.__haetsalDataGuard is map;
+    }
+
+    function validDeliveryStatusTransition(beforeStatus, afterStatus) {
+      return beforeStatus == afterStatus
+        || (beforeStatus == 'WAITING' && (afterStatus == 'STARTED' || afterStatus == 'COMPLETED' || afterStatus == 'CANCELLED'))
+        || (beforeStatus == 'STARTED' && (afterStatus == 'COMPLETED' || afterStatus == 'CANCELLED'))
+        || (beforeStatus == 'COMPLETED' && (afterStatus == 'WAITING' || afterStatus == 'CANCELLED'))
+        || (beforeStatus == 'CANCELLED' && afterStatus == 'WAITING');
+    }
+
+    function validDeliveryRecordCreate(docId) {
+      return hasProtectedExternalWriteEnvelope()
+        && validDeliveryRecordData(docId, request.resource.data.data)
+        && (isManager() || request.resource.data.data.status == 'WAITING');
+    }
+
+    function validDeliveryOrderEditUpdate(docId, before, after) {
+      let liveDocId = 'live_order_' + after.orderId;
+      let live = getAfter(
+        /databases/$(database)/documents/haetsalCombinedApp/$(liveDocId)
+      ).data.data;
+      return isSignedIn()
+        && hasProtectedExternalWriteEnvelope()
+        && validDeliveryRecordData(docId, after)
+        && before is map
+        && after.reason == 'order-edited-transaction'
+        && before.orderId == after.orderId
+        && before.type == after.type
+        && before.version == after.version
+        && before.userId == after.userId
+        && before.orderNumber == after.orderNumber
+        && before.createdAt == after.createdAt
+        && before.orderCreatedAt == after.orderCreatedAt
+        && live.reason == 'order-edited-transaction'
+        && live.orderId == after.orderId
+        && live.order is map
+        && live.order.userId == after.userId
+        && live.order.orderNumber == after.orderNumber
+        && live.order.items == after.items
+        && live.order.quantity == after.quantity
+        && live.order.quantity == after.totalQty
+        && live.order.memo == after.memo
+        && (
+          (
+            live.order.deliveryType == 'DELIVERY'
+            && live.order.deliveryLocation == after.deliveryLocation
+            && (
+              after.status == before.status
+              || (before.status == 'CANCELLED' && after.status == 'WAITING')
+            )
+          )
+          || (
+            live.order.deliveryType == 'PICKUP'
+            && after.status == 'CANCELLED'
+          )
+        );
+    }
+
+    function validDeliveryRecordUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return (
+          isManager()
+          && hasProtectedExternalWriteEnvelope()
+          && validDeliveryRecordData(docId, after)
+          && before is map
+          && before.orderId == after.orderId
+          && before.type == after.type
+          && before.version == after.version
+          && before.userId == after.userId
+          && before.orderNumber == after.orderNumber
+          && before.createdAt == after.createdAt
+          && before.orderCreatedAt == after.orderCreatedAt
+          && validDeliveryStatusTransition(before.status, after.status)
+        )
+        || validDeliveryOrderEditUpdate(docId, before, after);
+    }
+
+    function isClosedGuardStatus(status) {
+      return status is string
+        && (status == 'PICKUP_DONE' || status == 'DELIVERY_DONE' || status == 'CANCELLED');
+    }
+
+    function validClosedOrderGuardData(docId, data) {
+      return data is map
+        && data.keys().hasAll([
+          'version', 'type', 'id', 'orderId', 'guardId', 'orderNumber',
+          'status', 'deliveryType', 'statusUpdatedAt', 'updatedAt',
+          'processedAt', 'cancelledAt', 'statusTime', 'productionCycle',
+          'statusRevision', 'reason', 'savedAt', 'savedTime', 'expiresAt',
+          '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'version', 'type', 'id', 'orderId', 'guardId', 'orderNumber',
+          'status', 'deliveryType', 'statusUpdatedAt', 'updatedAt',
+          'processedAt', 'cancelledAt', 'statusTime', 'productionCycle',
+          'statusRevision', 'reason', 'savedAt', 'savedTime', 'expiresAt',
+          '__haetsalDataGuard'
+        ])
+        && data.version is int
+        && data.version == 1
+        && data.type == 'ORDER_CLOSED_GUARD'
+        && data.id is string
+        && data.orderId is string
+        && data.orderId.size() > 0
+        && data.id == data.orderId
+        && data.guardId == docId
+        && docId == 'closed_guard_' + data.orderId
+        && data.orderNumber is string
+        && isClosedGuardStatus(data.status)
+        && data.deliveryType is string
+        && data.statusUpdatedAt is string
+        && data.updatedAt is string
+        && data.processedAt is string
+        && data.cancelledAt is string
+        && data.statusTime is int
+        && data.statusTime > 0
+        && data.productionCycle is int
+        && data.productionCycle >= 1
+        && data.statusRevision is int
+        && data.statusRevision >= 1
+        && data.reason is string
+        && data.savedAt is string
+        && data.savedTime is int
+        && data.savedTime > 0
+        && data.expiresAt is int
+        && data.expiresAt >= data.savedTime
+        && data.__haetsalDataGuard is map;
+    }
+
+    function validClosedOrderGuardCreate(docId) {
+      return isManager()
+        && hasProtectedExternalWriteEnvelope()
+        && validClosedOrderGuardData(docId, request.resource.data.data);
+    }
+
+    function validClosedOrderGuardUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isManager()
+        && hasProtectedExternalWriteEnvelope()
+        && validClosedOrderGuardData(docId, after)
+        && before is map
+        && before.id == after.id
+        && before.orderId == after.orderId
+        && before.guardId == after.guardId
+        && before.type == after.type
+        && before.version == after.version
+        && after.statusTime >= before.statusTime
+        && after.productionCycle >= before.productionCycle
+        && after.statusRevision >= before.statusRevision
+        && after.savedTime >= before.savedTime;
+    }
+
+    function validRevivedOrderGuardData(docId, data) {
+      return data is map
+        && data.keys().hasAll([
+          'version', 'type', 'id', 'orderId', 'guardId', 'orderNumber',
+          'userId', 'userName', 'status', 'deliveryType', 'quantity',
+          'businessDate', 'statusUpdatedAt', 'statusTime', 'reason', 'category',
+          'quarantineLive', 'refundRecordId', 'refundCorrectionStatus',
+          'refundCorrectionAmount', 'refundCorrectionOperationId',
+          'refundCorrectionAppliedAt', 'refundCorrectionError', 'savedAt',
+          'savedTime', 'expiresAt', 'orderSnapshot', '__haetsalDataGuard'
+        ])
+        && data.keys().hasOnly([
+          'version', 'type', 'id', 'orderId', 'guardId', 'orderNumber',
+          'userId', 'userName', 'status', 'deliveryType', 'quantity',
+          'businessDate', 'statusUpdatedAt', 'statusTime', 'reason', 'category',
+          'quarantineLive', 'refundRecordId', 'refundCorrectionStatus',
+          'refundCorrectionAmount', 'refundCorrectionOperationId',
+          'refundCorrectionAppliedAt', 'refundCorrectionError', 'savedAt',
+          'savedTime', 'expiresAt', 'orderSnapshot', '__haetsalDataGuard'
+        ])
+        && data.version is int
+        && data.version == 1
+        && data.type == 'ORDER_REVIVED_GUARD'
+        && data.id is string
+        && data.orderId is string
+        && data.orderId.size() > 0
+        && data.id == data.orderId
+        && data.guardId == docId
+        && docId == 'revived_guard_' + data.orderId
+        && data.orderNumber is string
+        && data.userId is string
+        && data.userName is string
+        && data.status is string
+        && data.deliveryType is string
+        && data.quantity is int
+        && data.quantity >= 0
+        && data.businessDate is string
+        && data.statusUpdatedAt is string
+        && data.statusTime is int
+        && data.statusTime > 0
+        && data.reason is string
+        && data.category is string
+        && data.quarantineLive is bool
+        && data.refundRecordId is string
+        && data.refundCorrectionStatus is string
+        && data.refundCorrectionAmount is int
+        && data.refundCorrectionAmount >= 0
+        && data.refundCorrectionOperationId is string
+        && data.refundCorrectionAppliedAt is string
+        && data.refundCorrectionError is string
+        && data.savedAt is string
+        && data.savedTime is int
+        && data.savedTime > 0
+        && data.expiresAt is int
+        && (data.orderSnapshot == null || data.orderSnapshot is map)
+        && data.__haetsalDataGuard is map;
+    }
+
+    function validRevivedOrderGuardCreate(docId) {
+      return isManager()
+        && hasProtectedExternalWriteEnvelope()
+        && validRevivedOrderGuardData(docId, request.resource.data.data);
+    }
+
+    function validRevivedOrderGuardUpdate(docId) {
+      let before = resource.data.data;
+      let after = request.resource.data.data;
+      return isManager()
+        && hasProtectedExternalWriteEnvelope()
+        && validRevivedOrderGuardData(docId, after)
+        && before is map
+        && before.id == after.id
+        && before.orderId == after.orderId
+        && before.guardId == after.guardId
+        && before.type == after.type
+        && before.version == after.version
+        && after.statusTime >= before.statusTime
+        && after.savedTime >= before.savedTime;
+    }
+
+    match /{topCollection}/{document=**} {
+      allow read: if isSignedIn()
+        && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalRestoreAuditRuns'
+        && topCollection != 'haetsalRestoreAudits'
+        && topCollection != 'haetsalUserAccountStatus'
+        && topCollection != 'haetsalUserAccountStatusEvents'
+        && topCollection != 'haetsalMaterialSupport'
+        && topCollection != 'haetsalMaterialSupportSummary'
+        && topCollection != 'haetsalMilkSupportRequests'
+        && topCollection != 'haetsalCouponRecordNotes'
+        && topCollection != 'haetsalOfflineCouponEdits';
+      allow create, update, delete: if isSignedIn()
+        && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalRestoreAuditRuns'
+        && topCollection != 'haetsalRestoreAudits'
+        && topCollection != 'haetsalCompletedOrders'
+        && topCollection != 'haetsalOrderCompletionEvents'
+        && topCollection != 'haetsalOrderCompletionRequests'
+        && topCollection != 'haetsalOrderSequenceCounters'
+        && topCollection != 'haetsalOrderSequenceReservations'
+        && topCollection != 'haetsalOrderArchiveMarks'
+        && topCollection != 'haetsalOrderDeliveryRecords'
+        && topCollection != 'haetsalOrderClosedGuards'
+        && topCollection != 'haetsalOrderRevivedGuards'
+        && topCollection != 'haetsalUserAccountStatus'
+        && topCollection != 'haetsalUserAccountStatusEvents'
+        && topCollection != 'haetsalMaterialSupport'
+        && topCollection != 'haetsalMaterialSupportSummary'
+        && topCollection != 'haetsalMilkSupportRequests'
+        && topCollection != 'haetsalCouponRecordNotes'
+        && topCollection != 'haetsalOfflineCouponEdits';
+    }
+
+    match /haetsalOfflineCouponEdits/{docId} {
+      allow read: if isAdmin();
+      allow create: if
+        (isOfflineCouponEditCurrentDocId(docId) && validOfflineCouponEditCurrentCreate(docId))
+        || (isOfflineCouponEditAuditDocId(docId) && validOfflineCouponEditAuditCreate(docId));
+      allow update: if isOfflineCouponEditCurrentDocId(docId)
+        && validOfflineCouponEditCurrentUpdate(docId);
+      allow delete: if false;
+    }
+
+    match /haetsalOrderDeliveryRecords/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validDeliveryRecordCreate(docId);
+      allow update: if validDeliveryRecordUpdate(docId);
+      allow delete: if false;
+    }
+
+    match /haetsalOrderClosedGuards/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validClosedOrderGuardCreate(docId);
+      allow update: if validClosedOrderGuardUpdate(docId);
+      allow delete: if false;
+    }
+
+    match /haetsalOrderRevivedGuards/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validRevivedOrderGuardCreate(docId);
+      allow update: if validRevivedOrderGuardUpdate(docId);
+      allow delete: if false;
+    }
+
+    match /haetsalRestoreAuditRuns/{runId} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin()
+        && validRestoreAuditOuterEnvelope()
+        && validRestoreAuditRunCreate(runId);
+      allow update, delete: if false;
+
+      match /userCore/{userKey} {
+        allow get, list: if isAdmin();
+        allow create: if isAdmin()
+          && validRestoreAuditOuterEnvelope()
+          && validRestoreAuditCoreCreate(runId, userKey);
+        allow update, delete: if false;
+      }
+
+      match /userLinkage/{userKey} {
+        allow get, list: if isAdmin();
+        allow create: if isAdmin()
+          && validRestoreAuditOuterEnvelope()
+          && validRestoreAuditLinkageCreate(runId, userKey);
+        allow update, delete: if false;
+      }
+
+      match /sources/{sourceDocId} {
+        allow get, list: if isAdmin();
+        allow create: if isAdmin()
+          && validRestoreAuditOuterEnvelope()
+          && validRestoreAuditSourceCreate(runId, sourceDocId);
+        allow update, delete: if false;
+      }
+    }
+
+    match /haetsalRestoreAudits/{document=**} {
+      allow read, create, update, delete: if false;
+    }
+
+    // 앱 실행 정책은 앱에서 읽기만 허용합니다.
+    // 생성·수정·삭제는 Firebase 콘솔에서만 합니다.
+    match /haetsalCombinedApp/app_runtime_policy {
+      allow read: if isSignedIn();
+      allow create, update, delete: if false;
+    }
+
+    // 사용자정보, 주문, 쿠폰, 텀블러, 안전 백업, 제작대기 큐,
+    // 월별 보관 문서 등이 저장되는 주 컬렉션입니다.
+    match /haetsalCombinedApp/{docId} {
+      allow get: if isSignedIn()
+        && (!isOfflineCouponEditDocId(docId) || isAdmin())
+        && (!isCouponRestoreAuditDocId(docId) || isAdmin())
+        && (!isCouponRecalcDocId(docId) || isAdmin());
+      allow list: if isAdmin()
+        || (
+          isManager()
+          && request.query.limit <= 300
+          && resource.data.data is map
+          && resource.data.data.isOpen == true
+        )
+        || (
+          isSignedIn()
+          && request.query.limit <= 250
+          && resource.data.data is map
+          && resource.data.data.payloadKind == 'coupon-event'
+        );
+      allow create: if docId != 'app_runtime_policy'
+        && hasCouponBalanceGuardSchema(docId)
+        && (
+          (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthCreate(docId))
+          || (isCouponEventDocId(docId) && validCouponEventCreate(docId))
+          || (isOfflineCouponUseDocId(docId) && validOfflineCouponUseCreate(docId))
+          || (isCouponRecordResolutionDocId(docId) && validCouponRecordResolutionCreate(docId))
+          || (isCouponRecalcRunDocId(docId) && validCouponRecalcRunCreate(docId))
+          || (isCouponRecalcItemDocId(docId) && validCouponRecalcItemCreate(docId))
+          || (isCouponRecalcLatestDocId(docId) && validCouponRecalcLatestCreate(docId))
+          || (isOrderEditDiagnosticDocId(docId) && validOrderEditDiagnosticCreate(docId))
+          || (
+            !isSharedPeopleAuthDocId(docId)
+            && !isCouponLedgerDocId(docId)
+            && !isCouponRestoreAuditDocId(docId)
+            && !isCouponRecalcDocId(docId)
+            && !isOrderEditDiagnosticDocId(docId)
+            && !isLiveOrderDocId(docId)
+            && isFreshClientCreate()
+          )
+          || (
+            !isCouponLedgerDocId(docId)
+            && !isCouponRecalcDocId(docId)
+            && isLiveOrderDocId(docId)
+            && validLiveOrderCreate(docId)
+          )
+        );
+      allow update: if docId != 'app_runtime_policy'
+        && hasCouponBalanceGuardSchema(docId)
+        && (
+          (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthUpdate(docId))
+          || (isCouponRecalcLatestDocId(docId) && validCouponRecalcLatestUpdate(docId))
+          || (isOrderEditDiagnosticDocId(docId) && validOrderEditDiagnosticUpdate(docId))
+          || (
+            !isSharedPeopleAuthDocId(docId)
+            && !isCouponLedgerDocId(docId)
+            && !isCouponRestoreAuditDocId(docId)
+            && !isCouponRecalcDocId(docId)
+            && !isOrderEditDiagnosticDocId(docId)
+            && (
+              (!isLiveOrderDocId(docId) && isFreshClientUpdate())
+              || (isLiveOrderDocId(docId) && validLiveOrderUpdate(docId))
+            )
+          )
+        );
+
+      // 제작완료 원장, 쿠폰 원장, 재계산 원장 및 공식 접수번호와 연결되는 실시간 주문 문서는 앱에서 삭제할 수 없습니다.
+      allow delete: if isSignedIn()
+        && docId != 'app_runtime_policy'
+        && !isSharedPeopleAuthDocId(docId)
+        && !isLiveOrderDocId(docId)
+        && !isCouponLedgerDocId(docId)
+        && !isCouponRestoreAuditDocId(docId)
+        && !isCouponRecalcDocId(docId);
+    }
+
+    // 완료 주문 개별 보관 문서
+    match /haetsalCompletedOrders/{docId} {
+      allow read: if isSignedIn();
+      allow create: if isFreshClientCreate();
+      allow update: if isFreshClientUpdate();
+      allow delete: if false;
+    }
+
+    // 제작완료 중복 방지 및 완료 확정 이벤트 문서
+    match /haetsalOrderCompletionEvents/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validCompletionEventCreate(docId);
+      allow update, delete: if false;
+    }
+
+    // 제작완료 요청 원장 문서
+    match /haetsalOrderCompletionRequests/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validCompletionRequestCreate(docId);
+      allow update: if validCompletionRequestUpdate(docId);
+      allow delete: if false;
+    }
+
+    // 날짜별 마지막 접수번호 카운터
+    match /haetsalOrderSequenceCounters/{dateKey} {
+      allow read: if isSignedIn();
+      allow create: if validSequenceCounterCreate(dateKey);
+      allow update: if validSequenceCounterUpdate(dateKey);
+      allow delete: if false;
+    }
+
+    // 주문별 공식 접수번호 배정 원장
+    match /haetsalOrderSequenceReservations/{docId} {
+      allow read: if isSignedIn();
+      allow create: if validSequenceReservationCreate(docId);
+      allow update, delete: if false;
+    }
+
+    // 주문 보관/정리 완료 마커 문서
+    match /haetsalOrderArchiveMarks/{docId} {
+      allow read: if isSignedIn();
+      allow create: if isFreshClientCreate();
+      allow update: if isFreshClientUpdate();
+      allow delete: if isSignedIn();
+    }
+
+    // 관리자 전용 사용자 이용 상태 현재값
+    match /haetsalUserAccountStatus/{userId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin()
+        && request.resource.data.userId == userId
+        && request.resource.data.status is string
+        && (request.resource.data.status == 'ACTIVE'
+          || request.resource.data.status == 'SUSPENDED'
+          || request.resource.data.status == 'DELETED')
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0;
+      allow delete: if false;
+    }
+
+    // 사용자 상태 변경 이력은 생성 후 변경하거나 삭제하지 않습니다.
+    match /haetsalUserAccountStatusEvents/{eventId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.eventId == eventId
+        && request.resource.data.userId is string
+        && request.resource.data.userId.size() > 0
+        && request.resource.data.status is string
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0;
+      allow update, delete: if false;
+    }
+
+    // 재료비 후원 상세 기록은 생성 후 변경하거나 삭제하지 않습니다.
+    match /haetsalMaterialSupport/{recordId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.recordId == recordId
+        && request.resource.data.userId is string
+        && request.resource.data.userId.size() > 0
+        && request.resource.data.supportDate is string
+        && request.resource.data.amountWon is int
+        && request.resource.data.amountWon >= 0
+        && request.resource.data.couponQuantity is int
+        && request.resource.data.couponQuantity >= 0;
+      allow update, delete: if false;
+    }
+
+    // 재료비 후원 횟수·금액·쿠폰 수량 요약
+    match /haetsalMaterialSupportSummary/{userId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin()
+        && request.resource.data.userId == userId
+        && request.resource.data.supportState is string
+        && (request.resource.data.supportState == 'RECORDED'
+          || request.resource.data.supportState == 'NO_SUPPORT_CONFIRMED'
+          || request.resource.data.supportState == 'REVIEW_REQUIRED')
+        && request.resource.data.supportCount is int
+        && request.resource.data.supportCount >= 0
+        && request.resource.data.totalAmountWon is int
+        && request.resource.data.totalAmountWon >= 0
+        && request.resource.data.totalCouponQuantity is int
+        && request.resource.data.totalCouponQuantity >= 0;
+      allow delete: if false;
+    }
+
+    // 우유 후원 신청: 사용자는 신청만 하고, 매니저 검토 후 관리자만 쿠폰을 지급합니다.
+    match /haetsalMilkSupportRequests/{requestId} {
+      allow get: if isManager();
+      allow list: if isManager()
+        && request.query.limit <= 30
+        && (
+          (isAdmin() && resource.data.status == 'PAYMENT_PENDING')
+          || resource.data.status == 'SUBMITTED'
+          || resource.data.status == 'RETURNED_TO_MANAGER'
+        );
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          'requestId','status','userId','userName','userDept','itemCount','itemIds',
+          'requestedTotal','approvedTotal','unitVolumeMl','createdByUid','createdAtClient','serverCreatedAt'
+        ])
+        && request.resource.data.requestId == requestId
+        && request.resource.data.status == 'SUBMITTED'
+        && request.resource.data.userId is string
+        && request.resource.data.userId.size() > 0
+        && request.resource.data.userName is string
+        && request.resource.data.userDept is string
+        && request.resource.data.itemCount is int
+        && request.resource.data.itemCount >= 1
+        && request.resource.data.itemCount <= 10
+        && request.resource.data.itemIds is list
+        && request.resource.data.itemIds.size() == request.resource.data.itemCount
+        && request.resource.data.requestedTotal is int
+        && request.resource.data.requestedTotal >= 1
+        && request.resource.data.approvedTotal == 0
+        && request.resource.data.unitVolumeMl == 200
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.createdAtClient is string;
+      allow update: if (
+          isManager()
+          && (resource.data.status == 'SUBMITTED' || resource.data.status == 'RETURNED_TO_MANAGER')
+          && (request.resource.data.status == 'PAYMENT_PENDING' || request.resource.data.status == 'REJECTED')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status','receivedDate','approvedTotal','managerReviewNote','managerReviewedByUid',
+            'managerReviewedAtClient','serverManagerReviewedAt'
+          ])
+          && request.resource.data.receivedDate is string
+          && request.resource.data.receivedDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.approvedTotal is int
+          && request.resource.data.approvedTotal >= 0
+          && ((request.resource.data.status == 'PAYMENT_PENDING' && request.resource.data.approvedTotal > 0)
+            || (request.resource.data.status == 'REJECTED' && request.resource.data.approvedTotal == 0))
+          && request.resource.data.managerReviewedByUid == request.auth.uid
+        )
+        || (
+          isAdmin()
+          && resource.data.status == 'PAYMENT_PENDING'
+          && request.resource.data.status == 'RETURNED_TO_MANAGER'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status','adminReturnReason','adminReturnedByUid','adminReturnedAtClient','serverAdminReturnedAt'
+          ])
+          && request.resource.data.adminReturnReason is string
+          && request.resource.data.adminReturnReason.size() > 0
+          && request.resource.data.adminReturnedByUid == request.auth.uid
+        )
+        || (
+          isAdmin()
+          && resource.data.status == 'PAYMENT_PENDING'
+          && request.resource.data.status == 'PAID'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status','paidCouponQuantity','paymentOperationId','paidByUid','paidAtClient','serverPaidAt'
+          ])
+          && request.resource.data.paidCouponQuantity == resource.data.approvedTotal
+          && request.resource.data.paidCouponQuantity is int
+          && request.resource.data.paidCouponQuantity > 0
+          && request.resource.data.paymentOperationId == 'milk-support-payment:' + requestId
+          && request.resource.data.paidByUid == request.auth.uid
+        )
+        || (
+          isAdmin()
+          && resource.data.status == 'SUBMITTED'
+          && request.resource.data.status == 'VOIDED'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && !exists(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate)
+          && existsAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate)
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.keys().hasOnly([
+            'eventId','requestId','type','fromStatus','toStatus','reason','actorUid','createdAtClient','serverCreatedAt'
+          ])
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.eventId == 'admin_void_duplicate'
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.requestId == requestId
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.type == 'VOIDED_AS_DUPLICATE'
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.fromStatus == 'SUBMITTED'
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.toStatus == 'VOIDED'
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.reason == 'DUPLICATE'
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.actorUid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.createdAtClient is string
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)/events/admin_void_duplicate).data.serverCreatedAt == request.time
+        );
+      allow delete: if false;
+
+      match /items/{itemId} {
+        allow get: if isManager();
+        allow list: if isManager() && request.query.limit <= 10;
+        allow create: if isSignedIn()
+          && request.resource.data.keys().hasOnly([
+            'itemId','requestId','index','expiryDate','quantity','unitVolumeMl','createdByUid','createdAtClient'
+          ])
+          && request.resource.data.itemId == itemId
+          && request.resource.data.requestId == requestId
+          && request.resource.data.index is int
+          && request.resource.data.index >= 0
+          && request.resource.data.index < 10
+          && request.resource.data.expiryDate is string
+          && request.resource.data.expiryDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.quantity is int
+          && request.resource.data.quantity >= 1
+          && request.resource.data.unitVolumeMl == 200
+          && request.resource.data.createdByUid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.createdByUid == request.auth.uid;
+        allow update: if isManager()
+          && (get(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'SUBMITTED'
+            || get(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'RETURNED_TO_MANAGER')
+          && (getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'PAYMENT_PENDING'
+            || getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'REJECTED')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'verifiedExpiryDate','verifiedQuantity','approvedQuantity','managerDecision','eligibilityStatus','eligibilityReason',
+            'operatingDays','managerReviewedByUid','managerReviewedAtClient','serverManagerReviewedAt'
+          ])
+          && request.resource.data.verifiedExpiryDate is string
+          && request.resource.data.verifiedExpiryDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.verifiedQuantity is int
+          && request.resource.data.verifiedQuantity >= 1
+          && request.resource.data.approvedQuantity is int
+          && request.resource.data.approvedQuantity >= 0
+          && request.resource.data.approvedQuantity <= request.resource.data.verifiedQuantity
+          && (request.resource.data.managerDecision == 'APPROVED' || request.resource.data.managerDecision == 'REJECTED')
+          && ((request.resource.data.managerDecision == 'APPROVED' && request.resource.data.approvedQuantity > 0)
+            || (request.resource.data.managerDecision == 'REJECTED' && request.resource.data.approvedQuantity == 0))
+          && (request.resource.data.eligibilityStatus == '지급 기준 충족'
+            || request.resource.data.eligibilityStatus == '추가 검토 필요'
+            || request.resource.data.eligibilityStatus == '지급 기준 미충족')
+          && ((request.resource.data.approvedQuantity > 0 && request.resource.data.eligibilityStatus == '지급 기준 충족')
+            || (request.resource.data.approvedQuantity == 0 && request.resource.data.eligibilityStatus != '지급 기준 충족'))
+          && request.resource.data.eligibilityReason is string
+          && request.resource.data.operatingDays is int
+          && request.resource.data.operatingDays >= 0
+          && request.resource.data.managerReviewedByUid == request.auth.uid;
+        allow delete: if false;
+      }
+
+      match /events/{eventId} {
+        allow get: if isManager();
+        allow list: if isManager() && request.query.limit <= 30;
+        allow create: if request.resource.data.eventId == eventId
+          && request.resource.data.requestId == requestId
+          && request.resource.data.actorUid == request.auth.uid
+          && (
+            (request.resource.data.type == 'SUBMITTED'
+              && eventId == 'submitted'
+              && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.createdByUid == request.auth.uid)
+            || (isManager() && request.resource.data.type == 'MANAGER_REVIEWED')
+            || (isAdmin() && request.resource.data.type == 'RETURNED_TO_MANAGER')
+            || (isAdmin() && request.resource.data.type == 'PAID' && eventId == 'admin_payment')
+            || (isAdmin()
+              && request.resource.data.type == 'VOIDED_AS_DUPLICATE'
+              && eventId == 'admin_void_duplicate'
+              && request.resource.data.keys().hasOnly([
+                'eventId','requestId','type','fromStatus','toStatus','reason','actorUid','createdAtClient','serverCreatedAt'
+              ])
+              && request.resource.data.fromStatus == 'SUBMITTED'
+              && request.resource.data.toStatus == 'VOIDED'
+              && request.resource.data.reason == 'DUPLICATE'
+              && request.resource.data.createdAtClient is string
+              && request.resource.data.serverCreatedAt == request.time
+              && get(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'SUBMITTED'
+              && getAfter(/databases/$(database)/documents/haetsalMilkSupportRequests/$(requestId)).data.status == 'VOIDED')
+          );
+        allow update, delete: if false;
+      }
+    }
+
+    // 쿠폰 원본 기록을 보존하면서 붙이는 관리자 메모
+    match /haetsalCouponRecordNotes/{noteId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.noteId == noteId
+        && request.resource.data.userId is string
+        && request.resource.data.userId.size() > 0
+        && request.resource.data.originalRecordKey is string
+        && request.resource.data.originalRecordKey.size() > 0
+        && request.resource.data.memo is string
+        && request.resource.data.memo.size() > 0;
+      allow update, delete: if false;
+    }
+  }
+}
+
+
