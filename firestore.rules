@@ -124,6 +124,23 @@ service cloud.firestore {
       return request.resource.data.data is map;
     }
 
+    function hasNoLegacyOperatorCredentialFields(docId) {
+      let forbidden = ['managerPw', 'adminPw', 'managerPwUpdatedAt', 'adminPwUpdatedAt'];
+      return !(docId == 'shared_people_auth' || docId == 'order_data' || docId == 'tumbler_data')
+        || (request.resource.data.data is map
+          && ((docId == 'shared_people_auth'
+              && request.resource.data.data.auth is map
+              && !request.resource.data.data.auth.keys().hasAny(forbidden))
+            || (docId == 'order_data'
+              && (!request.resource.data.data.keys().hasAny(['sysSettings'])
+                || (request.resource.data.data.sysSettings is map
+                  && !request.resource.data.data.sysSettings.keys().hasAny(forbidden))))
+            || (docId == 'tumbler_data'
+              && (!request.resource.data.data.keys().hasAny(['settings'])
+                || (request.resource.data.data.settings is map
+                  && !request.resource.data.data.settings.keys().hasAny(forbidden))))));
+    }
+
     // v6 adds credential profile markers; Rules cannot inspect every map in users.
     function hasOrderUserCredentialSchema(docId) {
       return !(isSharedPeopleAuthDocId(docId) || docId == 'order_data')
@@ -2587,6 +2604,7 @@ service cloud.firestore {
           && resource.data.data.payloadKind == 'coupon-event'
         );
       allow create: if docId != 'app_runtime_policy'
+        && hasNoLegacyOperatorCredentialFields(docId)
         && hasOrderUserCredentialSchema(docId)
         && hasCouponBalanceGuardSchema(docId)
         && (
@@ -2615,6 +2633,7 @@ service cloud.firestore {
           )
         );
       allow update: if docId != 'app_runtime_policy'
+        && hasNoLegacyOperatorCredentialFields(docId)
         && hasOrderUserCredentialSchema(docId)
         && hasCouponBalanceGuardSchema(docId)
         && (

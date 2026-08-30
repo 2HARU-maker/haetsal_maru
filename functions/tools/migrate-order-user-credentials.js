@@ -4,19 +4,22 @@
 // Passwords and verifier material never appear in CLI output or migration audit.
 // Every mode requires --project and --run-id. Emulator modes additionally require
 // FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 and FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099.
-// Apply/verify require all four expected-* values returned by the dry-run/preflight.
+// Apply/verify require all five expected-* values returned by the dry-run/preflight.
 // verify additionally requires --emulator, or --production --verify plus approval.
 // Production preflight requires --preflight --acknowledge-production-read and approval.
 // Keep business writes frozen through verification: reruns reject any document
 // changed after the atomic APPLIED commit. No plaintext-restoring rollback exists.
 const { createHash, randomBytes, scrypt, timingSafeEqual } = require("node:crypto");
 const PARAMETERS = Object.freeze({ N:32768, r:8, p:1, keyLength:32, maxmem:64 * 1024 * 1024 });
-const BUILD = 202608310436;
+const BUILD = 202608310648;
 const MAX_USERS = 10000;
-const SOURCE_PATHS = ["haetsalCombinedApp/shared_people_auth", "haetsalCombinedApp/order_data"];
+const SOURCE_PATHS = ["haetsalCombinedApp/shared_people_auth", "haetsalCombinedApp/order_data", "haetsalCombinedApp/tumbler_data"];
+const LEGACY_OPERATOR_FIELDS = Object.freeze(["managerPw","adminPw","managerPwUpdatedAt","adminPwUpdatedAt"]);
+const LEGACY_OPERATOR_SOURCE_FIELDS = ["auth","sysSettings","settings"];
 const VERIFIERS = "haetsalUserCredentialVerifiers";
 const AUDITS = "haetsalCredentialMigrationRuns";
 const AUDIT_FIELDS = ["runId","migrationType","status","sourceSharedUpdateTime","sourceOrderUpdateTime",
+  "sourceTumblerUpdateTime","legacyOperatorCredentialSchemaVersion","legacyOperatorFieldRemovalCount",
   "sourceFingerprint","protectedUserCount","unprotectedUserCount","sharedUserCount","orderUserCount",
   "verifierWriteCount","credentialSchemaVersion","appBuildNumber","writeSchemaVersion","createdAt","completedAt"];
 
@@ -42,7 +45,7 @@ function parseArguments(argv, env) {
   if(!["emulator-dry-run","emulator-apply","production-preflight","production-apply","verify"].includes(mode)) fail("INVALID_MODE");
   const flags = new Set(["apply","emulator","production","preflight","acknowledge-production-read","verify"]);
   const values = new Set(["project","run-id","expected-shared-update-time","expected-order-update-time",
-    "expected-source-fingerprint","expected-protected-count"]);
+    "expected-tumbler-update-time","expected-source-fingerprint","expected-protected-count"]);
   const args = { mode };
   for(let i=1;i<argv.length;i++){
     const key = argv[i].startsWith("--") ? argv[i].slice(2) : "";
@@ -92,10 +95,11 @@ function parseArguments(argv, env) {
   if(applying || mode === "verify"){
     if(!/^[a-f0-9]{64}$/.test(args["expected-source-fingerprint"] || "")) fail("FINGERPRINT_GUARD");
     if(!/^\d+:\d{9}$/.test(args["expected-shared-update-time"] || "") ||
-       !/^\d+:\d{9}$/.test(args["expected-order-update-time"] || "")) fail("UPDATE_TIME_GUARD");
+       !/^\d+:\d{9}$/.test(args["expected-order-update-time"] || "") ||
+       !/^\d+:\d{9}$/.test(args["expected-tumbler-update-time"] || "")) fail("UPDATE_TIME_GUARD");
     if(!/^(0|[1-9]\d*)$/.test(args["expected-protected-count"] || "")) fail("PROTECTED_COUNT_GUARD");
     args.expectedCount = Number(args["expected-protected-count"]);
-    if(!Number.isSafeInteger(args.expectedCount) || args.expectedCount + 3 >= 450) fail("WRITE_LIMIT");
+    if(!Number.isSafeInteger(args.expectedCount) || args.expectedCount + 4 >= 450) fail("WRITE_LIMIT");
   }
   args.isEmulator = emulator;
   args.applying = applying;
@@ -156,9 +160,47 @@ function sanitizedProfile(source, protectedValue) {
   result.passwordProtected = protectedValue;
   return result;
 }
+
+function sanitizeLegacyOperatorMap(source) {
+  const result={};
+  for(const key of Object.keys(source)){
+    if(!LEGACY_OPERATOR_FIELDS.includes(key)){
+      Object.defineProperty(result,key,{value:source[key],enumerable:true,writable:true,configurable:true});
+    }
+  }
+  return result;
+}
+function inspectLegacyOperatorSources(docs) {
+  if(docs.length!==3) fail("SOURCE_DOCUMENT_MISSING");
+  const counts=[0,0,0];
+  let unexpected=0;
+  docs.forEach((doc,index)=>{
+    if(!plain(doc) || !plain(doc.data)) fail("SOURCE_DATA_MAP_MISSING");
+    const target=LEGACY_OPERATOR_SOURCE_FIELDS[index];
+    if(own(doc.data,target) && !plain(doc.data[target])) fail("INVALID_LEGACY_OPERATOR_MAP");
+    checkSize(doc);
+    function scan(value,parts) {
+      if(Array.isArray(value)){value.forEach((item,i)=>scan(item,[...parts,String(i)]));return;}
+      if(!plain(value)) return;
+      for(const key of Object.keys(value)){
+        if(LEGACY_OPERATOR_FIELDS.includes(key)){
+          if(parts.length===2 && parts[0]==="data" && parts[1]===target) counts[index]++;
+          else unexpected++;
+        }
+        scan(value[key],[...parts,key]);
+      }
+    }
+    scan(doc,[]);
+  });
+  if(unexpected) fail("UNEXPECTED_LEGACY_OPERATOR_FIELD_LOCATION",unexpected);
+  return {legacyOperatorFieldCounts:{sharedAuth:counts[0],orderSettings:counts[1],tumblerSettings:counts[2]},
+    legacyOperatorFieldRemovalCount:counts.reduce((a,b)=>a+b,0)};
+}
+
 function inspectSources(snapshots) {
-  if(snapshots.some(snapshot=>!snapshot.exists)) fail("SOURCE_DOCUMENT_MISSING");
+  if(snapshots.length !== 3 || snapshots.some(snapshot=>!snapshot.exists)) fail("SOURCE_DOCUMENT_MISSING");
   const docs=snapshots.map(snapshot=>snapshot.data());
+  const legacy=inspectLegacyOperatorSources(docs);
   const shared=validateUsers(docs[0]),order=validateUsers(docs[1]);
   let mismatches=0;
   for(const [id,user] of order){
@@ -167,37 +209,43 @@ function inspectSources(snapshots) {
   }
   if(mismatches) fail("SOURCE_PASSWORD_MISMATCH",mismatches);
   const protectedUsers=[...shared.values()].filter(user=>own(user,"password") && user.password !== "");
-  if(protectedUsers.length + 3 >= 450) fail("WRITE_LIMIT");
+  // protected + three source documents + audit must stay below 450: maximum 445.
+  if(protectedUsers.length + 4 >= 450) fail("WRITE_LIMIT");
   const protectedIds=new Set(protectedUsers.map(user=>user.id));
-  const sanitized=docs.map((doc,index)=>({
-    ...doc,
-    data:{
-      ...doc.data,
-      users:[...(index === 0 ? shared : order).values()].map(user=>sanitizedProfile(user,protectedIds.has(user.id))),
-      orderUserCredentialSchemaVersion:1
+  const sanitized=docs.map((doc,index)=>{
+    const data={...doc.data};
+    if(index < 2){
+      data.users=[...(index === 0 ? shared : order).values()].map(user=>sanitizedProfile(user,protectedIds.has(user.id)));
+      data.orderUserCredentialSchemaVersion=1;
     }
-  }));
+    const field=LEGACY_OPERATOR_SOURCE_FIELDS[index];
+    if(own(data,field)) data[field]=sanitizeLegacyOperatorMap(data[field]);
+    return {...doc,data};
+  });
   const sizes=sanitized.map(checkSize);
   if(sizes.reduce((a,b)=>a+b,0) + protectedUsers.length * 2048 > 8 * 1024 * 1024) fail("TRANSACTION_SIZE_LIMIT");
   return {
-    docs,sanitized,protectedUsers,
+    docs,sanitized,protectedUsers,...legacy,
     sharedUserCount:shared.size,orderUserCount:order.size,
     protectedUserCount:protectedUsers.length,unprotectedUserCount:shared.size-protectedUsers.length,
     sourceSharedUpdateTime:updateTime(snapshots[0]),sourceOrderUpdateTime:updateTime(snapshots[1]),
-    sourceFingerprint:fingerprint(docs)
+    sourceTumblerUpdateTime:updateTime(snapshots[2]),sourceFingerprint:fingerprint(docs)
   };
 }
 function matchExpected(info,args) {
   if(info.sourceSharedUpdateTime !== args["expected-shared-update-time"] ||
-     info.sourceOrderUpdateTime !== args["expected-order-update-time"]) fail("SOURCE_UPDATE_TIME_CHANGED");
+     info.sourceOrderUpdateTime !== args["expected-order-update-time"] ||
+     info.sourceTumblerUpdateTime !== args["expected-tumbler-update-time"]) fail("SOURCE_UPDATE_TIME_CHANGED");
   if(info.sourceFingerprint !== args["expected-source-fingerprint"]) fail("SOURCE_FINGERPRINT_CHANGED");
   if(info.protectedUserCount !== args.expectedCount) fail("PROTECTED_COUNT_CHANGED");
 }
 function summary(info,status,writeCount=0) {
   return {status,sourceSharedUpdateTime:info.sourceSharedUpdateTime,sourceOrderUpdateTime:info.sourceOrderUpdateTime,
-    sourceFingerprint:info.sourceFingerprint,protectedUserCount:info.protectedUserCount,
-    unprotectedUserCount:info.unprotectedUserCount,sharedUserCount:info.sharedUserCount,
-    orderUserCount:info.orderUserCount,expectedWriteCount:info.protectedUserCount+3,writeCount};
+    sourceTumblerUpdateTime:info.sourceTumblerUpdateTime,sourceFingerprint:info.sourceFingerprint,
+    legacyOperatorCredentialSchemaVersion:1,legacyOperatorFieldRemovalCount:info.legacyOperatorFieldRemovalCount,
+    legacyOperatorFieldCounts:info.legacyOperatorFieldCounts,unexpectedLegacyOperatorFieldCount:0,
+    protectedUserCount:info.protectedUserCount,unprotectedUserCount:info.unprotectedUserCount,sharedUserCount:info.sharedUserCount,
+    orderUserCount:info.orderUserCount,expectedWriteCount:info.protectedUserCount+4,writeCount};
 }
 function fixedBase64(value,size) {
   if(typeof value !== "string" || value.length !== 4 * Math.ceil(size/3)) return false;
@@ -227,26 +275,37 @@ async function prepareVerifiers(users) {
 function validateAudit(snapshot,args) {
   const audit=snapshot.data();
   if(!snapshot.exists || !plain(audit) || Object.keys(audit).sort().join(",")!==AUDIT_FIELDS.slice().sort().join(",") ||
-     audit.runId!==args["run-id"] || audit.status!=="APPLIED" || audit.migrationType!=="ORDER_USER_CREDENTIAL_CUTOVER" ||
-     audit.credentialSchemaVersion!==1 || audit.appBuildNumber!==BUILD || audit.writeSchemaVersion!==6) fail("INVALID_APPLIED_AUDIT");
+     audit.runId!==args["run-id"] || audit.status!=="APPLIED" || audit.migrationType!=="ORDER_USER_AND_LEGACY_OPERATOR_CREDENTIAL_CUTOVER" ||
+     audit.credentialSchemaVersion!==1 || audit.appBuildNumber!==BUILD || audit.writeSchemaVersion!==6 ||
+     audit.legacyOperatorCredentialSchemaVersion!==1 || !Number.isInteger(audit.legacyOperatorFieldRemovalCount) ||
+     audit.legacyOperatorFieldRemovalCount<0 || audit.legacyOperatorFieldRemovalCount>12) fail("INVALID_APPLIED_AUDIT");
   if(audit.sourceFingerprint!==args["expected-source-fingerprint"] ||
      audit.sourceSharedUpdateTime!==args["expected-shared-update-time"] ||
      audit.sourceOrderUpdateTime!==args["expected-order-update-time"] ||
+     audit.sourceTumblerUpdateTime!==args["expected-tumbler-update-time"] ||
      audit.protectedUserCount!==args.expectedCount) fail("RUN_ID_SOURCE_CONFLICT");
   return audit;
 }
 async function verifyApplied(db,args,prepared) {
   const sources=SOURCE_PATHS.map(p=>db.doc(p)),auditRef=db.collection(AUDITS).doc(args["run-id"]);
   return db.runTransaction(async transaction=>{
-    const [sharedSnap,orderSnap,auditSnap]=await transaction.getAll(...sources,auditRef);
+    const [sharedSnap,orderSnap,tumblerSnap,auditSnap]=await transaction.getAll(...sources,auditRef);
     const audit=validateAudit(auditSnap,args);
     const rows=await transaction.get(db.collection(VERIFIERS).limit(MAX_USERS+1));
-    const docs=[sharedSnap,orderSnap].map(s=>s.data());
-    const maps=docs.map(validateUsers);
+    const sourceSnaps=[sharedSnap,orderSnap,tumblerSnap];
+    if(sourceSnaps.some(s=>!s.exists)) fail("SOURCE_DOCUMENT_MISSING");
+    const docs=sourceSnaps.map(s=>s.data());
+    const legacy=inspectLegacyOperatorSources(docs);
+    if(legacy.legacyOperatorFieldRemovalCount!==0) fail("APPLIED_LEGACY_OPERATOR_CREDENTIAL");
+    const maps=docs.slice(0,2).map(validateUsers);
     const commitTime=updateTime(auditSnap);
-    if([sharedSnap,orderSnap,...rows.docs].some(s=>updateTime(s)!==commitTime)) fail("APPLIED_STATE_CHANGED");
+    // A byte-identical source set can keep its original updateTime (notably tumbler).
+    // Accept only the atomic commit time or that exact guarded original version.
+    const originalTimes=[audit.sourceSharedUpdateTime,audit.sourceOrderUpdateTime,audit.sourceTumblerUpdateTime];
+    if(sourceSnaps.some((s,i)=>updateTime(s)!==commitTime && updateTime(s)!==originalTimes[i]) ||
+       rows.docs.some(s=>updateTime(s)!==commitTime)) fail("APPLIED_STATE_CHANGED");
     if(maps[0].size!==audit.sharedUserCount || maps[1].size!==audit.orderUserCount ||
-       docs.some(doc=>doc.data.orderUserCredentialSchemaVersion!==1)) fail("APPLIED_PROFILE_COUNT_OR_SCHEMA");
+       docs.slice(0,2).some(doc=>doc.data.orderUserCredentialSchemaVersion!==1)) fail("APPLIED_PROFILE_COUNT_OR_SCHEMA");
     const protectedIds=new Set();
     for(const user of maps[0].values()){
       if(own(user,"password") || typeof user.passwordProtected!=="boolean") fail("APPLIED_PROFILE_CREDENTIAL");
@@ -268,7 +327,7 @@ async function verifyApplied(db,args,prepared) {
       }
     }
     if(prepared && fingerprint(docs)!==fingerprint(prepared.sanitized)) fail("APPLIED_SOURCE_MISMATCH");
-    return summary(audit,prepared?"APPLIED_VERIFIED":"APPLIED_VERIFIED_NO_OP",prepared?protectedIds.size+3:0);
+    return summary(audit,prepared?"APPLIED_VERIFIED":"APPLIED_VERIFIED_NO_OP",prepared?protectedIds.size+4:0);
   });
 }
 async function execute(args) {
@@ -296,8 +355,8 @@ async function execute(args) {
     const verifiers=await prepareVerifiers(info.protectedUsers);
     await db.runTransaction(async transaction=>{
       const current=await transaction.getAll(...sourceRefs,auditRef);
-      if(current[2].exists) fail("RUN_ID_ALREADY_EXISTS");
-      const fresh=inspectSources(current.slice(0,2));
+      if(current[3].exists) fail("RUN_ID_ALREADY_EXISTS");
+      const fresh=inspectSources(current.slice(0,3));
       matchExpected(fresh,args);
       if(fresh.sourceFingerprint!==info.sourceFingerprint) fail("SOURCE_CHANGED_DURING_PREPARATION");
       const prior=await transaction.get(db.collection(VERIFIERS).limit(1));
@@ -305,9 +364,12 @@ async function execute(args) {
       for(const [id,value] of verifiers) transaction.create(db.collection(VERIFIERS).doc(id),value);
       transaction.set(sourceRefs[0],info.sanitized[0]);
       transaction.set(sourceRefs[1],info.sanitized[1]);
+      transaction.set(sourceRefs[2],info.sanitized[2]);
       transaction.create(auditRef,{
-        runId:args["run-id"],migrationType:"ORDER_USER_CREDENTIAL_CUTOVER",status:"APPLIED",
+        runId:args["run-id"],migrationType:"ORDER_USER_AND_LEGACY_OPERATOR_CREDENTIAL_CUTOVER",status:"APPLIED",
         sourceSharedUpdateTime:info.sourceSharedUpdateTime,sourceOrderUpdateTime:info.sourceOrderUpdateTime,
+        sourceTumblerUpdateTime:info.sourceTumblerUpdateTime,legacyOperatorCredentialSchemaVersion:1,
+        legacyOperatorFieldRemovalCount:info.legacyOperatorFieldRemovalCount,
         sourceFingerprint:info.sourceFingerprint,protectedUserCount:info.protectedUserCount,
         unprotectedUserCount:info.unprotectedUserCount,sharedUserCount:info.sharedUserCount,orderUserCount:info.orderUserCount,
         verifierWriteCount:verifiers.size,credentialSchemaVersion:1,appBuildNumber:BUILD,writeSchemaVersion:6,
@@ -335,5 +397,5 @@ async function main(argv=process.argv.slice(2),env=process.env) {
 }
 // Test runners can inspect pure validation functions without creating an SDK client.
 // execute is intentionally private; production paths must go through CLI guards.
-module.exports={parseArguments,canonical,inspectSources,validVerifier,PARAMETERS};
+module.exports={parseArguments,canonical,inspectSources,inspectLegacyOperatorSources,validVerifier,PARAMETERS};
 if(require.main===module) main().then(code=>{process.exitCode=code;},()=>{process.exitCode=1;});

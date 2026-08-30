@@ -11174,6 +11174,26 @@ const ORDER_USER_CREDENTIAL_SCHEMA_VERSION = 1;
 const ORDER_USER_PASSWORD_MANAGEMENT_FROZEN = true;
 
 // Legacy profile credentials are consumed only here as a protection signal.
+const LEGACY_OPERATOR_CREDENTIAL_FIELDS = Object.freeze(["managerPw", "adminPw", "managerPwUpdatedAt", "adminPwUpdatedAt"]);
+function sanitizeLegacyOperatorCredentialMap(source){
+  const record = source && typeof source === "object" && !Array.isArray(source) ? source : {};
+  const next = {};
+  Object.keys(record).forEach(key => {
+    if(!LEGACY_OPERATOR_CREDENTIAL_FIELDS.includes(key)){
+      Object.defineProperty(next, key, { value:record[key], enumerable:true, writable:true, configurable:true });
+    }
+  });
+  return next;
+}
+function sanitizeLegacyOperatorCredentialData(source, documentKind){
+  if(!source || typeof source !== "object" || Array.isArray(source)) return source;
+  const field = documentKind === "shared-auth" ? "auth"
+    : documentKind === "order-settings" ? "sysSettings"
+    : documentKind === "tumbler-settings" ? "settings" : "";
+  if(!field || !Object.prototype.hasOwnProperty.call(source, field)) return source;
+  return { ...source, [field]:sanitizeLegacyOperatorCredentialMap(source[field]) };
+}
+
 function sanitizeOrderUserCredentialFields(source, previous){
   const record = source && typeof source === "object" && !Array.isArray(source) ? source : {};
   const next = {};
@@ -11546,8 +11566,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202608310436;
-  const APP_BUILD_LABEL = '20260831_0436';
+  const APP_BUILD_NUMBER = 202608310648;
+  const APP_BUILD_LABEL = '20260831_0648';
   const WRITE_SCHEMA_VERSION = 6;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -11827,7 +11847,8 @@ window.HaetsalCloudStore = (function(){
   }
 
   function setCache(key, value, shouldNotify=true){
-    caches[key] = clone((key === "shared" || key === "order") ? sanitizeOrderUserCredentialData(value, caches[key]) : value);
+    const documentKind = key === "shared" ? "shared-auth" : key === "order" ? "order-settings" : key === "tumbler" ? "tumbler-settings" : "";
+    caches[key] = clone(sanitizeLegacyOperatorCredentialData((key === "shared" || key === "order") ? sanitizeOrderUserCredentialData(value, caches[key]) : value, documentKind));
     if(shouldNotify) emit(key);
     return clone(caches[key]);
   }
@@ -12164,10 +12185,6 @@ window.HaetsalOperatorSession = (function(){
 window.HaetsalSharedStore = (function(){
   const SHARED_KEY = 'haetsalmaru_shared_people_auth_v1';
   const DEFAULT_AUTH = {
-    managerPw: '1212',
-    adminPw: '13123',
-    managerPwUpdatedAt: '',
-    adminPwUpdatedAt: ''
   };
 
   function nowIso(){
@@ -12225,7 +12242,7 @@ window.HaetsalSharedStore = (function(){
         : defaultSharedData();
       const normalized = {
         orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
-        auth: { ...DEFAULT_AUTH, ...((stored && stored.auth) || {}) },
+        auth: sanitizeLegacyOperatorCredentialMap((stored && stored.auth) || DEFAULT_AUTH),
         users: Array.isArray(stored && stored.users) ? stored.users.map(normalizeSharedUserPreservingCouponPresence) : [],
         deletedUserIds: { ...(((stored && stored.deletedUserIds) || {})) },
         deletedUserKeys: { ...(((stored && stored.deletedUserKeys) || {})) }
@@ -12240,7 +12257,7 @@ window.HaetsalSharedStore = (function(){
   function save(shared){
     const normalized = {
         orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
-      auth: { ...DEFAULT_AUTH, ...((shared && shared.auth) || {}) },
+      auth: sanitizeLegacyOperatorCredentialMap((shared && shared.auth) || DEFAULT_AUTH),
       users: Array.isArray(shared && shared.users)
         ? shared.users.map(user => toSharedUser(user, { omitCouponFields: !!(user && user[OMIT_COUPON_FIELDS_FLAG]) || !hasOwnRecordField(user, 'coupons') }))
         : [],
@@ -12566,38 +12583,7 @@ window.HaetsalSharedStore = (function(){
   }
 
   function resolveAuth(sharedAuth, localSettings){
-    const next = { ...DEFAULT_AUTH, ...(sharedAuth || {}) };
-    const local = { ...DEFAULT_AUTH, ...(localSettings || {}) };
-    [
-      ['managerPw', 'managerPwUpdatedAt'],
-      ['adminPw', 'adminPwUpdatedAt']
-    ].forEach(([field, timeField]) => {
-      const sharedValue = str(next[field]) || DEFAULT_AUTH[field];
-      const sharedTime = str(next[timeField]);
-      const localValue = str(local[field]) || DEFAULT_AUTH[field];
-      const localTime = str(local[timeField]);
-
-      if(localTime && (!sharedTime || new Date(localTime).getTime() > new Date(sharedTime).getTime())){
-        next[field] = localValue;
-        next[timeField] = localTime;
-        return;
-      }
-      if(sharedTime && (!localTime || new Date(sharedTime).getTime() > new Date(localTime).getTime())){
-        return;
-      }
-      if(sharedValue !== localValue){
-        if(localValue !== DEFAULT_AUTH[field] && sharedValue === DEFAULT_AUTH[field]){
-          next[field] = localValue;
-          next[timeField] = localTime || nowIso();
-        }else if(sharedValue !== DEFAULT_AUTH[field] && localValue === DEFAULT_AUTH[field]){
-          return;
-        }else{
-          next[field] = localValue || sharedValue || DEFAULT_AUTH[field];
-          next[timeField] = pickLaterTimestamp(sharedTime, localTime) || nowIso();
-        }
-      }
-    });
-    return next;
+    return sanitizeLegacyOperatorCredentialMap(sharedAuth);
   }
 
   function exportOrderUsers(sharedUsers){
@@ -12680,7 +12666,7 @@ window.HaetsalSharedStore = (function(){
   function syncOrderData(orderData, options){
     const opts = options || {};
     const couponMode = getCouponMode(opts);
-    const localData = sanitizeOrderUserCredentialData(clone(orderData || {}));
+    const localData = sanitizeOrderUserCredentialData(clone(sanitizeLegacyOperatorCredentialData(orderData || {}, "order-settings")));
     const shared = read();
     const originalSharedUsers = Array.isArray(shared.users) ? shared.users.map(normalizeSharedUserPreservingCouponPresence) : [];
     let users = filterDeletedSharedUsers(shared, originalSharedUsers);
@@ -12720,13 +12706,7 @@ window.HaetsalSharedStore = (function(){
       ...localData,
       orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
       users: exportedUsers,
-      sysSettings: {
-        ...(localData.sysSettings || {}),
-        managerPw: shared.auth.managerPw,
-        adminPw: shared.auth.adminPw,
-        managerPwUpdatedAt: shared.auth.managerPwUpdatedAt,
-        adminPwUpdatedAt: shared.auth.adminPwUpdatedAt
-      }
+      sysSettings: sanitizeLegacyOperatorCredentialMap(localData.sysSettings)
     };
   }
 
@@ -12762,7 +12742,7 @@ window.HaetsalSharedStore = (function(){
 
   function syncTumblerData(tumblerData, options){
     const opts = options || {};
-    const localData = clone(tumblerData || {});
+    const localData = clone(sanitizeLegacyOperatorCredentialData(tumblerData || {}, "tumbler-settings"));
     const shared = read();
     const originalSharedUsers = Array.isArray(shared.users) ? shared.users.map(normalizeSharedUserPreservingCouponPresence) : [];
     let users = filterDeletedSharedUsers(shared, originalSharedUsers);
@@ -12817,13 +12797,7 @@ window.HaetsalSharedStore = (function(){
       ...localData,
       tumblers: remappedTumblers,
       staff: exportTumblerStaff(filterDeletedSharedUsers(shared, shared.users)),
-      settings: {
-        ...(localData.settings || {}),
-        managerPw: shared.auth.managerPw,
-        adminPw: shared.auth.adminPw,
-        managerPwUpdatedAt: shared.auth.managerPwUpdatedAt,
-        adminPwUpdatedAt: shared.auth.adminPwUpdatedAt
-      }
+      settings: sanitizeLegacyOperatorCredentialMap(localData.settings)
     };
   }
 
@@ -12858,7 +12832,7 @@ window.HaetsalSharedStore = (function(){
 
   function hydrateOrderData(orderData, options){
     const opts = options || {};
-    const localData = sanitizeOrderUserCredentialData(clone(orderData || {}));
+    const localData = sanitizeOrderUserCredentialData(clone(sanitizeLegacyOperatorCredentialData(orderData || {}, "order-settings")));
     const shared = read();
     const localUsers = Array.isArray(localData.users) ? localData.users : [];
     const sharedHasRealUsers = hasRealSharedUsers(shared.users);
@@ -12870,29 +12844,17 @@ window.HaetsalSharedStore = (function(){
       ...localData,
       orderUserCredentialSchemaVersion: ORDER_USER_CREDENTIAL_SCHEMA_VERSION,
       users: shouldTrustSharedUsers ? sharedUsers : localUsersWithoutDeleted,
-      sysSettings: {
-        ...(localData.sysSettings || {}),
-        managerPw: shared.auth.managerPw,
-        adminPw: shared.auth.adminPw,
-        managerPwUpdatedAt: shared.auth.managerPwUpdatedAt,
-        adminPwUpdatedAt: shared.auth.adminPwUpdatedAt
-      }
+      sysSettings: sanitizeLegacyOperatorCredentialMap(localData.sysSettings)
     };
   }
 
   function hydrateTumblerData(tumblerData){
-    const localData = clone(tumblerData || {});
+    const localData = clone(sanitizeLegacyOperatorCredentialData(tumblerData || {}, "tumbler-settings"));
     const shared = read();
     return {
       ...localData,
       staff: exportTumblerStaff(filterDeletedSharedUsers(shared, shared.users)),
-      settings: {
-        ...(localData.settings || {}),
-        managerPw: shared.auth.managerPw,
-        adminPw: shared.auth.adminPw,
-        managerPwUpdatedAt: shared.auth.managerPwUpdatedAt,
-        adminPwUpdatedAt: shared.auth.adminPwUpdatedAt
-      }
+      settings: sanitizeLegacyOperatorCredentialMap(localData.settings)
     };
   }
 
@@ -13552,10 +13514,6 @@ window.HaetsalSharedStore = (function(){
           holidays: [],
           noticeLink: '',
           noticeLinkUpdatedAt: '',
-          managerPw: '1212',
-          adminPw: '13123',
-          managerPwUpdatedAt: '',
-          adminPwUpdatedAt: '',
           tumblerLink: '',
           menuNames: ['아메리카노','카페라떼','바닐라라떼','카라멜마끼아또','말차라떼','아이스티'],
           menuCatalogUpdatedAt: '',
@@ -14122,8 +14080,8 @@ window.HaetsalSharedStore = (function(){
     }
 
     function mergeSysSettingsWithMenuCatalogProtection(localSettings, incomingSettings){
-      const local = localSettings || {};
-      const incoming = incomingSettings || {};
+      const local = sanitizeLegacyOperatorCredentialMap(localSettings);
+      const incoming = sanitizeLegacyOperatorCredentialMap(incomingSettings);
       const localMenuTime = getTimestampMs(local.menuCatalogUpdatedAt);
       const incomingMenuTime = getTimestampMs(incoming.menuCatalogUpdatedAt);
       const localNoticeLink = String(local.noticeLink || '').trim();
@@ -16044,7 +16002,7 @@ window.HaetsalSharedStore = (function(){
 
     function normalizeStoredOrderData(raw){
       const mergedSettings = recoverMenuCatalogFromBackupIfNeeded(
-        applyMenuCatalogToSettings({ ...defaultData().sysSettings, ...(((raw || {}).sysSettings) || {}) }),
+        applyMenuCatalogToSettings(sanitizeLegacyOperatorCredentialMap({ ...defaultData().sysSettings, ...(((raw || {}).sysSettings) || {}) })),
         'normalize-stored-order-data'
       );
       mergedSettings.emergencyOrderCompactArchive = normalizeEmergencyOrderCompactArchive(mergedSettings.emergencyOrderCompactArchive);
@@ -16313,7 +16271,7 @@ window.HaetsalSharedStore = (function(){
     }
 
     function prepareSysSettingsForOrderDataFullBackup(settings){
-      const source = settings && typeof settings === 'object' ? settings : {};
+      const source = sanitizeLegacyOperatorCredentialMap(settings);
       const compactArchive = normalizeEmergencyOrderCompactArchive(source.emergencyOrderCompactArchive);
       return {
         ...source,
@@ -21644,7 +21602,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       const preserveAutomaticCoupons = isAutomaticCouponSafeSaveReason(reason);
       try{
         const menuCatalogProtection = protectMenuCatalogBeforeSave(state.sysSettings, reason);
-        state.sysSettings = menuCatalogProtection.settings;
+        state.sysSettings = sanitizeLegacyOperatorCredentialMap(menuCatalogProtection.settings);
         const guardedOrdersForSave = filterOrdersByClosedLiveGuards(state.orders);
         if(Array.isArray(state.orders) && guardedOrdersForSave.length !== state.orders.length){
           state.orders = guardedOrdersForSave;
@@ -45756,10 +45714,6 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         storeHotCount: 10,
         storeGenCount: 10,
         totalSaved: 0,
-        managerPw: '1212',
-        adminPw: '13123',
-        managerPwUpdatedAt: '',
-        adminPwUpdatedAt: ''
       },
       tumblers: [],
       staff: [],
@@ -45771,7 +45725,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   function normalizeData(raw){
     const base = defaultData();
     const data = {
-      settings: { ...base.settings, ...((raw && raw.settings) || {}) },
+      settings: sanitizeLegacyOperatorCredentialMap({ ...base.settings, ...((raw && raw.settings) || {}) }),
       tumblers: Array.isArray(raw && raw.tumblers) ? raw.tumblers : [],
       staff: Array.isArray(raw && raw.staff) ? raw.staff : [],
       rentalHistory: Array.isArray(raw && raw.rentalHistory) ? raw.rentalHistory : [],
@@ -50584,7 +50538,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         built.orderStatusUpdatedAtServer = serverTimestamp();
       }
       transaction.set(ref, built, { merge:true });
-      if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData));
+      if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData, "shared-auth"));
       if(couponEntry){
         const builtCoupon = buildPayload(couponEntry.finalPayload);
         builtCoupon.serverCreatedAt = serverTimestamp();
@@ -50833,7 +50787,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         }
 
         transaction.set(liveRef, buildPayloadWithServerOrderTimes(finalPayload, 'updated'));
-        if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData));
+        if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData, "shared-auth"));
         if(finalCouponEntry){
           const couponPayload = buildPayload(finalCouponEntry.finalPayload);
           couponPayload.serverCreatedAt = serverTimestamp();
@@ -51215,7 +51169,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         order:finalOrder
       };
       transaction.set(liveRef, buildPayloadWithServerOrderTimes(finalPayload, 'created'));
-      if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData));
+      if(couponPrepared) transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData, "shared-auth"));
       if(couponEntry){
         const builtCoupon = buildPayload(couponEntry.finalPayload);
         builtCoupon.serverCreatedAt = serverTimestamp();
@@ -51953,7 +51907,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         order:nextOrder
       };
       transaction.set(liveRef, buildPayloadWithServerOrderTimes(livePayload, 'updated'), { merge:true });
-      transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData));
+      transaction.set(cloudDocRefs.shared, buildPayload(couponPrepared.nextSharedData, "shared-auth"));
       const couponPayload = buildPayload(couponEntry.finalPayload);
       couponPayload.serverCreatedAt = serverTimestamp();
       couponPayload.serverUpdatedAt = serverTimestamp();
@@ -52443,7 +52397,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         savedAt:now,
         statusTime:Number(guardData.statusTime || Date.now())
       });
-      transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+      transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
       transaction.set(guardRef, buildPayload(guardPayload), { merge:true });
       const couponPayload = buildPayload(couponEntry.finalPayload);
       couponPayload.serverCreatedAt = serverTimestamp();
@@ -54119,8 +54073,8 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     }
   }
 
-  function attachRemoteDataGuard(data, savedAt){
-    const cloned = JSON.parse(JSON.stringify(sanitizeOrderUserCredentialData(data)));
+  function attachRemoteDataGuard(data, savedAt, documentKind){
+    const cloned = JSON.parse(JSON.stringify(sanitizeOrderUserCredentialData(sanitizeLegacyOperatorCredentialData(data, documentKind))));
     if(cloned && typeof cloned === 'object' && !Array.isArray(cloned)){
       cloned[REMOTE_DATA_GUARD_FIELD] = {
         dataGuardVersion: REMOTE_DATA_GUARD_VERSION,
@@ -54141,7 +54095,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     return 'write_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 12);
   }
 
-  function buildPayload(data){
+  function buildPayload(data, documentKind){
     if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('firestore-build-payload')){
       throw new Error('Firestore write blocked by runtime guard');
     }
@@ -54151,7 +54105,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
     const writeSchemaVersion = window.HaetsalRuntimeGuard && Number(window.HaetsalRuntimeGuard.WRITE_SCHEMA_VERSION || 0);
     const clientWriteId = makeClientWriteId();
     return {
-      data: attachRemoteDataGuard(data, savedAt),
+      data: attachRemoteDataGuard(data, savedAt, documentKind),
       updatedAt: savedAt,
       dataGuardVersion: REMOTE_DATA_GUARD_VERSION,
       appBuild: REMOTE_DATA_GUARD_BUILD,
@@ -55024,7 +54978,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           lastRecalcRunId:runId,
           updatedAt:appliedAtClient
         });
-        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         grantEntries.forEach((entry, index) => {
           if(grantSnapshots[index].exists()) return;
           const builtPayload = buildPayload(entry.finalPayload);
@@ -55243,7 +55197,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       };
       const next = JSON.parse(JSON.stringify(sharedData));
       next.users = users.filter(user => String(user && user.id || '') !== target);
-      transaction.set(cloudDocRefs.shared, buildPayload(next));
+      transaction.set(cloudDocRefs.shared, buildPayload(next, "shared-auth"));
       transaction.set(statusRef, { ...deletionRecord, serverUpdatedAt:serverTimestamp(), previousStatus:statusSnap.exists() ? String(statusSnap.data().status || '') : 'ACTIVE' });
       transaction.set(eventRef, { ...deletionRecord, eventId, serverCreatedAt:serverTimestamp() });
     });
@@ -55422,7 +55376,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         existingEventSnapshots.forEach(snapshot => {
           if(snapshot.exists()) throw new Error('동일한 신규 사용자 초기 쿠폰 기록이 이미 저장되어 있습니다.');
         });
-        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         entries.forEach(entry => {
           const builtPayload = buildPayload(entry.finalPayload);
           builtPayload.serverCreatedAt = serverTimestamp();
@@ -56253,7 +56207,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
         nextSharedData.users.push(normalizedUser);
         updatedUsers.push(normalizedUser);
       });
-      const sharedPayload = buildPayload(nextSharedData);
+      const sharedPayload = buildPayload(nextSharedData, "shared-auth");
       const auditPayloads = auditEntries.all.map(entry => buildPayload(entry.data));
       const estimatedBytes = getArchiveJsonBytes(sharedPayload)
         + entries.reduce((sum, entry) => sum + getArchiveJsonBytes(buildPayload(entry.finalPayload)), 0)
@@ -56424,7 +56378,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           };
         }
         const prepared = prepareVersionedCouponMutation(sharedData, mutation);
-        transaction.set(cloudDocRefs.shared, buildPayload(prepared.nextSharedData));
+        transaction.set(cloudDocRefs.shared, buildPayload(prepared.nextSharedData, "shared-auth"));
         if(entry){
           const builtPayload = buildPayload(entry.finalPayload);
           builtPayload.serverCreatedAt = serverTimestamp();
@@ -56481,7 +56435,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           nextSharedData = prepared.nextSharedData;
           updatedUsers.push(prepared.nextUser);
         });
-        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         return { users:updatedUsers, sharedData:nextSharedData };
       }),
       30 * 1000,
@@ -56537,7 +56491,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           nextSharedData = prepared.nextSharedData;
           updatedUsers.push(prepared.nextUser);
         });
-        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         entries.forEach((entry, index) => {
           const existing = existingSnapshots[index];
           if(existing.exists()){
@@ -57032,7 +56986,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       }, { reason:'milk-support-admin-payment' });
       if(couponSnapshot.exists()) throw new Error('동일 신청의 쿠폰 지급 기록이 이미 존재합니다.');
       if(paymentEventSnapshot.exists()) throw new Error('동일 신청의 지급 완료 기록이 이미 존재합니다.');
-      transaction.set(cloudDocRefs.shared, buildPayload(prepared.nextSharedData));
+      transaction.set(cloudDocRefs.shared, buildPayload(prepared.nextSharedData, "shared-auth"));
       const builtCoupon = buildPayload(couponEntry.finalPayload);
       builtCoupon.serverCreatedAt = serverTimestamp();
       builtCoupon.serverUpdatedAt = serverTimestamp();
@@ -57155,7 +57109,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
             nextSharedData = prepared.nextSharedData;
             updatedUsers.push(prepared.nextUser);
           });
-          transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+          transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         }
         const builtPayload = buildPayload(finalPayload);
         builtPayload.serverCreatedAt = serverTimestamp();
@@ -57652,7 +57606,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
           balanceMutations,
           descriptors
         );
-        if(nextSharedData) transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData));
+        if(nextSharedData) transaction.set(cloudDocRefs.shared, buildPayload(nextSharedData, "shared-auth"));
         const builtCurrent = buildPayload(currentPayload);
         builtCurrent.serverUpdatedAt = serverTimestamp();
         if(!currentSnapshot.exists()) builtCurrent.serverCreatedAt = serverTimestamp();
@@ -57904,7 +57858,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
       const snapshot = await transaction.get(ref);
       const serverData = snapshot.exists() ? getPayloadData(snapshot.data()) : {};
       const protectedValue = mergeServerCouponVersionsIntoSharedWrite(serverData, value);
-      transaction.set(ref, buildPayload(protectedValue));
+      transaction.set(ref, buildPayload(protectedValue, "shared-auth"));
       return protectedValue;
     });
   }
@@ -57953,7 +57907,7 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
             console.warn('주문별 실시간 저장 문서 생성 실패:', error);
           }
           const safetySave = safetyBackup
-            ? setDoc(orderSafetyBackupRef, buildPayload(safetyBackup)).catch(error => {
+            ? setDoc(orderSafetyBackupRef, buildPayload(safetyBackup, "order-settings")).catch(error => {
                 markFirestoreQuotaExceeded(error, 'order-safety-backup-write');
                 console.error('Firestore 주문 안전 백업 저장 실패:', error);
               })
@@ -57971,10 +57925,10 @@ async function verifyFirebaseOperatorUser(user, forceRefresh){
               })
             : Promise.resolve();
           return Promise.all([liveOrderDocsSave, liveQueueSave, safetySave])
-            .then(() => setDoc(ref, buildPayload(value)))
+            .then(() => setDoc(ref, buildPayload(value, "order-settings")))
             .then(() => ({ key:'order', actualAggregateWriteCompleted:true, aggregateWriteCompletedAt:new Date().toISOString() }));
         }
-        return setDoc(ref, buildPayload(value));
+        return setDoc(ref, buildPayload(value, "tumbler-settings"));
       });
     }
 
