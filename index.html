@@ -11509,8 +11509,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202608301940;
-  const APP_BUILD_LABEL = '20260830_1940';
+  const APP_BUILD_NUMBER = 202609010126;
+  const APP_BUILD_LABEL = '20260901_0126';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -54454,19 +54454,52 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return users.find(user => String((user && user.id) || '') === targetUserId) || null;
   }
 
+  function getCouponServerReadRecoveryKind(error){
+    const quotaGuard = window.HaetsalFirestoreQuotaGuard;
+    if(quotaGuard && ((typeof quotaGuard.isQuotaError === 'function' && quotaGuard.isQuotaError(error)) || (typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked()))) return '';
+    const code = String(error && error.code || '').toLowerCase().replace(/^(firestore|auth)\//, '');
+    if(['unauthenticated', 'user-token-expired', 'id-token-expired', 'invalid-user-token'].includes(code)) return 'auth';
+    if(['unavailable', 'deadline-exceeded', 'aborted', 'cancelled', 'internal', 'unknown', 'network-request-failed'].includes(code)) return 'read';
+    if(code) return '';
+    const message = String(error && error.message || '').trim();
+    if(message === '사용자 현재 잔액 서버 조회 시간이 초과되었습니다.') return 'read';
+    const name = String(error && error.name || '');
+    if((name === 'TypeError' || name === 'NetworkError') && /^(Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?|The network connection was lost\.?|The Internet connection appears to be offline\.?)$/i.test(message)) return 'read';
+    return '';
+  }
+
   async function readCouponRecalcSharedUser(userId){
     const targetUserId = String(userId || '').trim();
     if(!targetUserId) throw new Error('재계산할 사용자 ID가 없습니다.');
     await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
-    const snapshot = await runArchiveCloudPromiseWithTimeout(
+    const readServer = () => runArchiveCloudPromiseWithTimeout(
       getDocFromServer(cloudDocRefs.shared),
       ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
       '사용자 현재 잔액 서버 조회 시간이 초과되었습니다.'
     );
+    let snapshot;
+    try{
+      snapshot = await readServer();
+    }catch(error){
+      const recoveryKind = getCouponServerReadRecoveryKind(error);
+      if(!recoveryKind) throw error;
+      if(recoveryKind === 'auth'){
+        await runArchiveCloudPromiseWithTimeout(
+          auth.currentUser ? getIdTokenResult(auth.currentUser, true) : ensureAnonymousLogin(),
+          ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS,
+          'Firebase 준비 확인 시간이 초과되었습니다.'
+        );
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 250));
+      if(!getCouponServerReadRecoveryKind(error)) throw error;
+      snapshot = await readServer();
+    }
     if(!snapshot.exists()) throw new Error('서버 사용자 명단 문서를 찾을 수 없습니다.');
     const sharedData = unwrapCouponRecalcDocData(snapshot);
+    if(!sharedData || typeof sharedData !== 'object' || Array.isArray(sharedData) || !Array.isArray(sharedData.users)) throw new Error('invalid coupon server response');
     const user = getCouponRecalcSharedUserFromData(sharedData, targetUserId);
     if(!user) throw new Error('서버 사용자 명단에서 재계산할 사용자를 찾을 수 없습니다.');
+    if(Array.isArray(user) || !Number.isInteger(user.coupons) || (user.couponBalanceVersion !== undefined && (!Number.isInteger(user.couponBalanceVersion) || user.couponBalanceVersion < 0)) || (user.couponsUpdatedAt !== undefined && typeof user.couponsUpdatedAt !== 'string') || (user.lastRecalcRunId !== undefined && typeof user.lastRecalcRunId !== 'string')) throw new Error('invalid coupon server response');
     return { user:JSON.parse(JSON.stringify(user)), sharedData:JSON.parse(JSON.stringify(sharedData)) };
   }
 
