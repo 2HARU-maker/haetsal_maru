@@ -147,6 +147,9 @@ function validateUsers(doc) {
   for(const user of doc.data.users){
     if(!plain(user) || !validId(user.id) || (own(user,"password") && typeof user.password !== "string") ||
         (own(user,"passwordProtected") && typeof user.passwordProtected !== "boolean")) { invalid++; continue; }
+    if(user.passwordProtected === true && (!own(user,"password") || user.password === "")){
+      fail("PROTECTED_PROFILE_WITHOUT_PLAINTEXT");
+    }
     if(ids.has(user.id)) duplicates++;
     ids.set(user.id,user);
   }
