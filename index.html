@@ -11566,8 +11566,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202608310648;
-  const APP_BUILD_LABEL = '20260831_0648';
+  const APP_BUILD_NUMBER = 202608311207;
+  const APP_BUILD_LABEL = '20260831_1207';
   const WRITE_SCHEMA_VERSION = 6;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -38322,6 +38322,34 @@ function selectUser(user){
       return app ? app.querySelector('.dashboard-body') : null;
     }
 
+    function getDashboardScrollOwner(){
+      const dashboardBody = getDashboardScrollContainer();
+      if(!dashboardBody) return null;
+      const overflowY = window.getComputedStyle(dashboardBody).overflowY;
+      return ['auto','scroll','overlay'].includes(overflowY)
+        ? dashboardBody
+        : (document.scrollingElement || document.documentElement);
+    }
+
+    function getDashboardScrollTop(owner){
+      if(!owner) return 0;
+      const scrollingElement = document.scrollingElement || document.documentElement;
+      return Number(owner === scrollingElement
+        ? (window.pageYOffset || owner.scrollTop || 0)
+        : (owner.scrollTop || 0));
+    }
+
+    function restoreDashboardScrollTop(owner, top){
+      if(!owner) return 0;
+      const maximumTop = Math.max(0, Number(owner.scrollHeight || 0) - Number(owner.clientHeight || 0));
+      const restoredTop = Math.min(Math.max(0, Number(top || 0)), maximumTop);
+      owner.scrollTop = restoredTop;
+      if(owner === (document.scrollingElement || document.documentElement)){
+        window.scrollTo(window.pageXOffset || 0, restoredTop);
+      }
+      return getDashboardScrollTop(owner);
+    }
+
     function isDashboardView(){
       return state.currentView === 'ADMIN_DASHBOARD' || state.currentView === 'MANAGER_DASHBOARD';
     }
@@ -38332,14 +38360,14 @@ function selectUser(user){
 
     function captureOrderScrollPosition(){
       const page = getOrderScrollContainer();
-      const dashboardBody = getDashboardScrollContainer();
+      const dashboardOwner = getDashboardScrollOwner();
       const scrollingElement = document.scrollingElement || document.documentElement;
       return {
         view: state.currentView,
         dashboardTab: state.dashboardTab || '',
         selectedUserId: state.selectedUserId || '',
         pageTop: page ? Number(page.scrollTop || 0) : 0,
-        dashboardTop: dashboardBody ? Number(dashboardBody.scrollTop || 0) : 0,
+        dashboardTop: getDashboardScrollTop(dashboardOwner),
         windowTop: Number(window.pageYOffset || (scrollingElement ? scrollingElement.scrollTop : 0) || 0)
       };
     }
@@ -38362,7 +38390,7 @@ function selectUser(user){
       if(previous.view !== current.view) return null;
       if(String(previous.dashboardTab || '') !== String(current.dashboardTab || '')) return null;
       if(Number(previous.dashboardTop || 0) <= 0) return null;
-      if(previous.owner === getDashboardScrollContainer()) return null;
+      if(previous.owner === getDashboardScrollOwner()) return null;
       return previous;
     }
 
@@ -38407,8 +38435,10 @@ function selectUser(user){
     }
 
     document.addEventListener('scroll', event => {
-      const current = getDashboardScrollContainer();
-      const target = event.target === document ? document.scrollingElement : event.target;
+      const current = getDashboardScrollOwner();
+      const target = event.target === document || event.target === window
+        ? (document.scrollingElement || document.documentElement)
+        : event.target;
       if(current && target === current && isDashboardView()){
         lastDashboardScrollSnapshot = {
           ...captureOrderScrollPosition(),
@@ -38418,7 +38448,7 @@ function selectUser(user){
       const snapshot = getActiveOrderLifecycleScrollSnapshot();
       if(!snapshot) return;
       if(!current || target !== current || target !== snapshot.restoredOwner) return;
-      if(Math.abs(Number(target.scrollTop || 0) - Number(snapshot.restoredTop || 0)) > 1){
+      if(Math.abs(getDashboardScrollTop(current) - Number(snapshot.restoredTop || 0)) > 1){
         clearOrderLifecycleScrollPreservation();
       }
     }, true);
@@ -38433,19 +38463,21 @@ function selectUser(user){
         requestAnimationFrame(() => {
           if(restoreGeneration !== orderScrollRestoreGeneration) return;
           try{
-            const page = getOrderScrollContainer();
-            const dashboardBody = getDashboardScrollContainer();
-            if(page) page.scrollTop = Number(snapshot.pageTop || 0);
-            if(dashboardBody){
-              const maximumTop = Math.max(0, Number(dashboardBody.scrollHeight || 0) - Number(dashboardBody.clientHeight || 0));
-              dashboardBody.scrollTop = Math.min(Math.max(0, Number(snapshot.dashboardTop || 0)), maximumTop);
-              if(orderLifecycleScrollSnapshot === snapshot){
-                snapshot.restoredOwner = dashboardBody;
-                snapshot.restoredTop = Number(dashboardBody.scrollTop || 0);
+            if(isDashboardView()){
+              const dashboardOwner = getDashboardScrollOwner();
+              if(dashboardOwner){
+                const restoredTop = restoreDashboardScrollTop(dashboardOwner, snapshot.dashboardTop);
+                if(orderLifecycleScrollSnapshot === snapshot){
+                  snapshot.restoredOwner = dashboardOwner;
+                  snapshot.restoredTop = restoredTop;
+                }
               }
+            }else{
+              const page = getOrderScrollContainer();
+              if(page) page.scrollTop = Number(snapshot.pageTop || 0);
+              if(document.scrollingElement) document.scrollingElement.scrollTop = Number(snapshot.windowTop || 0);
+              window.scrollTo(window.pageXOffset || 0, Number(snapshot.windowTop || 0));
             }
-            if(document.scrollingElement) document.scrollingElement.scrollTop = Number(snapshot.windowTop || 0);
-            window.scrollTo(window.pageXOffset || 0, Number(snapshot.windowTop || 0));
           }catch(error){}
         });
       });
