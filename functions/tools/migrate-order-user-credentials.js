@@ -202,6 +202,13 @@ function inspectSources(snapshots) {
   const docs=snapshots.map(snapshot=>snapshot.data());
   const legacy=inspectLegacyOperatorSources(docs);
   const shared=validateUsers(docs[0]),order=validateUsers(docs[1]);
+  for(const users of [shared,order]){
+    for(const user of users.values()){
+      if(user.passwordProtected === true && (!own(user,"password") || user.password === "")){
+        fail("PROTECTED_PROFILE_WITHOUT_PLAINTEXT");
+      }
+    }
+  }
   let mismatches=0;
   for(const [id,user] of order){
     if(own(user,"password") && user.password !== "" &&
