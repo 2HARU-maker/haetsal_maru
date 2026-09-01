@@ -55740,6 +55740,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       : Number(user && user.coupons || 0) > 0).length){
       throw new Error('신규 사용자 수와 초기 쿠폰 기록 수가 일치하지 않습니다.');
     }
+    let transactionError = null;
     const transactionResult = await runArchiveCloudPromiseWithTimeout(
       runTransaction(db, async transaction => {
         const sharedSnapshot = await transaction.get(cloudDocRefs.shared);
@@ -55807,7 +55808,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }),
       ORDER_ARCHIVE_CLOUD_WRITE_TIMEOUT_MS,
       '신규 사용자와 초기 쿠폰 기록 저장 시간이 초과되었습니다.'
-    );
+    ).catch(error => {
+      transactionError = error;
+      return null;
+    });
     const sharedVerifySnapshot = await getDocFromServer(cloudDocRefs.shared);
     if(!sharedVerifySnapshot.exists()) throw new Error('신규 사용자 저장 후 서버 사용자 명단을 확인하지 못했습니다.');
     const verifiedSharedData = unwrapCouponRecalcDocData(sharedVerifySnapshot);
@@ -55829,7 +55833,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       sharedData:JSON.parse(JSON.stringify(verifiedSharedData)),
       saved,
       count:saved.length,
-      transactionResult
+      transactionResult,
+      recoveredAfterUnknownCommit:transactionError !== null
     };
   }
 
