@@ -34166,29 +34166,44 @@ body.mobile-tablet-device .pos-keyboard-btn{
         state.selectedUserIds = [];
         showMessage('쿠폰 조정이 완료되었습니다.');
       }catch(error){
-        const commitConfirmed = !!(batchResult && batchResult.commitConfirmed === true);
-        if(!commitConfirmed) restoreAdminCouponChangeSnapshot(changeSnapshot);
-        if(commitConfirmed && Array.isArray(batchResult.users)){
-          batchResult.users.forEach(serverUser => {
-            const localUser = getUserById(serverUser.id);
-            if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
-          });
-          applyAuthoritativeSharedCouponData(batchResult);
-        }
-        if(commitConfirmed && Array.isArray(batchResult.saved) && batchResult.saved.length){
-          state.couponHistory = mergeCouponHistoryRecords(state.couponHistory, batchResult.saved);
-          state.userCouponCloudRecordsByUserId = state.userCouponCloudRecordsByUserId || {};
-          batchResult.saved.forEach(record => {
-            const key = String((record && record.userId) || '');
-            if(!key) return;
-            state.userCouponCloudRecordsByUserId[key] = mergeCouponHistoryRecords(
-              state.userCouponCloudRecordsByUserId[key] || [],
-              [record]
-            );
-          });
+        const transactionCommitted = !!(batchResult && batchResult.commitConfirmed === true);
+        const payoutConfirmed = !!(transactionCommitted
+          && batchResult.ok === true
+          && batchResult.commitStatus !== 'COMMIT_CONFIRMED_BUT_DATA_MISMATCH');
+        if(!transactionCommitted) restoreAdminCouponChangeSnapshot(changeSnapshot);
+        if(transactionCommitted){
+          try{
+            if(Array.isArray(batchResult.users)){
+              batchResult.users.forEach(serverUser => {
+                const localUser = getUserById(serverUser.id);
+                if(localUser) applyAuthoritativeCouponUser(localUser, serverUser);
+              });
+              applyAuthoritativeSharedCouponData(batchResult);
+            }
+            if(Array.isArray(batchResult.saved) && batchResult.saved.length){
+              state.couponHistory = mergeCouponHistoryRecords(state.couponHistory, batchResult.saved);
+              state.userCouponCloudRecordsByUserId = state.userCouponCloudRecordsByUserId || {};
+              batchResult.saved.forEach(record => {
+                const key = String((record && record.userId) || '');
+                if(!key) return;
+                state.userCouponCloudRecordsByUserId[key] = mergeCouponHistoryRecords(
+                  state.userCouponCloudRecordsByUserId[key] || [],
+                  [record]
+                );
+              });
+            }
+          }catch(recoveryError){
+            console.error('확정된 관리자 일괄 쿠폰 조정의 로컬 후속 반영 실패', recoveryError);
+          }
         }
         console.error('관리자 일괄 쿠폰 조정 저장 실패', error);
-        if(!String(error && error.message || '').includes('최신 잔액을 반영')) showMessage('관리자 일괄 쿠폰 조정을 완료하지 못했습니다.');
+        if(payoutConfirmed){
+          state.showCouponModal = false;
+          state.selectedUserIds = [];
+          showMessage('쿠폰 조정이 완료되었습니다.');
+        }else if(!String(error && error.message || '').includes('최신 잔액을 반영')){
+          showMessage('관리자 일괄 쿠폰 조정을 완료하지 못했습니다.');
+        }
       }finally{
         state.bulkCouponChangeInFlight = false;
         render();
@@ -56469,6 +56484,42 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return { ok:true, users:verifiedUsers, sharedData:JSON.parse(JSON.stringify(verifiedSharedData)) };
   }
 
+  async function verifyAdminBulkCouponCommitAfterUnknownOutcome(rows, entries){
+    try{
+      const sharedSnapshot = await runArchiveCloudPromiseWithTimeout(
+        getDocFromServer(cloudDocRefs.shared),
+        ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+        '쿠폰 지급 결과 서버 확인 시간이 초과되었습니다.'
+      );
+      if(!sharedSnapshot.exists()) return null;
+      const sharedData = unwrapCouponRecalcDocData(sharedSnapshot);
+      const users = rows.map(mutation => getCouponRecalcSharedUserFromData(sharedData, mutation.userId));
+      if(users.some(user => !user)) return null;
+      const saved = [];
+      for(const entry of entries){
+        const eventSnapshot = await runArchiveCloudPromiseWithTimeout(
+          getDocFromServer(entry.eventRef),
+          ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS,
+          '쿠폰 지급 기록의 서버 확인 시간이 초과되었습니다.'
+        );
+        const verifiedRecord = assertCouponEventServerRecordMatches(entry.finalPayload, eventSnapshot);
+        saved.push({ ...entry.finalPayload, ...verifiedRecord, cloudStored:true, serverVerified:true });
+      }
+      return {
+        ok:true,
+        commitConfirmed:true,
+        commitStatus:'COMMIT_CONFIRMED_AFTER_UNKNOWN_OUTCOME',
+        users:users.map(user => JSON.parse(JSON.stringify(user))),
+        sharedData:JSON.parse(JSON.stringify(sharedData)),
+        saved,
+        count:saved.length,
+        transactionResult:null
+      };
+    }catch(error){
+      return null;
+    }
+  }
+
   async function applyVersionedCouponMutationsWithEvents(mutations, records, options){
     const rows = Array.isArray(mutations) ? mutations.filter(Boolean) : [];
     const sourceRecords = Array.isArray(records) ? records.filter(Boolean) : [];
@@ -56520,13 +56571,22 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         });
         return { users:updatedUsers, sharedData:nextSharedData };
       });
-    const transactionResult = isAdminBulkCouponChange
-      ? await transactionPromise
-      : await runArchiveCloudPromiseWithTimeout(
-          transactionPromise,
-          30 * 1000,
-          '쿠폰 잔액과 지급 기록 동시 저장 시간이 초과되었습니다.'
-        );
+    let transactionResult;
+    try{
+      transactionResult = isAdminBulkCouponChange
+        ? await transactionPromise
+        : await runArchiveCloudPromiseWithTimeout(
+            transactionPromise,
+            30 * 1000,
+            '쿠폰 잔액과 지급 기록 동시 저장 시간이 초과되었습니다.'
+          );
+    }catch(error){
+      if(isAdminBulkCouponChange && getCouponServerReadRecoveryKind(error) === 'read'){
+        const verifiedAfterUnknown = await verifyAdminBulkCouponCommitAfterUnknownOutcome(rows, entries);
+        if(verifiedAfterUnknown) return verifiedAfterUnknown;
+      }
+      throw error;
+    }
     if(!isAdminBulkCouponChange){
       const verifySnapshot = await getDocFromServer(cloudDocRefs.shared);
       if(!verifySnapshot.exists()) throw new Error('쿠폰 지급 후 서버 사용자 명단을 확인하지 못했습니다.');
