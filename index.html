@@ -31505,6 +31505,38 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return readCompletionRequestQueueLocal().find(item => item.orderId === orderId && item.productionCycle === productionCycle) || null;
     }
 
+    async function inspectMissingCompletionRequestRecovery(order){
+      if(!(window.HaetsalLiveOrderDocs && typeof window.HaetsalLiveOrderDocs.inspectMissingCompletionRecovery === 'function')){
+        return { ok:false, status:'completion-recovery-check-not-ready', needsCheck:true, recoverable:false };
+      }
+      const orderId = String(order && order.id || '').trim();
+      if(!orderId) return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false };
+      const rawProductionCycle = Number(order.productionCycle);
+      if(!Number.isInteger(rawProductionCycle) || rawProductionCycle < 1) return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false };
+      const productionCycle = normalizeOrderProductionCycle(order.productionCycle);
+      const recoveryRequest = normalizeCompletionRequestQueueItem({
+        orderId,
+        productionCycle,
+        completionEventId:makeOrderCompletionEventId(orderId, productionCycle),
+        requestedAt:new Date().toISOString(),
+        requestedBy:getCurrentActorLabel(),
+        baseStatusRevision:normalizeOrderStatusRevision(order.statusRevision),
+        status:'pending'
+      });
+      if(!recoveryRequest) return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false };
+      try{
+        const result = await window.HaetsalLiveOrderDocs.inspectMissingCompletionRecovery({
+          ...recoveryRequest,
+          actor:getCurrentActorLabel()
+        });
+        return { ...(result || {}), recoveryRequest };
+      }catch(error){
+        markFirestoreQuotaRetryBlocked(error);
+        console.warn('missing completion request recovery inspection failed', error);
+        return { ok:false, status:'completion-recovery-check-failed', needsCheck:true, recoverable:false, recoveryRequest, error };
+      }
+    }
+
     async function handleCheckOrderCompletionStatus(orderId){
       const order = getOrderById(orderId);
       if(!order) return;
@@ -31512,10 +31544,25 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const latestOrder = getOrderById(orderId) || order;
       let request = findCompletionRequestForOrder(latestOrder);
       if(!request){
-        clearCompletionRequestOnLocalOrder(orderId);
-        saveData({ reason:'completion-request-local-cleared', allowFullBackup:false });
-        render();
-        return;
+        const recovery = await inspectMissingCompletionRequestRecovery(latestOrder);
+        if(recovery && recovery.confirmed === true && recovery.recoveryRequest){
+          return applyConfirmedCompletionResult(recovery.recoveryRequest, recovery, 'order-completed-status-check');
+        }
+        if(recovery && recovery.status === 'request-exists' && recovery.request){
+          mergeCompletionRequestsIntoLocalQueue([recovery.request]);
+          request = findCompletionRequestForOrder(latestOrder);
+        }else if(recovery && recovery.recoverable === true){
+          request = enqueueCompletionRequest(latestOrder);
+        }
+        if(!request){
+          if(recovery && recovery.order && !isOrderClosedStatus(recovery.order)){
+            applyOrderStageTransactionToState(recovery.order, 'order-completion-recovery-blocked-check');
+          }
+          markCompletionRequestOnLocalOrder(orderId, 'needs-check', '상태 확인 필요');
+          requestOrderLifecycleRender();
+          showMessage('주문 상태 확인 필요: 서버의 최신 주문 상태를 확인해주세요.');
+          return recovery;
+        }
       }
       const verified = await verifyCompletionRequestServerState(request);
       if(verified && verified.confirmed === true){
@@ -51396,6 +51443,105 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       && (!requiredStatus || normalizeCompletionRequestCloudStatus(data.status) === requiredStatus);
   }
 
+  function isActiveCompletionRecoveryGuardSnapshot(snapshot){
+    if(!(snapshot && snapshot.exists())) return false;
+    const data = getPayloadData(snapshot.data());
+    const expiresAt = Number(data && data.expiresAt || 0);
+    return !expiresAt || expiresAt > Date.now();
+  }
+
+  async function inspectMissingCompletionRequestRecoveryFromServer(request){
+    const req = request && typeof request === 'object' ? request : {};
+    const orderId = String(req.orderId || '').trim();
+    const requestedCycle = Number(req.productionCycle);
+    const productionCycle = normalizeLifecycleCycle(req.productionCycle);
+    const completionEventId = String(req.completionEventId || makeCompletionEventDocId(orderId, productionCycle));
+    if(!orderId || !Number.isInteger(requestedCycle) || requestedCycle < 1 || completionEventId !== makeCompletionEventDocId(orderId, productionCycle)){
+      return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false, confirmed:false };
+    }
+    await firebaseReadyPromise;
+    const [liveSnap, requestSnap, eventSnap, revivedGuardSnap, closedGuardSnap] = await Promise.all([
+      getDocFromServer(getLiveOrderRef(orderId)),
+      getDocFromServer(getCompletionRequestRef(completionEventId)),
+      getDocFromServer(getCompletionEventRef(completionEventId)),
+      getDocFromServer(doc(revivedOrderGuardCollectionRef, makeRevivedOrderGuardDocId(orderId))),
+      getDocFromServer(doc(closedOrderGuardCollectionRef, makeClosedOrderGuardDocId(orderId)))
+    ]);
+    if(!liveSnap.exists()){
+      return { ok:false, status:'missing-live', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId };
+    }
+    const liveData = getPayloadData(liveSnap.data());
+    const liveOrder = getOfficialLiveOrderFromData(liveSnap.data());
+    if(!liveOrder || !(liveData && typeof liveData === 'object')){
+      return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId };
+    }
+    const rawLiveCycle = Object.prototype.hasOwnProperty.call(liveOrder, 'productionCycle') ? liveOrder.productionCycle : liveData.productionCycle;
+    if(!hasExplicitLifecycleCycle(rawLiveCycle)){
+      return { ok:false, status:'invalid-data', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    const liveCycle = normalizeLifecycleCycle(rawLiveCycle);
+    const liveStatus = normalizeLiveOrderStatus(liveOrder.status || liveData.status, liveOrder.deliveryType || liveData.deliveryType);
+    const liveCompletionEventId = String(liveOrder.completionEventId || liveData.completionEventId || '');
+    const liveCompletionCommitted = liveOrder.completionCommitted === true || liveData.completionCommitted === true;
+    const eventData = eventSnap.exists() ? getPayloadData(eventSnap.data()) : null;
+    const eventMatchesCurrent = eventData && isMatchingCompletionEventData(eventData, orderId, productionCycle, completionEventId);
+    const liveMatchesCompleted = isLiveOrderDoneStatus(liveStatus)
+      && liveCycle === productionCycle
+      && liveCompletionEventId === completionEventId
+      && liveCompletionCommitted;
+    if(liveMatchesCompleted && eventMatchesCurrent){
+      return { ok:true, status:'completed-confirmed', needsCheck:false, recoverable:false, confirmed:true, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(eventSnap.exists()){
+      return { ok:false, status:'already-event', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(isLiveOrderDoneStatus(liveStatus) || liveCompletionCommitted){
+      return { ok:false, status:'already-completed', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(liveStatus === 'CANCELLED'){
+      return { ok:false, status:'cancelled', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(liveCycle !== productionCycle){
+      return { ok:false, status:'cycle-mismatch', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, liveCycle, completionEventId, order:liveOrder };
+    }
+    if(liveData.isOpen !== true || liveOrder.isOpen === false || isLiveOrderCompletionBlocked(liveOrder, liveData)){
+      return { ok:false, status:'invalid-status', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(isActiveCompletionRecoveryGuardSnapshot(revivedGuardSnap)){
+      return { ok:false, status:'revived-order-guard', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    if(isActiveCompletionRecoveryGuardSnapshot(closedGuardSnap)){
+      return { ok:false, status:'closed-order-guard', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    const requestData = requestSnap.exists() ? getPayloadData(requestSnap.data()) : null;
+    if(requestSnap.exists()){
+      if(!isMatchingCompletionRequestData(requestData, orderId, productionCycle, completionEventId, '')){
+        return { ok:false, status:'invalid-request', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+      }
+      return { ok:true, status:'request-exists', needsCheck:false, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder, request:{ ...requestData, completionEventId } };
+    }
+    const deliveryType = String(liveOrder.deliveryType || liveData.deliveryType || '').toUpperCase();
+    const workStage = getFallbackLiveOrderWorkStage(liveOrder, liveData);
+    if(deliveryType === 'DELIVERY'){
+      const deliverySnap = await getDocFromServer(getDeliveryRecordRef(orderId));
+      const deliveryRecord = deliverySnap.exists() ? normalizeDeliveryRecordCloudPayload(getPayloadData(deliverySnap.data())) : null;
+      const productionCompleted = !!(
+        liveOrder.productionCompleted === true || liveOrder.productionCompletedAt ||
+        liveData.productionCompleted === true || liveData.productionCompletedAt
+      );
+      const deliveryReady = workStage === 'DELIVERING' || (workStage === 'DELIVERY_WAITING' && productionCompleted);
+      if(!deliveryRecord || String(deliveryRecord.orderId || '') !== orderId){
+        return { ok:false, status:'missing-delivery-record', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+      }
+      if(!deliveryReady){
+        return { ok:false, status:'delivery-production-not-completed', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder, deliveryRecord };
+      }
+    }else if(deliveryType !== 'PICKUP' || !['MEASURE_WAITING','PRODUCTION_WAITING'].includes(workStage)){
+      return { ok:false, status:'invalid-status', needsCheck:true, recoverable:false, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+    }
+    return { ok:true, status:'recoverable-missing-request', needsCheck:false, recoverable:true, confirmed:false, orderId, productionCycle, completionEventId, order:liveOrder };
+  }
+
   async function verifyCompletionStateFromServer(request){
     const req = request && typeof request === 'object' ? request : {};
     const orderId = String(req.orderId || '').trim();
@@ -52436,6 +52582,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     claimCompletionRequest: claimCompletionRequestDocument,
     readCompletionRequest: readCompletionRequestDocument,
     readOpenCompletionRequests: readOpenCompletionRequestDocuments,
+    inspectMissingCompletionRecovery: inspectMissingCompletionRequestRecoveryFromServer,
     verifyCompletion: verifyCompletionStateFromServer,
     completeOrder: completeLiveOrderByTransaction,
     reopenOrder: reopenLiveOrderByTransaction,
