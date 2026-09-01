@@ -13820,6 +13820,8 @@ window.HaetsalSharedStore = (function(){
         cancelOrderReason: '',
         showPreflightCheckModal: false,
         overdueTumblerAction: '',
+        pendingOverdueOrderContinuation: null,
+        preparedOverdueOrderResponse: null,
         showOrderPersonalTumblerSettingsModal: false,
         orderPersonalTumblerSettingsIndex: 0,
         orderPersonalTumblerSettingsValue: '',
@@ -25710,6 +25712,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       state.tempLocation = '';
       state.tempTumblerInfo = '';
       state.overdueTumblerAction = '';
+      state.pendingOverdueOrderContinuation = null;
+      state.preparedOverdueOrderResponse = null;
       state.isLocationPermanent = false;
       state.isTumblerPermanent = false;
       state.showLocationModal = false;
@@ -30859,6 +30863,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.tempLocation = user.defaultLocation || '';
       state.tempTumblerInfo = user.tumblerInfo || '';
       state.overdueTumblerAction = '';
+      state.pendingOverdueOrderContinuation = null;
+      state.preparedOverdueOrderResponse = null;
       state.isLocationPermanent = false;
       state.isTumblerPermanent = false;
       if(user.password && !isStaff()){
@@ -31013,6 +31019,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const totalQty = getOrderTotalQuantityFromItems(orderItems);
       const totalCouponCost = getOrderCouponCostFromItems(orderItems);
       const now = new Date();
+      const preparedOverdueResponse = state.preparedOverdueOrderResponse &&
+        String(state.preparedOverdueOrderResponse.userId || '') === String(user.id || '') &&
+        String(state.preparedOverdueOrderResponse.action || '') === String(state.overdueTumblerAction || '')
+        ? state.preparedOverdueOrderResponse
+        : null;
       const pendingOrderId = lastOrderSubmissionFailure && lastOrderSubmissionFailure.needsCheck === true
         ? String(lastOrderSubmissionFailure.orderId || '')
         : '';
@@ -31022,8 +31033,57 @@ body.mobile-tablet-device .pos-keyboard-btn{
         showMessage('제작대기 저장 실패');
         return;
       }
-      const orderId = pendingOrderId || uid('order');
+      const orderId = pendingOrderId || String((preparedOverdueResponse && preparedOverdueResponse.orderId) || '') || uid('order');
       const couponBalanceOperationId = `order-create:${orderId}`;
+      const actualOverdueSnapshot = getActualOverdueTumblerSnapshot(user.id);
+      if(!preparedOverdueResponse && !actualOverdueSnapshot.dataReady){
+        showMessage('텀블러 데이터를 아직 불러오지 못했습니다.');
+        return;
+      }
+      const overdueDays = preparedOverdueResponse
+        ? Math.max(0, Number(preparedOverdueResponse.overdueDays || 0))
+        : (actualOverdueSnapshot.hasOverdue ? Math.max(0, Number(actualOverdueSnapshot.overdueDays || 0)) : 0);
+      const overdueTumblerAction = preparedOverdueResponse
+        ? String(preparedOverdueResponse.action || '')
+        : (overdueDays > 0 ? String(state.overdueTumblerAction || '').trim() : '');
+      if(overdueDays > 0 && !proxyMode && !isValidOverdueTumblerAction(overdueTumblerAction)){
+        state.pendingOverdueOrderContinuation = {
+          userId:String(userId || ''),
+          qty:Number(qty || 1),
+          memoText:String(memoText || ''),
+          proxyMode:proxyMode === true
+        };
+        render();
+        showMessage('대여기간을 초과한 텀블러 안내를 확인하고 버튼을 선택해주세요.');
+        return;
+      }
+      state.pendingOverdueOrderContinuation = null;
+      let overdueResponseResult = preparedOverdueResponse ? preparedOverdueResponse.result : null;
+      if(overdueDays > 0 && isValidOverdueTumblerAction(overdueTumblerAction) && !overdueResponseResult){
+        if(!(window.TumblerModule && typeof window.TumblerModule.recordOverdueOrderResponse === 'function')){
+          showMessage('텀블러 반납/재대여 선택 결과를 기록할 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
+          return;
+        }
+        overdueResponseResult = window.TumblerModule.recordOverdueOrderResponse({
+          userId:user.id,
+          userName:user.name,
+          action:overdueTumblerAction,
+          orderId,
+          orderNumber:'',
+          extensionDays:5
+        });
+        if(!overdueResponseResult || !overdueResponseResult.ok){
+          showMessage((overdueResponseResult && overdueResponseResult.message) || '텀블러 반납/재대여 선택 결과를 기록하지 못했습니다. 다시 시도해주세요.');
+          return;
+        }
+        state.preparedOverdueOrderResponse = {
+          userId:String(user.id || ''),
+          action:overdueTumblerAction,
+          orderId,
+          overdueDays,
+          result:overdueResponseResult
+        };
+      }
       try{
         await assertOrderWritePreflightReady('order-submit-before-coupon-read');
       }catch(error){
@@ -31062,20 +31122,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!couponBalancePrepared) return;
       const firstItem = orderItems[0] || createDefaultOrderItem();
       const orderIdentity = getNextSafeOrderIdentity(now, orderId);
-      const actualOverdueSnapshot = getActualOverdueTumblerSnapshot(user.id);
-      if(!actualOverdueSnapshot.dataReady){
-        showMessage('텀블러 데이터를 아직 불러오지 못했습니다.');
-        return;
-      }
-      const overdueDays = actualOverdueSnapshot.hasOverdue
-        ? Math.max(0, Number(actualOverdueSnapshot.overdueDays || 0))
-        : 0;
-      const overdueTumblerAction = overdueDays > 0 ? String(state.overdueTumblerAction || '').trim() : '';
-      if(overdueDays > 0 && !proxyMode && !isValidOverdueTumblerAction(overdueTumblerAction)){
-        render();
-        showMessage('대여기간을 초과한 텀블러 안내를 확인하고 버튼을 선택해주세요.');
-        return;
-      }
       const sequenceReservation = await reserveNewOrderSequenceWithRetry(orderId, orderIdentity.dateKey, orderIdentity.minimumSeq, now.toISOString(), {
         userId:String(user.id || ''),
         couponOperationId:couponBalanceOperationId
@@ -31109,6 +31155,25 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const serverCreatedAtIso = String(sequenceReservation.allocatedAt || '');
       const currentSeq = Number(sequenceReservation.seq || 0);
       const orderNumber = String(sequenceReservation.orderNumber || '');
+      if(overdueResponseResult && isValidOverdueTumblerAction(overdueTumblerAction)){
+        if(!(window.TumblerModule && typeof window.TumblerModule.finalizeOverdueOrderResponseOrderNumber === 'function')){
+          showMessage('텀블러 반납/재대여 선택 결과를 기록하지 못했습니다. 다시 시도해주세요.');
+          return;
+        }
+        const overdueOrderNumberResult = window.TumblerModule.finalizeOverdueOrderResponseOrderNumber({
+          orderId,
+          orderNumber,
+          action:overdueTumblerAction
+        });
+        if(!overdueOrderNumberResult || !overdueOrderNumberResult.ok){
+          showMessage('텀블러 반납/재대여 선택 결과를 기록하지 못했습니다. 다시 시도해주세요.');
+          return;
+        }
+        overdueResponseResult = { ...overdueResponseResult, orderNumber };
+        if(state.preparedOverdueOrderResponse){
+          state.preparedOverdueOrderResponse.result = overdueResponseResult;
+        }
+      }
       const remainingCoupons = Number(couponBalancePrepared.currentCoupons || 0) - Number(totalCouponCost || 1);
       const order = {
         id: orderId,
@@ -31198,28 +31263,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
         state.pendingOrderSource = '';
       }
 
-      if(overdueDays > 0 && isValidOverdueTumblerAction(overdueTumblerAction)){
-        if(!(window.TumblerModule && typeof window.TumblerModule.recordOverdueOrderResponse === 'function')){
-          showMessage('텀블러 반납/재대여 선택 결과를 기록할 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
-          return;
-        }
-        const responseResult = window.TumblerModule.recordOverdueOrderResponse({
-          userId: user.id,
-          userName: user.name,
-          action: overdueTumblerAction,
-          orderId: order.id,
-          orderNumber: order.orderNumber,
-          extensionDays: 5
-        });
-        if(!responseResult || !responseResult.ok){
-          showMessage((responseResult && responseResult.message) || '텀블러 반납/재대여 선택 결과를 기록하지 못했습니다. 다시 시도해주세요.');
-          return;
-        }
-        order.overdueTumblerResponseItems = Array.isArray(responseResult.items) ? responseResult.items : [];
-        order.tumblerDueDateAfterResponse = responseResult.earliestDueDate || user.tumblerDueDate || '';
-        order.rentedTumblerAfterResponse = responseResult.rentedTumbler || user.rentedTumbler || '';
-        if(responseResult.earliestDueDate) user.tumblerDueDate = responseResult.earliestDueDate;
-        if(responseResult.rentedTumbler) user.rentedTumbler = responseResult.rentedTumbler;
+      if(overdueResponseResult && overdueResponseResult.ok){
+        order.overdueTumblerResponseItems = Array.isArray(overdueResponseResult.items) ? overdueResponseResult.items : [];
+        order.tumblerDueDateAfterResponse = overdueResponseResult.earliestDueDate || user.tumblerDueDate || '';
+        order.rentedTumblerAfterResponse = overdueResponseResult.rentedTumbler || user.rentedTumbler || '';
+        if(overdueResponseResult.earliestDueDate) user.tumblerDueDate = overdueResponseResult.earliestDueDate;
+        if(overdueResponseResult.rentedTumbler) user.rentedTumbler = overdueResponseResult.rentedTumbler;
       }
 
       const orderCouponRecord = recordManualCouponHistory(user, 'COUPON_ORDER_USE', Number(totalCouponCost || 1), Number(couponBalancePrepared.currentCoupons || 0), remainingCoupons, {
@@ -31319,6 +31368,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
       state.currentOrderId = order.id;
       state.completeOrderOwnerUserId = user.id;
+      state.pendingOverdueOrderContinuation = null;
+      state.preparedOverdueOrderResponse = null;
       state.currentView = 'ORDER_COMPLETE';
       state.ocShowSettings = false;
       state.ocShowHistory = false;
@@ -44370,7 +44421,20 @@ body.mobile-tablet-device .pos-keyboard-btn{
       else if(action === 'set-overdue-tumbler-action'){
         const value = String(btn.dataset.value || '');
         state.overdueTumblerAction = isValidOverdueTumblerAction(value) ? value : '';
+        state.preparedOverdueOrderResponse = null;
+        const continuation = state.pendingOverdueOrderContinuation;
+        state.pendingOverdueOrderContinuation = null;
         render();
+        if(continuation && state.overdueTumblerAction && String(continuation.userId || '') === String(state.selectedUserId || '')){
+          window.setTimeout(() => {
+            handleFinalOrder(
+              continuation.userId,
+              Number(continuation.qty || 1),
+              String(continuation.memoText || ''),
+              continuation.proxyMode === true
+            );
+          }, 0);
+        }
       }
       else if(action === 'submit-order'){
         if(!state.selectedUserId){ showMessage('사용자를 먼저 선택해주세요.'); return; }
@@ -47043,7 +47107,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const previousDueDate = item.dueDate || '';
       let nextDueDate = previousDueDate;
       if(action === OVERDUE_RESPONSE_EXTEND_5_DAYS){
-        const baseDate = previousDueDate ? new Date(previousDueDate) : new Date();
+        const now = new Date();
+        const previousDate = previousDueDate ? new Date(previousDueDate) : null;
+        const baseDate = previousDate && !Number.isNaN(previousDate.getTime()) && previousDate.getTime() > now.getTime()
+          ? previousDate
+          : now;
         const next = calculateDueDate(baseDate, extensionDays, holidays());
         nextDueDate = next.toISOString();
         updatedDueDates[item.id] = nextDueDate;
@@ -47101,8 +47169,54 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       .map(item => item.dueDate || '')
       .filter(Boolean)
       .sort((a,b) => new Date(a) - new Date(b))[0] || '';
+    const remainingOverdueItems = getUserOverdueRentalItems(userId).map(item => ({
+      id:String(item.id || ''),
+      dueDate:String(item.dueDate || ''),
+      type:String(item.type || ''),
+      number:item.number,
+      label:getCancelCheckLabel(item)
+    }));
 
-    return { ok:true, items:responseItems, earliestDueDate, rentedTumbler, action, actionLabel };
+    return { ok:true, items:responseItems, earliestDueDate, rentedTumbler, remainingOverdueItems, action, actionLabel };
+  }
+
+  function finalizeOverdueOrderResponseOrderNumber(payload){
+    const orderId = String((payload && payload.orderId) || '');
+    const orderNumber = String((payload && payload.orderNumber) || '');
+    const action = String((payload && payload.action) || '');
+    if(!orderId || !orderNumber || !getOverdueResponseLabel(action)) return { ok:false, updated:0 };
+
+    let updated = 0;
+    tState.data.tumblers = tumblerList().map(item => {
+      if(!item || String(item.overdueOrderId || '') !== orderId || String(item.overdueOrderAction || '') !== action){
+        return item;
+      }
+      if(String(item.overdueOrderNumber || '') === orderNumber) return item;
+      updated += 1;
+      return { ...item, overdueOrderNumber:orderNumber };
+    });
+    tState.data.rentalHistory = rentalHistoryList().map(item => {
+      if(!item || String(item.overdueOrderId || '') !== orderId || String(item.overdueOrderAction || '') !== action){
+        return item;
+      }
+      const originalResponseHistory = Array.isArray(item.overdueOrderResponseHistory) ? item.overdueOrderResponseHistory : [];
+      const responseHistory = originalResponseHistory.map(entry => {
+        if(!entry || String(entry.orderId || '') !== orderId || String(entry.action || '') !== action || String(entry.orderNumber || '') === orderNumber){
+          return entry;
+        }
+        return { ...entry, orderNumber };
+      });
+      const itemOrderNumber = String(item.overdueOrderNumber || '');
+      const historyChanged = responseHistory.some((entry, index) => entry !== originalResponseHistory[index]);
+      if(itemOrderNumber === orderNumber && !historyChanged) return item;
+      updated += 1;
+      return { ...item, overdueOrderNumber:orderNumber, overdueOrderResponseHistory:responseHistory };
+    });
+    if(updated > 0){
+      saveData();
+      render();
+    }
+    return { ok:true, updated };
   }
 
   function addStaffSingle(){
@@ -49481,6 +49595,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     markRentOrderCancellationForCheck,
     resolveRentOrderCancellationCheck,
     recordOverdueOrderResponse,
+    finalizeOverdueOrderResponseOrderNumber,
     cleanupExpiredRentOrderReservations,
     cleanupReturnedWaitingTumblers,
     startRentOrderFlow: function(){
