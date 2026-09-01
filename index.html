@@ -43469,6 +43469,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function startCompletionPointerGesture(event){
       const btn = getCompletionScrollGuardButton(event.target);
       if(!btn || event.isPrimary === false) return;
+      completionBlockedClick = null;
       const scrollContainer = getCompletionScrollContainer();
       completionScrollGesture = {
         pointerId:event.pointerId,
@@ -43518,6 +43519,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const btn = getCompletionScrollGuardButton(event.target);
       const touch = event.changedTouches && event.changedTouches[0];
       if(!btn || !touch) return;
+      completionBlockedClick = null;
       const scrollContainer = getCompletionScrollContainer();
       completionScrollGesture = {
         touchIdentifier:touch.identifier,
