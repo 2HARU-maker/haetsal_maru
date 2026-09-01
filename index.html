@@ -31019,11 +31019,32 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const totalQty = getOrderTotalQuantityFromItems(orderItems);
       const totalCouponCost = getOrderCouponCostFromItems(orderItems);
       const now = new Date();
-      const preparedOverdueResponse = state.preparedOverdueOrderResponse &&
+      const memoryPreparedOverdueResponse = state.preparedOverdueOrderResponse &&
         String(state.preparedOverdueOrderResponse.userId || '') === String(user.id || '') &&
         String(state.preparedOverdueOrderResponse.action || '') === String(state.overdueTumblerAction || '')
         ? state.preparedOverdueOrderResponse
         : null;
+      const actualOverdueSnapshot = getActualOverdueTumblerSnapshot(user.id);
+      const recoveredOverdueResult = !memoryPreparedOverdueResponse
+        && actualOverdueSnapshot.dataReady
+        && window.TumblerModule
+        && typeof window.TumblerModule.getPendingOverdueOrderResponse === 'function'
+        ? window.TumblerModule.getPendingOverdueOrderResponse(user.id)
+        : null;
+      const recoveredPreparedOverdueResponse = recoveredOverdueResult && recoveredOverdueResult.ok && String(recoveredOverdueResult.orderId || '')
+        ? {
+            userId:String(user.id || ''),
+            action:String(recoveredOverdueResult.action || ''),
+            orderId:String(recoveredOverdueResult.orderId || ''),
+            overdueDays:Math.max(0, Number(recoveredOverdueResult.overdueDays || 0)),
+            result:recoveredOverdueResult
+          }
+        : null;
+      const preparedOverdueResponse = memoryPreparedOverdueResponse || recoveredPreparedOverdueResponse;
+      if(recoveredPreparedOverdueResponse){
+        state.overdueTumblerAction = recoveredPreparedOverdueResponse.action;
+        state.preparedOverdueOrderResponse = recoveredPreparedOverdueResponse;
+      }
       const pendingOrderId = lastOrderSubmissionFailure && lastOrderSubmissionFailure.needsCheck === true
         ? String(lastOrderSubmissionFailure.orderId || '')
         : '';
@@ -31035,7 +31056,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const orderId = pendingOrderId || String((preparedOverdueResponse && preparedOverdueResponse.orderId) || '') || uid('order');
       const couponBalanceOperationId = `order-create:${orderId}`;
-      const actualOverdueSnapshot = getActualOverdueTumblerSnapshot(user.id);
       if(!preparedOverdueResponse && !actualOverdueSnapshot.dataReady){
         showMessage('텀블러 데이터를 아직 불러오지 못했습니다.');
         return;
@@ -31108,9 +31128,36 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const pendingResolution = await verifyPendingOrderSubmissionBeforeNewOrder(user.id);
       if(pendingResolution && pendingResolution.committed === true){
-        if(pendingResolution.order) mergeOrderLiveDocumentIntoState(pendingResolution.order);
+        const committedOrder = pendingResolution.order || null;
+        if(committedOrder){
+          mergeOrderLiveDocumentIntoState(committedOrder);
+          await saveOrderSubmissionAttemptSafely({
+            orderId:String(committedOrder.id || orderId),
+            userId:String(committedOrder.userId || user.id || ''),
+            reservationId:String(committedOrder.sequenceReservationId || committedOrder.id || orderId),
+            dateKey:String(committedOrder.sequenceDate || ''),
+            seq:Number(committedOrder.seq || 0),
+            orderNumber:String(committedOrder.orderNumber || ''),
+            couponOperationId:String(committedOrder.couponBalanceOperationId || couponBalanceOperationId),
+            needsCheck:false,
+            stage:'COMPLETED',
+            status:'COMPLETED',
+            retryCount:Number(lastOrderSubmissionFailure && lastOrderSubmissionFailure.retryCount || 0),
+            errorCode:'',
+            errorMessage:''
+          });
+        }
         if(pendingResolution.couponRecord) rememberCommittedCouponHistoryRecord(pendingResolution.couponRecord);
         applyLiveOrderSaveState('saved', '제작대기 저장 정상');
+        if(committedOrder){
+          state.currentOrderId = String(committedOrder.id || orderId);
+          state.completeOrderOwnerUserId = String(committedOrder.userId || user.id || '');
+          state.pendingOverdueOrderContinuation = null;
+          state.preparedOverdueOrderResponse = null;
+          state.currentView = 'ORDER_COMPLETE';
+          state.ocShowSettings = false;
+          state.ocShowHistory = false;
+        }
         render();
         return;
       }
@@ -47082,6 +47129,81 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     };
   }
 
+  function getPendingOverdueOrderResponse(userId, expectedAction){
+    const targetId = String(userId || '');
+    const targetAction = String(expectedAction || '');
+    if(!targetId) return null;
+    const candidates = tumblerList()
+      .filter(item => item
+        && item.status === 'rented'
+        && String(item.currentUserId || '') === targetId
+        && String(item.overdueOrderId || '')
+        && !String(item.overdueOrderNumber || '')
+        && getOverdueResponseLabel(item.overdueOrderAction)
+        && (!targetAction || String(item.overdueOrderAction || '') === targetAction))
+      .sort((a,b) => new Date(b.overdueOrderActionAt || 0) - new Date(a.overdueOrderActionAt || 0));
+    if(!candidates.length) return null;
+
+    const first = candidates[0];
+    const orderId = String(first.overdueOrderId || '');
+    const action = String(first.overdueOrderAction || '');
+    const actionLabel = getOverdueResponseLabel(action);
+    const responseTumblers = candidates.filter(item => String(item.overdueOrderId || '') === orderId && String(item.overdueOrderAction || '') === action);
+    const tumblerIds = new Set(responseTumblers.map(item => String(item.id || '')));
+    const matchingHistory = rentalHistoryList().filter(item => {
+      if(!item || item.returnedAt || item.status !== 'rented' || !tumblerIds.has(String(item.tumblerId || ''))) return false;
+      if(String(item.userId || '') && String(item.userId || '') !== targetId) return false;
+      if(String(item.overdueOrderId || '') !== orderId || String(item.overdueOrderAction || '') !== action || String(item.overdueOrderNumber || '')) return false;
+      return (Array.isArray(item.overdueOrderResponseHistory) ? item.overdueOrderResponseHistory : []).some(entry => entry
+        && String(entry.orderId || '') === orderId
+        && String(entry.action || '') === action
+        && !String(entry.orderNumber || ''));
+    });
+    if(!matchingHistory.length) return null;
+
+    const responseItems = responseTumblers.map(item => ({
+      tumblerId:item.id,
+      type:item.type,
+      number:item.number,
+      label:getCancelCheckLabel(item),
+      previousDueDate:String(item.overduePreviousDueDate || ''),
+      newDueDate:String(item.overdueNewDueDate || item.dueDate || ''),
+      action,
+      actionLabel
+    }));
+    const stillRented = tumblerList().filter(item => item && item.status === 'rented' && String(item.currentUserId || '') === targetId);
+    const earliestDueDate = stillRented
+      .map(item => item.dueDate || '')
+      .filter(Boolean)
+      .sort((a,b) => new Date(a) - new Date(b))[0] || '';
+    const earliestPreviousDueDate = responseItems
+      .map(item => item.previousDueDate || '')
+      .filter(Boolean)
+      .sort((a,b) => new Date(a) - new Date(b))[0] || '';
+    const remainingOverdueItems = getUserOverdueRentalItems(targetId).map(item => ({
+      id:String(item.id || ''),
+      dueDate:String(item.dueDate || ''),
+      type:String(item.type || ''),
+      number:item.number,
+      label:getCancelCheckLabel(item)
+    }));
+
+    return {
+      ok:true,
+      recovered:true,
+      userId:targetId,
+      orderId,
+      orderNumber:'',
+      action,
+      actionLabel,
+      overdueDays:earliestPreviousDueDate ? getDiffDays(earliestPreviousDueDate) : 0,
+      items:responseItems,
+      earliestDueDate,
+      rentedTumbler:stillRented.map(item => getCancelCheckLabel(item)).filter(Boolean).join(', '),
+      remainingOverdueItems
+    };
+  }
+
   function recordOverdueOrderResponse(payload){
     const userId = String((payload && payload.userId) || '');
     const action = String((payload && payload.action) || '');
@@ -47091,6 +47213,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const extensionDays = Math.max(1, Number((payload && payload.extensionDays) || TUMBLER_DEFAULT_RENTAL_DAYS));
     if(!userId) return { ok:false, message:'사용자 정보를 찾을 수 없습니다.' };
     if(!actionLabel) return { ok:false, message:'반납/재대여 선택값을 확인할 수 없습니다.' };
+
+    const pendingResponse = getPendingOverdueOrderResponse(userId, action);
+    if(pendingResponse) return pendingResponse;
 
     const targets = getUserOverdueRentalItems(userId);
     if(!targets.length){
@@ -47177,7 +47302,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       label:getCancelCheckLabel(item)
     }));
 
-    return { ok:true, items:responseItems, earliestDueDate, rentedTumbler, remainingOverdueItems, action, actionLabel };
+    return { ok:true, orderId, orderNumber, items:responseItems, earliestDueDate, rentedTumbler, remainingOverdueItems, action, actionLabel };
   }
 
   function finalizeOverdueOrderResponseOrderNumber(payload){
@@ -49592,6 +49717,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     releaseReservedRentOrder,
     completeReservedRentOrder,
     getUserOverdueRentalSnapshot,
+    getPendingOverdueOrderResponse,
     markRentOrderCancellationForCheck,
     resolveRentOrderCancellationCheck,
     recordOverdueOrderResponse,
