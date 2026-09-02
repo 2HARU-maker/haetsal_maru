@@ -38593,7 +38593,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const snapshot = getActiveOrderLifecycleScrollSnapshot();
       if(!snapshot) return;
-      if(!current || target !== current || target !== snapshot.restoredOwner) return;
+      if(!current || target !== current) return;
+      if(target !== snapshot.restoredOwner){
+        clearOrderLifecycleScrollPreservation();
+        orderScrollRestoreGeneration += 1;
+        return;
+      }
       if(Math.abs(getDashboardScrollTop(current) - Number(snapshot.restoredTop || 0)) > 1){
         clearOrderLifecycleScrollPreservation();
       }
@@ -38605,25 +38610,27 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(snapshot.view !== state.currentView) return;
       if(isDashboardView() && String(snapshot.dashboardTab || '') !== String(state.dashboardTab || '')) return;
       if(!isDashboardView() && String(snapshot.selectedUserId || '') !== String(state.selectedUserId || '')) return;
+      if(isDashboardView()){
+        try{
+          const dashboardOwner = getDashboardScrollOwner();
+          if(dashboardOwner){
+            const restoredTop = restoreDashboardScrollTop(dashboardOwner, snapshot.dashboardTop);
+            if(orderLifecycleScrollSnapshot === snapshot){
+              snapshot.restoredOwner = dashboardOwner;
+              snapshot.restoredTop = restoredTop;
+            }
+          }
+        }catch(error){}
+        return;
+      }
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if(restoreGeneration !== orderScrollRestoreGeneration) return;
           try{
-            if(isDashboardView()){
-              const dashboardOwner = getDashboardScrollOwner();
-              if(dashboardOwner){
-                const restoredTop = restoreDashboardScrollTop(dashboardOwner, snapshot.dashboardTop);
-                if(orderLifecycleScrollSnapshot === snapshot){
-                  snapshot.restoredOwner = dashboardOwner;
-                  snapshot.restoredTop = restoredTop;
-                }
-              }
-            }else{
-              const page = getOrderScrollContainer();
-              if(page) page.scrollTop = Number(snapshot.pageTop || 0);
-              if(document.scrollingElement) document.scrollingElement.scrollTop = Number(snapshot.windowTop || 0);
-              window.scrollTo(window.pageXOffset || 0, Number(snapshot.windowTop || 0));
-            }
+            const page = getOrderScrollContainer();
+            if(page) page.scrollTop = Number(snapshot.pageTop || 0);
+            if(document.scrollingElement) document.scrollingElement.scrollTop = Number(snapshot.windowTop || 0);
+            window.scrollTo(window.pageXOffset || 0, Number(snapshot.windowTop || 0));
           }catch(error){}
         });
       });
