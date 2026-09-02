@@ -51165,6 +51165,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return Math.max(serverMaxSeq, Math.max(0, Math.floor(Number(localMinimumSeq || 0)) || 0));
   }
 
+  const confirmedOrderSequenceCounterDateKeys = new Set();
+
   async function reserveOrderSequenceByTransaction(request){
     const req = request && typeof request === 'object' ? request : {};
     const orderId = String(req.orderId || '').trim();
@@ -51175,8 +51177,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(!orderId || !dateKey) return { ok:false, status:'invalid-data' };
     await firebaseReadyPromise;
 
-    const initialFloor = await getInitialOrderSequenceFloor(dateKey, localMinimumSeq);
-    return runTransaction(db, async(transaction) => {
+    const counterWasConfirmed = confirmedOrderSequenceCounterDateKeys.has(dateKey);
+    const initialFloor = counterWasConfirmed
+      ? null
+      : await getInitialOrderSequenceFloor(dateKey, localMinimumSeq);
+    const result = await runTransaction(db, async(transaction) => {
       const reservationRef = getOrderSequenceReservationRef(orderId);
       const reservationSnap = await transaction.get(reservationRef);
       if(reservationSnap.exists()){
@@ -51210,6 +51215,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const counterRef = getOrderSequenceCounterRef(dateKey);
       const counterSnap = await transaction.get(counterRef);
       const counterData = counterSnap.exists() ? getPayloadData(counterSnap.data()) : null;
+      if(!counterData && counterWasConfirmed){
+        return { ok:false, status:'sequence-counter-missing', needsCheck:true };
+      }
       const currentSeq = counterData
         ? Math.max(0, Math.floor(Number(counterData.lastSeq || 0)) || 0)
         : initialFloor;
@@ -51258,6 +51266,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         allocatedAt
       };
     });
+    if(result && result.ok === true && result.status === 'reserved'){
+      confirmedOrderSequenceCounterDateKeys.add(dateKey);
+    }
+    return result;
   }
 
   function inspectOrderSequenceReservationSnapshot(snapshot, orderId, expectedDateKey){
