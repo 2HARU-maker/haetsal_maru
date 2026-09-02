@@ -43537,10 +43537,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return Number(container && container.scrollTop || 0);
     }
 
+    function getCompletionGestureScrollContainer(gesture){
+      const initialContainer = gesture && gesture.scrollContainer;
+      if(initialContainer && initialContainer.isConnected !== false) return initialContainer;
+      return getCompletionScrollContainer() || initialContainer;
+    }
+
     function completionGestureMoved(gesture, clientX, clientY){
       if(!gesture) return false;
       const distance = Math.hypot(Number(clientX || 0) - gesture.startX, Number(clientY || 0) - gesture.startY);
-      const scrollChanged = getCompletionScrollTop(gesture.scrollContainer) !== gesture.startScrollTop;
+      const scrollContainer = getCompletionGestureScrollContainer(gesture);
+      const scrollChanged = getCompletionScrollTop(scrollContainer) !== gesture.startScrollTop;
       return gesture.moved || distance >= COMPLETION_SCROLL_GUARD_DISTANCE || scrollChanged;
     }
 
