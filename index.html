@@ -58413,8 +58413,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     let orderCloudApplyGeneration = 0;
     let orderLiveQueueReceiveGeneration = 0;
 
-    function subscribeCloudDoc(key){
+    function subscribeCloudDoc(key, scopeInstance){
+      const scopeKey = 'cloud-doc-' + String(key || '');
       return onSnapshot(cloudDocRefs[key], snapshot => {
+        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
         if(!snapshot.exists()) return;
         const payload = snapshot.data();
         if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
@@ -58434,11 +58436,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.HaetsalCloudStore.applyRemote(key, payload.data);
         }
       }, error => {
-        markFirestoreQuotaExceeded(error, 'cloud-doc-' + key);
+        const quotaBlocked = markFirestoreQuotaExceeded(error, 'cloud-doc-' + key);
         console.error(`Firestore ${key} 불러오기 실패:`, error);
         if(window.HaetsalCloudStore && window.HaetsalCloudStore.markSyncError){
           window.HaetsalCloudStore.markSyncError(key, '동기화 실패');
         }
+        if(quotaBlocked){
+          stopAllScopedRealtimeSubscriptions();
+          return;
+        }
+        markScopedRealtimeSubscriptionFailed(scopeKey, error, scopeInstance);
       });
     }
 
@@ -58520,8 +58527,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return orderLiveQueueFallbackInFlight;
     }
 
-    function subscribeEmergencyCompactArchive(){
+    function subscribeEmergencyCompactArchive(scopeInstance){
       return onSnapshot(emergencyCompactArchiveRef, snapshot => {
+        markScopedRealtimeSubscriptionHealthy('emergency-compact-archive', scopeInstance);
         if(!snapshot.exists()) return;
         const payload = snapshot.data();
         const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
@@ -58530,8 +58538,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.HaetsalEmergencyCompactArchiveReceiver.receiveCloudArchive(archive || { records:[] });
         }
       }, error => {
-        markFirestoreQuotaExceeded(error, 'emergency-compact-archive-listener');
+        const quotaBlocked = markFirestoreQuotaExceeded(error, 'emergency-compact-archive-listener');
         console.error('Firestore 긴급 compact 보존 기록 불러오기 실패:', error);
+        if(quotaBlocked){
+          stopAllScopedRealtimeSubscriptions();
+          return;
+        }
+        markScopedRealtimeSubscriptionFailed('emergency-compact-archive', error, scopeInstance);
       });
     }
 
@@ -58961,13 +58974,15 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return Math.max(1000, nextShiftedMidnight - (now + seoulShiftMs) + 1000);
     }
 
-    function subscribeLiveOrderQuery(){
+    function subscribeLiveOrderQuery(scopeInstance){
       let stopped = false;
       let unsubscribeCurrentQuery = null;
       let dateRolloverTimer = null;
+      let queryGeneration = 0;
 
       const startCurrentDateQuery = function(compatibilityMode=false){
         if(stopped) return;
+        const currentQueryGeneration = ++queryGeneration;
         if(typeof unsubscribeCurrentQuery === 'function'){
           try{ unsubscribeCurrentQuery(); }catch(error){}
           unsubscribeCurrentQuery = null;
@@ -58984,8 +58999,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         const activeQueryRef = compatibilityMode
           ? buildCompatibleLiveOpenOrderQueryRef()
           : buildLiveOpenOrderQueryRef(businessDate);
-        unsubscribeCurrentQuery = onSnapshot(activeQueryRef, snapshot => {
-          if(stopped) return;
+        unsubscribeCurrentQuery = onSnapshot(activeQueryRef, { includeMetadataChanges:true }, snapshot => {
+          if(stopped || currentQueryGeneration !== queryGeneration) return;
+          markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance);
           const isInitialSnapshot = !initialSnapshotReceived;
           initialSnapshotReceived = true;
           const snapshotMetadata = {
@@ -59040,7 +59056,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             });
           }
           if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
-            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT);
+            const serverAuthorityComplete = snapshotMetadata.fromCache === false
+              && snapshotMetadata.hasPendingWrites === false
+              && snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT;
+            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, serverAuthorityComplete);
           }
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             filterIncomingOrdersByCloudGuards(changedLiveOrders).then(verifiedOrders => {
@@ -59051,9 +59070,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             });
           }
         }, error => {
-          markFirestoreQuotaExceeded(error, 'live-order-listener');
+          if(stopped || currentQueryGeneration !== queryGeneration) return;
+          const quotaBlocked = markFirestoreQuotaExceeded(error, 'live-order-listener');
           console.error('Firestore 오늘 주문별 실시간 저장소 불러오기 실패:', error);
-          if(initialSnapshotReceived) return;
+          if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
+            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
+          }
+          if(quotaBlocked){
+            stopAllScopedRealtimeSubscriptions();
+            return;
+          }
           const currentQuotaGuard = window.HaetsalFirestoreQuotaGuard;
           if(currentQuotaGuard && typeof currentQuotaGuard.isBlocked === 'function' && currentQuotaGuard.isBlocked()) return;
           const errorCode = String(error && error.code || '').toLowerCase();
@@ -59061,16 +59087,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           const shouldUseCompatibilityQuery = errorCode.includes('failed-precondition')
             || errorMessage.includes('failed-precondition')
             || errorMessage.includes('requires an index');
-          if(!shouldUseCompatibilityQuery){
+          if(!initialSnapshotReceived && !shouldUseCompatibilityQuery){
             loadOrderLiveQueueOnceForCurrentDay();
-            return;
           }
-          if(!compatibilityMode){
+          if(!initialSnapshotReceived && shouldUseCompatibilityQuery && !compatibilityMode){
             console.warn('Firestore 날짜 제한 주문 쿼리를 기존 주문별 실시간 쿼리로 전환합니다.');
             startCurrentDateQuery(true);
             return;
           }
-          loadOrderLiveQueueOnceForCurrentDay();
+          if(!initialSnapshotReceived && shouldUseCompatibilityQuery) loadOrderLiveQueueOnceForCurrentDay();
+          markScopedRealtimeSubscriptionFailed('live-order-query', error, scopeInstance);
         });
         dateRolloverTimer = setTimeout(startCurrentDateQuery, getMillisUntilNextSeoulDate());
       };
@@ -59078,6 +59104,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       startCurrentDateQuery();
       return function(){
         stopped = true;
+        queryGeneration += 1;
         if(dateRolloverTimer) clearTimeout(dateRolloverTimer);
         if(typeof unsubscribeCurrentQuery === 'function'){
           try{ unsubscribeCurrentQuery(); }catch(error){}
@@ -59085,10 +59112,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       };
     }
 
-    function subscribeUserLiveOrder(orderId){
+    function subscribeUserLiveOrder(orderId, scopeInstance){
       const targetOrderId = String(orderId || '').trim();
+      const scopeKey = 'user-live-order:' + targetOrderId;
       let initialSnapshotReceived = false;
       return onSnapshot(getLiveOrderRef(targetOrderId), docSnap => {
+        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
         const isInitialSnapshot = !initialSnapshotReceived;
         initialSnapshotReceived = true;
         if(!docSnap.exists()) return;
@@ -59106,14 +59135,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }
         });
       }, error => {
-        markFirestoreQuotaExceeded(error, 'user-live-order-listener-' + targetOrderId);
+        const quotaBlocked = markFirestoreQuotaExceeded(error, 'user-live-order-listener-' + targetOrderId);
         console.error('Firestore 사용자 주문별 실시간 저장소 불러오기 실패:', error);
+        if(quotaBlocked){
+          stopAllScopedRealtimeSubscriptions();
+          return;
+        }
+        markScopedRealtimeSubscriptionFailed(scopeKey, error, scopeInstance);
       });
     }
 
-    function subscribeDeliveryRecord(orderId){
+    function subscribeDeliveryRecord(orderId, scopeInstance){
       const targetOrderId = String(orderId || '').trim();
+      const scopeKey = 'delivery-record:' + targetOrderId;
       return onSnapshot(getDeliveryRecordRef(targetOrderId), docSnap => {
+        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
         addRealtimeUsageDiagnostic('deliverySnapshotReads', 1);
         if(!docSnap.exists()){
           addRealtimeUsageDiagnostic('deliveryMissingSnapshots', 1);
@@ -59125,47 +59161,218 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.OrderModule.receiveDeliveryRecords([normalized], '배달 기록 주문별 저장소');
         }
       }, error => {
-        markFirestoreQuotaExceeded(error, 'delivery-record-listener-' + targetOrderId);
+        const quotaBlocked = markFirestoreQuotaExceeded(error, 'delivery-record-listener-' + targetOrderId);
         console.error('Firestore 배달 기록 불러오기 실패:', error);
+        if(quotaBlocked){
+          stopAllScopedRealtimeSubscriptions();
+          return;
+        }
+        markScopedRealtimeSubscriptionFailed(scopeKey, error, scopeInstance);
       });
     }
 
     const scopedRealtimeSubscriptions = new Map();
+    const scopedRealtimeRetryStates = new Map();
+    const SCOPED_REALTIME_RETRY_BASE_MS = 1000;
+    const SCOPED_REALTIME_RETRY_MAX_MS = 30000;
+    const SCOPED_REALTIME_RETRY_MAX_ATTEMPTS = 6;
+    const SCOPED_REALTIME_RETRY_JITTER_RATIO = 0.2;
+
+    function isScopedRealtimeGuardBlocked(){
+      const currentQuotaGuard = window.HaetsalFirestoreQuotaGuard;
+      const runtimeGuard = window.HaetsalRuntimeGuard;
+      return !!((currentQuotaGuard && typeof currentQuotaGuard.isBlocked === 'function' && currentQuotaGuard.isBlocked())
+        || (runtimeGuard && typeof runtimeGuard.isStopped === 'function' && runtimeGuard.isStopped()));
+    }
+
+    function isScopedRealtimeOnline(){
+      return typeof navigator === 'undefined' || navigator.onLine !== false;
+    }
+
+    function isScopedRealtimeRecoveryAllowed(){
+      return !isScopedRealtimeGuardBlocked() && isScopedRealtimeOnline();
+    }
+
+    function getScopedRealtimeKnownKeys(){
+      return Array.from(new Set([
+        ...Array.from(scopedRealtimeSubscriptions.keys()),
+        ...Array.from(scopedRealtimeRetryStates.keys())
+      ]));
+    }
+
+    function clearScopedRealtimeRetryState(key){
+      const retryState = scopedRealtimeRetryStates.get(key);
+      if(retryState && retryState.timer) clearTimeout(retryState.timer);
+      return scopedRealtimeRetryStates.delete(key);
+    }
+
+    function getScopedRealtimeRetryErrorCode(error){
+      return String((error && (error.code || error.name)) || 'listener-error');
+    }
+
+    function getScopedRealtimeRetryDelayMs(attempt){
+      const exponent = Math.max(0, Number(attempt || 1) - 1);
+      const baseDelay = Math.min(SCOPED_REALTIME_RETRY_MAX_MS, SCOPED_REALTIME_RETRY_BASE_MS * Math.pow(2, exponent));
+      const jitter = baseDelay * SCOPED_REALTIME_RETRY_JITTER_RATIO * ((Math.random() * 2) - 1);
+      return Math.max(0, Math.round(baseDelay + jitter));
+    }
+
+    function markScopedRealtimeSubscriptionHealthy(key, scopeInstance){
+      const entry = scopedRealtimeSubscriptions.get(key);
+      if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
+      entry.status = 'healthy';
+      entry.lastHealthyAt = Date.now();
+      clearScopedRealtimeRetryState(key);
+      return true;
+    }
+
+    function scheduleScopedRealtimeSubscriptionRetry(key, label, error){
+      const normalizedKey = String(key || '');
+      if(!normalizedKey || isScopedRealtimeGuardBlocked()) return false;
+      const previous = scopedRealtimeRetryStates.get(normalizedKey) || null;
+      if(previous && (previous.timer || previous.ready === true)) return false;
+      const previousAttempt = Math.max(0, Number(previous && previous.attempt) || 0);
+      const generation = Math.max(0, Number(previous && previous.generation) || 0) + 1;
+      const lastErrorCode = getScopedRealtimeRetryErrorCode(error);
+      if(!isScopedRealtimeOnline()){
+        scopedRealtimeRetryStates.set(normalizedKey, {
+          key:normalizedKey,
+          label:String(label || normalizedKey),
+          attempt:previousAttempt,
+          generation,
+          timer:null,
+          ready:false,
+          waiting:true,
+          exhausted:false,
+          lastErrorCode
+        });
+        return true;
+      }
+      const attempt = previousAttempt + 1;
+      if(attempt > SCOPED_REALTIME_RETRY_MAX_ATTEMPTS){
+        scopedRealtimeRetryStates.set(normalizedKey, {
+          key:normalizedKey,
+          label:String(label || normalizedKey),
+          attempt:SCOPED_REALTIME_RETRY_MAX_ATTEMPTS,
+          generation,
+          timer:null,
+          ready:false,
+          waiting:false,
+          exhausted:true,
+          lastErrorCode
+        });
+        return false;
+      }
+      const retryState = {
+        key:normalizedKey,
+        label:String(label || normalizedKey),
+        attempt,
+        generation,
+        timer:null,
+        ready:false,
+        waiting:false,
+        exhausted:false,
+        lastErrorCode
+      };
+      retryState.timer = setTimeout(function(){
+        const current = scopedRealtimeRetryStates.get(normalizedKey);
+        if(!current || current.generation !== generation) return;
+        current.timer = null;
+        if(!isScopedRealtimeRecoveryAllowed()){
+          current.ready = false;
+          current.waiting = true;
+          scopedRealtimeRetryStates.set(normalizedKey, current);
+          return;
+        }
+        current.ready = true;
+        current.waiting = false;
+        scopedRealtimeRetryStates.set(normalizedKey, current);
+        syncScopedRealtimeSubscriptions();
+      }, getScopedRealtimeRetryDelayMs(attempt));
+      scopedRealtimeRetryStates.set(normalizedKey, retryState);
+      return true;
+    }
+
+    function markScopedRealtimeSubscriptionFailed(key, error, scopeInstance){
+      const entry = scopedRealtimeSubscriptions.get(key);
+      if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
+      const label = entry.label;
+      stopScopedRealtimeSubscription(key, { preserveRetry:true });
+      return scheduleScopedRealtimeSubscriptionRetry(key, label, error);
+    }
 
     function startScopedRealtimeSubscription(key, label, factory){
       if(scopedRealtimeSubscriptions.has(key)) return true;
-      const entry = { key, label, unsubscribe:null, release:null, released:false };
+      if(isScopedRealtimeGuardBlocked()) return false;
+      const retryState = scopedRealtimeRetryStates.get(key);
+      if(retryState){
+        if(retryState.timer || retryState.waiting || retryState.exhausted || retryState.ready !== true) return false;
+        retryState.ready = false;
+        scopedRealtimeRetryStates.set(key, retryState);
+      }
+      const entry = {
+        key,
+        label,
+        unsubscribe:null,
+        release:null,
+        released:false,
+        preserveRetry:false,
+        status:'starting',
+        lastHealthyAt:0
+      };
       const managedUnsubscribe = function(){
         if(entry.released) return;
         entry.released = true;
         if(scopedRealtimeSubscriptions.get(key) === entry) scopedRealtimeSubscriptions.delete(key);
+        if(!entry.preserveRetry) clearScopedRealtimeRetryState(key);
         if(typeof entry.unsubscribe === 'function'){
           try{ entry.unsubscribe(); }catch(error){}
         }
       };
       scopedRealtimeSubscriptions.set(key, entry);
       try{
-        entry.unsubscribe = factory();
+        const unsubscribe = factory(entry);
+        if(entry.released){
+          if(typeof unsubscribe === 'function'){
+            try{ unsubscribe(); }catch(error){}
+          }
+          return false;
+        }
+        entry.unsubscribe = unsubscribe;
         if(typeof entry.unsubscribe !== 'function'){
+          const invalidFactoryError = new Error('실시간 구독 해제 함수를 만들지 못했습니다.');
+          entry.preserveRetry = true;
           managedUnsubscribe();
+          scheduleScopedRealtimeSubscriptionRetry(key, label, invalidFactoryError);
           return false;
         }
         entry.release = window.HaetsalRuntimeGuard && typeof window.HaetsalRuntimeGuard.registerRealtimeUnsubscribe === 'function'
           ? window.HaetsalRuntimeGuard.registerRealtimeUnsubscribe(managedUnsubscribe, label)
           : managedUnsubscribe;
-        return scopedRealtimeSubscriptions.has(key);
+        return scopedRealtimeSubscriptions.get(key) === entry;
       }catch(error){
+        entry.preserveRetry = true;
         managedUnsubscribe();
-        throw error;
+        console.error(`Firestore ${label} 구독 시작 실패:`, error);
+        scheduleScopedRealtimeSubscriptionRetry(key, label, error);
+        return false;
       }
     }
 
-    function stopScopedRealtimeSubscription(key){
+    function stopScopedRealtimeSubscription(key, options){
+      const opts = options && typeof options === 'object' ? options : {};
+      const preserveRetry = opts.preserveRetry === true;
       const entry = scopedRealtimeSubscriptions.get(key);
-      if(!entry) return false;
+      if(!entry){
+        if(!preserveRetry) clearScopedRealtimeRetryState(key);
+        return false;
+      }
+      entry.preserveRetry = preserveRetry;
       if(typeof entry.release === 'function') entry.release();
       else{
+        entry.released = true;
         scopedRealtimeSubscriptions.delete(key);
+        if(!preserveRetry) clearScopedRealtimeRetryState(key);
         if(typeof entry.unsubscribe === 'function'){
           try{ entry.unsubscribe(); }catch(error){}
         }
@@ -59174,7 +59381,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     function stopAllScopedRealtimeSubscriptions(){
-      Array.from(scopedRealtimeSubscriptions.keys()).forEach(stopScopedRealtimeSubscription);
+      getScopedRealtimeKnownKeys().forEach(stopScopedRealtimeSubscription);
       stopAllOrderGuardVerifications();
       return true;
     }
@@ -59190,16 +59397,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     function syncDeliveryRecordSubscriptions(wanted){
       const keyPrefix = 'delivery-record:';
       if(!wanted || !window.OrderModule || typeof window.OrderModule.getActiveDeliveryOrderIds !== 'function'){
-        Array.from(scopedRealtimeSubscriptions.keys())
+        getScopedRealtimeKnownKeys()
           .filter(key => String(key).startsWith(keyPrefix))
           .forEach(stopScopedRealtimeSubscription);
         return;
       }
       const activeIds = new Set(window.OrderModule.getActiveDeliveryOrderIds().map(value => String(value || '').trim()).filter(Boolean));
       activeIds.forEach(orderId => {
-        setScopedRealtimeSubscription(keyPrefix + orderId, 'delivery-record-' + orderId, true, () => subscribeDeliveryRecord(orderId));
+        setScopedRealtimeSubscription(keyPrefix + orderId, 'delivery-record-' + orderId, true, scopeInstance => subscribeDeliveryRecord(orderId, scopeInstance));
       });
-      Array.from(scopedRealtimeSubscriptions.keys())
+      getScopedRealtimeKnownKeys()
         .filter(key => String(key).startsWith(keyPrefix) && !activeIds.has(String(key).slice(keyPrefix.length)))
         .forEach(stopScopedRealtimeSubscription);
     }
@@ -59207,18 +59414,36 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     function syncUserLiveOrderSubscriptions(wanted){
       const keyPrefix = 'user-live-order:';
       if(!wanted || !window.OrderModule || typeof window.OrderModule.getCurrentUserActiveOrderIds !== 'function'){
-        Array.from(scopedRealtimeSubscriptions.keys())
+        getScopedRealtimeKnownKeys()
           .filter(key => String(key).startsWith(keyPrefix))
           .forEach(stopScopedRealtimeSubscription);
         return;
       }
       const activeIds = new Set(window.OrderModule.getCurrentUserActiveOrderIds().map(value => String(value || '').trim()).filter(Boolean));
       activeIds.forEach(orderId => {
-        setScopedRealtimeSubscription(keyPrefix + orderId, 'user-live-order-' + orderId, true, () => subscribeUserLiveOrder(orderId));
+        setScopedRealtimeSubscription(keyPrefix + orderId, 'user-live-order-' + orderId, true, scopeInstance => subscribeUserLiveOrder(orderId, scopeInstance));
       });
-      Array.from(scopedRealtimeSubscriptions.keys())
+      getScopedRealtimeKnownKeys()
         .filter(key => String(key).startsWith(keyPrefix) && !activeIds.has(String(key).slice(keyPrefix.length)))
         .forEach(stopScopedRealtimeSubscription);
+    }
+
+    function runScopedRealtimeHealthCheck(){
+      if(!isScopedRealtimeRecoveryAllowed()) return false;
+      scopedRealtimeRetryStates.forEach((retryState, key) => {
+        if(scopedRealtimeSubscriptions.has(key)) return;
+        if(retryState.timer) clearTimeout(retryState.timer);
+        scopedRealtimeRetryStates.set(key, {
+          ...retryState,
+          attempt:retryState.exhausted ? 0 : Math.max(0, Number(retryState.attempt) || 0),
+          generation:Math.max(0, Number(retryState.generation) || 0) + 1,
+          timer:null,
+          ready:true,
+          waiting:false,
+          exhausted:false
+        });
+      });
+      return syncScopedRealtimeSubscriptions();
     }
 
     function getRealtimeScopeState(){
@@ -59251,9 +59476,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         return false;
       }
       const scope = getRealtimeScopeState();
-      setScopedRealtimeSubscription('cloud-doc-shared', 'cloud-doc-shared', true, () => subscribeCloudDoc('shared'));
-      setScopedRealtimeSubscription('cloud-doc-tumbler', 'cloud-doc-tumbler', true, () => subscribeCloudDoc('tumbler'));
-      setScopedRealtimeSubscription('cloud-doc-order', 'cloud-doc-order', scope.orderRoute, () => subscribeCloudDoc('order'));
+      setScopedRealtimeSubscription('cloud-doc-shared', 'cloud-doc-shared', true, scopeInstance => subscribeCloudDoc('shared', scopeInstance));
+      setScopedRealtimeSubscription('cloud-doc-tumbler', 'cloud-doc-tumbler', true, scopeInstance => subscribeCloudDoc('tumbler', scopeInstance));
+      setScopedRealtimeSubscription('cloud-doc-order', 'cloud-doc-order', scope.orderRoute, scopeInstance => subscribeCloudDoc('order', scopeInstance));
       setScopedRealtimeSubscription('emergency-compact-archive', 'emergency-compact-archive', scope.operatorDashboard, subscribeEmergencyCompactArchive);
       setScopedRealtimeSubscription('live-order-query', 'live-order-query', scope.operatorDashboard, subscribeLiveOrderQuery);
       syncOrderGuardVerifications(scope.operatorDashboard);
@@ -59266,6 +59491,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       sync:syncScopedRealtimeSubscriptions,
       stopAll:stopAllScopedRealtimeSubscriptions
     };
+    try{
+      window.addEventListener('online', runScopedRealtimeHealthCheck);
+      window.addEventListener('haetsal:runtime-stopped', stopAllScopedRealtimeSubscriptions);
+      document.addEventListener('visibilitychange', function(){
+        if(!document.hidden) runScopedRealtimeHealthCheck();
+      });
+    }catch(error){}
     syncScopedRealtimeSubscriptions();
   }).catch(error => {
     console.error('Firebase 준비 실패:', error);
