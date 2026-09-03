@@ -12949,6 +12949,7 @@ window.HaetsalSharedStore = (function(){
     const ORDER_STAGE_TRANSITION_QUEUE_MAX_COUNT = 500;
     let completionRequestSerialTail = Promise.resolve();
     const completionRequestTaskByKey = new Map();
+    const productionCompletionInteractionBusyOrderIds = new Set();
     let completionRequestRetryRunnerPromise = null;
     let completionRequestCloudHydrationPromise = null;
     let completedFollowupRetryRunnerPromise = null;
@@ -16326,8 +16327,9 @@ window.HaetsalSharedStore = (function(){
       };
     }
 
-    function prepareOrderDataForFullBackup(sourceData){
-      const normalized = normalizeStoredOrderData(sourceData || {
+    function prepareOrderDataForFullBackup(sourceData, prepared){
+      const preparedData = prepared || {};
+      const normalized = preparedData.normalizedData || normalizeStoredOrderData(sourceData || {
         users: state && Array.isArray(state.users) ? state.users : [],
         orders: state && Array.isArray(state.orders) ? state.orders : [],
         deliveryRecords: state && Array.isArray(state.deliveryRecords) ? state.deliveryRecords : [],
@@ -17278,8 +17280,9 @@ window.HaetsalSharedStore = (function(){
       }
     }
 
-    function getOrderStorageDiagnostics(sourceData){
-      const normalized = normalizeStoredOrderData(sourceData || {
+    function getOrderStorageDiagnostics(sourceData, prepared){
+      const preparedData = prepared || {};
+      const normalized = preparedData.normalizedData || normalizeStoredOrderData(sourceData || {
         users: state && Array.isArray(state.users) ? state.users : [],
         orders: state && Array.isArray(state.orders) ? state.orders : [],
         logs: state && Array.isArray(state.logs) ? state.logs : [],
@@ -17287,7 +17290,7 @@ window.HaetsalSharedStore = (function(){
         registrationRequests: state && Array.isArray(state.registrationRequests) ? state.registrationRequests : [],
         sysSettings: state && state.sysSettings ? state.sysSettings : {}
       });
-      const fullBackupData = prepareOrderDataForFullBackup(normalized);
+      const fullBackupData = preparedData.fullBackupData || prepareOrderDataForFullBackup(normalized, { normalizedData:normalized });
       const payloadBytes = getJsonSizeBytes(fullBackupData);
       const userBytes = getJsonSizeBytes(fullBackupData.users || []);
       const orderBytes = getJsonSizeBytes(fullBackupData.orders || []);
@@ -18245,8 +18248,9 @@ function getOrderArchiveAutoTodayKey(){
     }
 
     
-function createOrderSafetyBackupPayload(sourceData, reason='auto'){
-      const normalized = normalizeStoredOrderData(sourceData || {
+function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
+      const preparedData = prepared || {};
+      const normalized = preparedData.normalizedData || normalizeStoredOrderData(sourceData || {
         users: state && Array.isArray(state.users) ? state.users : [],
         orders: state && Array.isArray(state.orders) ? state.orders : [],
         logs: state && Array.isArray(state.logs) ? state.logs : [],
@@ -18268,13 +18272,17 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           lastSequence: normalized.sysSettings ? normalized.sysSettings.sequence : '',
           sequenceDate: normalized.sysSettings ? normalized.sysSettings.sequenceDate : ''
         },
-        diagnostics: getOrderStorageDiagnostics(normalized)
+        diagnostics: preparedData.storageDiagnostics || getOrderStorageDiagnostics(normalized, {
+          normalizedData:normalized,
+          fullBackupData:preparedData.fullBackupData
+        })
       };
     }
 
 
-    function createOrderLiveQueuePayload(sourceData, reason='auto'){
-      const normalized = normalizeStoredOrderData(sourceData || {
+    function createOrderLiveQueuePayload(sourceData, reason='auto', prepared){
+      const preparedData = prepared || {};
+      const normalized = preparedData.normalizedData || normalizeStoredOrderData(sourceData || {
         users: state && Array.isArray(state.users) ? state.users : [],
         orders: state && Array.isArray(state.orders) ? state.orders : [],
         logs: state && Array.isArray(state.logs) ? state.logs : [],
@@ -18341,10 +18349,11 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       }
     }
 
-    function persistOrderLiveQueueLocal(reason='auto'){
+    function persistOrderLiveQueueLocal(reason='auto', prepared){
       try{
         if(!window.localStorage) return null;
-        const payload = createOrderLiveQueuePayload({
+        const preparedData = prepared || {};
+        const payload = preparedData.payload || createOrderLiveQueuePayload({
           users: state.users,
           orders: state.orders,
           deliveryRecords: state.deliveryRecords,
@@ -18352,7 +18361,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           couponHistory: state.couponHistory,
           registrationRequests: state.registrationRequests,
           sysSettings: state.sysSettings
-        }, reason);
+        }, reason, preparedData);
         window.localStorage.setItem(ORDER_LIVE_QUEUE_LOCAL_KEY, JSON.stringify(payload));
         state.lastOrderLiveQueueSummary = {
           openOrderCount: Array.isArray(payload.orders) ? payload.orders.length : 0,
@@ -18364,6 +18373,55 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         console.warn('제작 대기 전용 백업 저장 실패', error);
         return null;
       }
+    }
+
+    function persistOrderLocalSafetyPayloads(sourceData, reason='auto', prepared){
+      const preparedData = prepared || {};
+      let normalizedData = preparedData.normalizedData || null;
+      try{
+        if(!normalizedData){
+          normalizedData = normalizeStoredOrderData(sourceData || {
+            users: state.users,
+            orders: state.orders,
+            deliveryRecords: state.deliveryRecords,
+            logs: state.logs,
+            couponHistory: state.couponHistory,
+            registrationRequests: state.registrationRequests,
+            sysSettings: state.sysSettings
+          });
+        }
+      }catch(error){
+        return {
+          emergencyBackup:persistOrderEmergencyBackup(reason),
+          liveQueue:persistOrderLiveQueueLocal(reason),
+          storageDiagnostics:null
+        };
+      }
+      let emergencyBackup = null;
+      let storageDiagnostics = null;
+      try{
+        const emergencyBackupPayload = createOrderSafetyBackupPayload(normalizedData, reason, {
+          normalizedData,
+          fullBackupData:preparedData.fullBackupData,
+          storageDiagnostics:preparedData.storageDiagnostics
+        });
+        storageDiagnostics = emergencyBackupPayload.diagnostics;
+        emergencyBackup = persistOrderEmergencyBackup(reason, { payload:emergencyBackupPayload });
+      }catch(error){
+        emergencyBackup = persistOrderEmergencyBackup(reason);
+      }
+      let liveQueue = null;
+      try{
+        const liveQueuePayload = createOrderLiveQueuePayload(normalizedData, reason, { normalizedData });
+        liveQueue = persistOrderLiveQueueLocal(reason, { payload:liveQueuePayload });
+      }catch(error){
+        liveQueue = persistOrderLiveQueueLocal(reason);
+      }
+      return {
+        emergencyBackup,
+        liveQueue,
+        storageDiagnostics
+      };
     }
 
     function getOrderLiveQueueTimestamp(order){
@@ -19296,7 +19354,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       return !(authority.complete && orderId && !authority.ids.has(orderId));
     }
 
-    function setCurrentDayLiveOrderAuthority(dateKey, orderIds, complete){
+    function setCurrentDayLiveOrderAuthority(dateKey, orderIds, complete, options){
+      const opts = options || {};
       const nextDateKey = String(dateKey || '').trim();
       const nextIds = new Set((Array.isArray(orderIds) ? orderIds : []).map(value => String(value || '').trim()).filter(Boolean));
       const previous = currentDayLiveOrderAuthority;
@@ -19315,7 +19374,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         ids:nextIds,
         hiddenIds:nextHiddenIds
       };
-      if(changed && isDashboardView()) renderAfterRemoteOrderSync('오늘 주문 실시간 목록 정합성 반영');
+      if(changed && isDashboardView() && opts.deferRender !== true) renderAfterRemoteOrderSync('오늘 주문 실시간 목록 정합성 반영');
       return changed;
     }
 
@@ -21138,8 +21197,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
     }
 
     function receiveOrderLiveDocuments(values, sourceLabel='주문별 제작대기 저장소', options){
+      const opts = options || {};
       const rows = Array.isArray(values) ? values : [values];
-      const remoteLifecycleTransitions = prepareRemoteOrderLifecycleScrollPreservation(rows, sourceLabel, options);
+      const remoteLifecycleTransitions = prepareRemoteOrderLifecycleScrollPreservation(rows, sourceLabel, opts);
       let added = 0;
       let updated = 0;
       rows.forEach(value => {
@@ -21155,14 +21215,42 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           updatedCount: updated,
           source: sourceLabel
         });
-        persistOrderEmergencyBackup('merge-live-documents');
-        persistOrderLiveQueueLocal('merge-live-documents');
+        persistOrderLocalSafetyPayloads({
+          users:state.users,
+          orders:state.orders,
+          deliveryRecords:state.deliveryRecords,
+          logs:state.logs,
+          couponHistory:state.couponHistory,
+          registrationRequests:state.registrationRequests,
+          sysSettings:state.sysSettings
+        }, 'merge-live-documents');
         applyVerifiedCouponBalancesToStateUsers('live-document-sync');
+        if(opts.deferRender !== true){
+          renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
+            orderEditUrgentIds:remoteLifecycleTransitions.map(item => String(item && item.orderId || '')).filter(Boolean)
+          });
+        }
+      }
+      return {
+        added,
+        updated,
+        count,
+        sourceLabel,
+        remoteLifecycleCount:remoteLifecycleTransitions.length,
+        remoteLifecycleOrderIds:remoteLifecycleTransitions.map(item => String(item && item.orderId || '')).filter(Boolean)
+      };
+    }
+
+    function finishCurrentDayLiveOrderSnapshot(values, sourceLabel, options){
+      const opts = options || {};
+      const result = receiveOrderLiveDocuments(values, sourceLabel, { ...opts, deferRender:true });
+      const shouldRender = opts.authorityChanged === true || Number(result && result.count || 0) > 0;
+      if(shouldRender && isDashboardView()){
         renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
-          orderEditUrgentIds:remoteLifecycleTransitions.map(item => String(item && item.orderId || '')).filter(Boolean)
+          orderEditUrgentIds:Array.isArray(result.remoteLifecycleOrderIds) ? result.remoteLifecycleOrderIds : []
         });
       }
-      return { added, updated, count, sourceLabel, remoteLifecycleCount:remoteLifecycleTransitions.length };
+      return { ...result, authorityChanged:opts.authorityChanged === true, renderRequested:shouldRender };
     }
 
     function mergeLocalLiveQueueIntoData(data){
@@ -21234,10 +21322,11 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
       }
     }
 
-    function persistOrderEmergencyBackup(reason='auto'){
+    function persistOrderEmergencyBackup(reason='auto', prepared){
       try{
         if(!window.localStorage) return null;
-        const backup = createOrderSafetyBackupPayload({
+        const preparedData = prepared || {};
+        const backup = preparedData.payload || createOrderSafetyBackupPayload({
           users: state.users,
           orders: state.orders,
           deliveryRecords: state.deliveryRecords,
@@ -21245,7 +21334,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
           couponHistory: state.couponHistory,
           registrationRequests: state.registrationRequests,
           sysSettings: state.sysSettings
-        }, reason);
+        }, reason, preparedData);
         window.localStorage.setItem(ORDER_EMERGENCY_BACKUP_KEY, JSON.stringify(backup));
         return backup;
       }catch(error){
@@ -21643,20 +21732,37 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto'){
         const unsafeOrderCouponSave = preserveAutomaticCoupons && hasUnmatchedCouponPreserveCacheUser(normalized.users, couponPreserveCacheUsers);
         const normalizedForSave = preserveAutomaticCoupons ? preserveOrderDataCouponsForAutomaticSave(normalized, couponPreserveCacheUsers) : normalized;
         rememberOrderLiveSourceForCloudSave(normalizedForSave, reason);
-        const fullBackupData = prepareOrderDataForFullBackup(normalizedForSave);
-        const storageDiagnostics = getOrderStorageDiagnostics(normalizedForSave);
+        const fullBackupData = prepareOrderDataForFullBackup(normalizedForSave, { normalizedData:normalizedForSave });
+        const storageDiagnostics = getOrderStorageDiagnostics(normalizedForSave, {
+          normalizedData:normalizedForSave,
+          fullBackupData
+        });
         state.lastOrderStorageDiagnostics = storageDiagnostics;
         const forceFullBackup = opts.forceFullBackup === true;
         if(orderArchiveMaintenanceMode && !forceFullBackup && reason.indexOf('archive-old-order-data') === -1){
-          persistOrderEmergencyBackup(reason + '-maintenance-local-only');
-          persistOrderLiveQueueLocal(reason + '-maintenance-local-only');
+          persistOrderLocalSafetyPayloads({
+            users:state.users,
+            orders:state.orders,
+            deliveryRecords:state.deliveryRecords,
+            logs:state.logs,
+            couponHistory:state.couponHistory,
+            registrationRequests:state.registrationRequests,
+            sysSettings:state.sysSettings
+          }, reason + '-maintenance-local-only');
           state.saveState = 'pending';
           state.saveStateText = '안전 분리 중 저장 보류';
           refreshOrderSaveStatusChips();
           return;
         }
-        persistOrderEmergencyBackup(reason);
-        persistOrderLiveQueueLocal(reason);
+        persistOrderLocalSafetyPayloads({
+          users:state.users,
+          orders:state.orders,
+          deliveryRecords:state.deliveryRecords,
+          logs:state.logs,
+          couponHistory:state.couponHistory,
+          registrationRequests:state.registrationRequests,
+          sysSettings:state.sysSettings
+        }, reason);
         if(menuCatalogProtection.blockFullBackup){
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-menu-catalog-protected-live-only');
           state.saveState = 'pending';
@@ -32555,8 +32661,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
         state.orders.push(stagedOrder);
         applied = stagedOrder;
       }
-      persistOrderEmergencyBackup(sourceLabel || 'order-stage-transaction');
-      persistOrderLiveQueueLocal(sourceLabel || 'order-stage-transaction');
+      persistOrderLocalSafetyPayloads({
+        users:state.users,
+        orders:state.orders,
+        deliveryRecords:state.deliveryRecords,
+        logs:state.logs,
+        couponHistory:state.couponHistory,
+        registrationRequests:state.registrationRequests,
+        sysSettings:state.sysSettings
+      }, sourceLabel || 'order-stage-transaction');
       markImportantFullBackupPending(`${sourceLabel || 'order-stage-transaction'}-important-backup`);
       return applied;
     }
@@ -32726,10 +32839,33 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return orderStageTransitionRetryRunnerPromise;
     }
 
+    function isProductionCompletionInteractionBusy(orderId){
+      return productionCompletionInteractionBusyOrderIds.has(String(orderId || '').trim());
+    }
+
+    function beginProductionCompletionInteraction(orderId){
+      const id = String(orderId || '').trim();
+      if(!id || productionCompletionInteractionBusyOrderIds.has(id)) return false;
+      productionCompletionInteractionBusyOrderIds.add(id);
+      requestOrderLifecycleRender();
+      return true;
+    }
+
+    function endProductionCompletionInteraction(orderId){
+      const id = String(orderId || '').trim();
+      if(!id || !productionCompletionInteractionBusyOrderIds.delete(id)) return false;
+      requestOrderLifecycleRender();
+      return true;
+    }
+
     async function handleOrderStageTransition(orderId, targetStage, successMessage, actionLabel, options){
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      const trackProductionCompletionBusy = opts.immediateProductionCompletionFeedback === true;
+      if(trackProductionCompletionBusy && isProductionCompletionInteractionBusy(order.id)){
+        return { status:'pending', skipped:true, reason:'production-completion-interaction-busy' };
+      }
       const safeTargetStage = normalizeOrderWorkStage(targetStage);
       if(!safeTargetStage || safeTargetStage === 'DONE'){
         showMessage('주문 단계 확인 필요: 변경할 단계를 확인할 수 없습니다.');
@@ -32740,6 +32876,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return;
       }
       beginOrderLifecycleScrollPreservation(`order-stage:${String(orderId || '')}:${safeTargetStage}`);
+      if(trackProductionCompletionBusy) beginProductionCompletionInteraction(order.id);
       const lifecycleBase = {
         orderId:String(order.id || orderId || ''),
         action:String(actionLabel || '단계 변경'),
@@ -32797,6 +32934,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
           lastError:String((error && (error.code || error.message)) || error || '')
         });
         showMessage(`${actionLabel || '단계 변경'} 처리 중 오류가 발생했습니다. 네트워크 상태를 확인해주세요.`);
+      }finally{
+        if(trackProductionCompletionBusy) endProductionCompletionInteraction(order.id);
       }
     }
 
@@ -32805,7 +32944,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     function handleDeliveryProductionCompleteOrder(orderId){
-      return handleOrderStageTransition(orderId, 'DELIVERY_WAITING', '', '제작완료', { productionCompleted:true });
+      return handleOrderStageTransition(orderId, 'DELIVERY_WAITING', '', '제작완료', {
+        productionCompleted:true,
+        immediateProductionCompletionFeedback:true
+      });
     }
 
     function handleDeliveryStartOrder(orderId){
@@ -32843,42 +32985,51 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      const trackProductionCompletionBusy = opts.forceFinal !== true;
+      if(trackProductionCompletionBusy && isProductionCompletionInteractionBusy(order.id)){
+        return { status:'pending', skipped:true, reason:'production-completion-interaction-busy' };
+      }
       beginOrderLifecycleScrollPreservation(`order-complete:${String(orderId || '')}`);
-      const hydratedCompletionRequest = await hydrateCompletionRequestForOrderFromCloud(order);
-      if(hydratedCompletionRequest && hydratedCompletionRequest.cloudStatus === 'COMPLETED'){
-        const verified = hydratedCompletionRequest.request ? await verifyCompletionRequestServerState(hydratedCompletionRequest.request) : null;
-        if(verified && verified.confirmed === true){
-          return applyConfirmedCompletionResult(hydratedCompletionRequest.request, verified, 'order-completed-server-verified');
+      if(trackProductionCompletionBusy) beginProductionCompletionInteraction(order.id);
+      try{
+        const hydratedCompletionRequest = await hydrateCompletionRequestForOrderFromCloud(order);
+        if(hydratedCompletionRequest && hydratedCompletionRequest.cloudStatus === 'COMPLETED'){
+          const verified = hydratedCompletionRequest.request ? await verifyCompletionRequestServerState(hydratedCompletionRequest.request) : null;
+          if(verified && verified.confirmed === true){
+            return applyConfirmedCompletionResult(hydratedCompletionRequest.request, verified, 'order-completed-server-verified');
+          }
+          markCompletionRequestOnLocalOrder(order.id, 'needs-check', order.completionRequestMessage || '');
+          clearOrderLifecycleScrollPreservation();
+          requestOrderLifecycleRender();
+          return verified || { status:'needs-check', needsCheck:true };
         }
-        markCompletionRequestOnLocalOrder(order.id, 'needs-check', order.completionRequestMessage || '');
-        clearOrderLifecycleScrollPreservation();
+        const request = (hydratedCompletionRequest && hydratedCompletionRequest.request) || enqueueCompletionRequest(order);
+        if(!request){
+          clearOrderLifecycleScrollPreservation();
+          showMessage('주문 상태 확인 필요: 완료 요청을 만들 수 없습니다.');
+          return;
+        }
+        const taskKey = getCompletionRequestTaskKey(request);
+        const existingTask = completionRequestTaskByKey.get(taskKey);
+        if(existingTask) return existingTask;
+        const lastAttemptMs = getTimestampMs(request.lastAttemptAt);
+        if(!opts.recoveryConfirmed && lastAttemptMs && Date.now() - lastAttemptMs < ORDER_COMPLETION_MANUAL_RECLICK_BLOCK_MS && String(request.status || '') !== 'needs-check'){
+          markCompletionRequestOnLocalOrder(order.id, String(request.status || 'pending'), order.completionRequestMessage || '동기화 대기 중');
+          requestOrderLifecycleRender();
+          return { status:String(request.status || 'pending'), skipped:true, reason:'manual-reclick-blocked' };
+        }
+        markCompletionRequestOnLocalOrder(order.id, 'pending', '동기화 대기 중');
         requestOrderLifecycleRender();
-        return verified || { status:'needs-check', needsCheck:true };
+        const result = await processCompletionRequestQueueItem(request, { silent:false });
+        if(result && (result.status === 'pending' || result.status === 'retrying')){
+          showMessage('네트워크 연결 후 제작완료 반영을 다시 확인합니다.');
+        }else if(result && result.needsCheck){
+          showMessage('주문 상태 확인 필요: 서버의 최신 주문 상태를 확인해주세요.');
+        }
+        return result;
+      }finally{
+        if(trackProductionCompletionBusy) endProductionCompletionInteraction(order.id);
       }
-      const request = (hydratedCompletionRequest && hydratedCompletionRequest.request) || enqueueCompletionRequest(order);
-      if(!request){
-        clearOrderLifecycleScrollPreservation();
-        showMessage('주문 상태 확인 필요: 완료 요청을 만들 수 없습니다.');
-        return;
-      }
-      const taskKey = getCompletionRequestTaskKey(request);
-      const existingTask = completionRequestTaskByKey.get(taskKey);
-      if(existingTask) return existingTask;
-      const lastAttemptMs = getTimestampMs(request.lastAttemptAt);
-      if(!opts.recoveryConfirmed && lastAttemptMs && Date.now() - lastAttemptMs < ORDER_COMPLETION_MANUAL_RECLICK_BLOCK_MS && String(request.status || '') !== 'needs-check'){
-        markCompletionRequestOnLocalOrder(order.id, String(request.status || 'pending'), order.completionRequestMessage || '동기화 대기 중');
-        requestOrderLifecycleRender();
-        return { status:String(request.status || 'pending'), skipped:true, reason:'manual-reclick-blocked' };
-      }
-      markCompletionRequestOnLocalOrder(order.id, 'pending', '동기화 대기 중');
-      requestOrderLifecycleRender();
-      const result = await processCompletionRequestQueueItem(request, { silent:false });
-      if(result && (result.status === 'pending' || result.status === 'retrying')){
-        showMessage('네트워크 연결 후 제작완료 반영을 다시 확인합니다.');
-      }else if(result && result.needsCheck){
-        showMessage('주문 상태 확인 필요: 서버의 최신 주문 상태를 확인해주세요.');
-      }
-      return result;
     }
 
     async function handleCancelOrder(orderId, userId, qty, reason){
@@ -39383,9 +39534,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
         : '🏪 픽업';
       const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const completionRequestStatus = String(order.completionRequestStatus || '');
-      const completionPending = completionRequestStatus === 'pending' || completionRequestStatus === 'retrying';
+      const completionInteractionBusy = isProductionCompletionInteractionBusy(order.id);
+      const completionPending = completionInteractionBusy || completionRequestStatus === 'pending' || completionRequestStatus === 'retrying';
       const completionNeedsCheck = completionRequestStatus === 'needs-check';
-      const completeButtonDisabled = false;
+      const completeButtonDisabled = completionInteractionBusy;
       const workStage = getOrderWorkStage(order);
       const activeFilter = getOrderQueueFilterValue();
       let completeAction = 'complete-order';
@@ -45605,8 +45757,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       isOrderForBusinessDate:function(order, dateKey){
         return isOrderForBusinessDate(order, dateKey);
       },
-      setCurrentDayLiveOrderAuthority:function(dateKey, orderIds, complete){
-        return setCurrentDayLiveOrderAuthority(dateKey, orderIds, complete);
+      setCurrentDayLiveOrderAuthority:function(dateKey, orderIds, complete, options){
+        return setCurrentDayLiveOrderAuthority(dateKey, orderIds, complete, options);
+      },
+      finishCurrentDayLiveOrderSnapshot:function(values, sourceLabel, options){
+        return finishCurrentDayLiveOrderSnapshot(values, sourceLabel, options);
       },
       hideCurrentDayLiveOrderId:function(dateKey, orderId){
         return hideCurrentDayLiveOrderId(dateKey, orderId);
@@ -59039,16 +59194,29 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               hasPendingWrites:false
             });
           }
-          if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
-            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT);
-          }
+          const authorityChanged = !!(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'
+            && window.OrderModule.setCurrentDayLiveOrderAuthority(
+              businessDate,
+              activeDocumentIds,
+              snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT,
+              { deferRender:true }
+            ));
+          const finishSnapshot = verifiedOrders => {
+            if(window.OrderModule && typeof window.OrderModule.finishCurrentDayLiveOrderSnapshot === 'function'){
+              window.OrderModule.finishCurrentDayLiveOrderSnapshot(
+                verifiedOrders,
+                '오늘 주문별 실시간 저장소',
+                { ...snapshotMetadata, authorityChanged }
+              );
+            }
+            syncOrderGuardVerifications(true);
+          };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             filterIncomingOrdersByCloudGuards(changedLiveOrders).then(verifiedOrders => {
-              if(verifiedOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
-                window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '오늘 주문별 실시간 저장소', snapshotMetadata);
-              }
-              syncOrderGuardVerifications(true);
+              finishSnapshot(verifiedOrders);
             });
+          }else{
+            finishSnapshot([]);
           }
         }, error => {
           markFirestoreQuotaExceeded(error, 'live-order-listener');
