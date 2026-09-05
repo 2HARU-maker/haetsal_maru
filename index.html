@@ -38762,6 +38762,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(isDashboardView() && String(snapshot.dashboardTab || '') !== String(state.dashboardTab || '')) return;
       if(!isDashboardView() && String(snapshot.selectedUserId || '') !== String(state.selectedUserId || '')) return;
       if(isDashboardView()){
+        if(Number(snapshot.dashboardTop || 0) <= 0 && orderLifecycleScrollSnapshot !== snapshot) return;
         try{
           const dashboardOwner = getDashboardScrollOwner();
           if(dashboardOwner){
