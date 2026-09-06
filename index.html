@@ -58727,6 +58727,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const pendingOrderGuardVerificationEntries = new Set();
     const ORDER_GUARD_QUERY_CHUNK_SIZE = 30;
     let orderGuardVerificationFlushScheduled = false;
+    let liveOrderQueryGuardVerificationGeneration = 0;
 
     function addRealtimeUsageDiagnostic(key, amount){
       realtimeUsageDiagnostics[key] = Number(realtimeUsageDiagnostics[key] || 0) + Number(amount || 0);
@@ -58967,19 +58968,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       Array.from(orderGuardVerificationEntries.keys()).forEach(stopOrderGuardVerification);
     }
 
-    function ensureOrderGuardVerification(order){
+    function ensureOrderGuardVerification(order, options){
+      const opts = options && typeof options === 'object' ? options : {};
+      const liveQueryGeneration = Math.max(0, Number(opts.liveQueryGeneration) || 0);
       const orderId = String((order && order.id) || '').trim();
       if(!orderId) return Promise.resolve(null);
       const fingerprint = getOrderGuardVerificationFingerprint(order);
       let entry = orderGuardVerificationEntries.get(orderId);
-      if(entry && entry.fingerprint !== fingerprint){
+      if(entry && (entry.fingerprint !== fingerprint || (liveQueryGeneration && entry.liveQueryGeneration !== liveQueryGeneration))){
         stopOrderGuardVerification(orderId);
         entry = null;
       }
       if(!entry){
         let resolveReady = null;
         const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-        entry = { orderId, fingerprint, released:false, ready:false, failed:false, settled:false, readyPromise, resolveReady };
+        entry = { orderId, fingerprint, liveQueryGeneration, released:false, ready:false, failed:false, settled:false, readyPromise, resolveReady };
         orderGuardVerificationEntries.set(orderId, entry);
         try{
           scheduleOrderGuardVerification(entry);
@@ -59002,7 +59005,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       });
     }
 
-    async function filterIncomingOrdersByCloudGuards(values){
+    async function filterIncomingOrdersByCloudGuards(values, options){
+      const opts = options && typeof options === 'object' ? options : {};
       const rows = Array.isArray(values) ? values : [];
       const pending = rows.map(value => {
         const order = value && value.order && typeof value.order === 'object' ? value.order : value;
@@ -59013,7 +59017,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         }
         const orderId = String(order.id || '').trim();
         retainOrderGuardVerification(orderId);
-        return { value, verification:ensureOrderGuardVerification(order), orderId };
+        return { value, verification:ensureOrderGuardVerification(order, opts), orderId };
       });
       try{
         const checked = await Promise.all(pending.map(async item => {
@@ -59326,6 +59330,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const startCurrentDateQuery = function(compatibilityMode=false){
         if(stopped) return;
         const currentQueryGeneration = ++queryGeneration;
+        const guardVerificationGeneration = ++liveOrderQueryGuardVerificationGeneration;
         if(typeof unsubscribeCurrentQuery === 'function'){
           try{ unsubscribeCurrentQuery(); }catch(error){}
           unsubscribeCurrentQuery = null;
@@ -59419,7 +59424,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             syncOrderGuardVerifications(true);
           };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
-            filterIncomingOrdersByCloudGuards(changedLiveOrders).then(verifiedOrders => {
+            filterIncomingOrdersByCloudGuards(changedLiveOrders, { liveQueryGeneration:guardVerificationGeneration }).then(verifiedOrders => {
               if(stopped || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
               finishSnapshot(verifiedOrders);
             });
