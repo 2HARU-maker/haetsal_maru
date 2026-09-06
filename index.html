@@ -58581,7 +58581,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             const generation = ++orderCloudApplyGeneration;
             const orderData = payload.data && typeof payload.data === 'object' ? payload.data : {};
             filterIncomingOrdersByCloudGuards(Array.isArray(orderData.orders) ? orderData.orders : []).then(verifiedOrders => {
-              if(generation !== orderCloudApplyGeneration) return;
+              if(generation !== orderCloudApplyGeneration || (scopeInstance && scopeInstance.released)) return;
               if(window.HaetsalCloudStore && window.HaetsalCloudStore.applyRemote){
                 window.HaetsalCloudStore.applyRemote(key, { ...orderData, orders:verifiedOrders });
               }
@@ -58707,11 +58707,26 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const realtimeUsageDiagnostics = {
       startedAt:new Date().toISOString(),
       guardSnapshotReads:0,
+      guardBoundedQueryRequests:0,
+      guardClosedBoundedQueryRequests:0,
+      guardRevivedBoundedQueryRequests:0,
+      guardDirectFallbackRequests:0,
+      guardClosedDirectFallbackRequests:0,
+      guardRevivedDirectFallbackRequests:0,
+      guardReturnedDocuments:0,
+      guardClosedReturnedDocuments:0,
+      guardRevivedReturnedDocuments:0,
+      guardMaxBoundedQuerySize:0,
+      guardVerificationBatches:0,
       guardVerificationFailures:0,
       deliverySnapshotReads:0,
       deliveryMissingSnapshots:0
     };
     const orderGuardVerificationEntries = new Map();
+    const orderGuardVerificationRetainCounts = new Map();
+    const pendingOrderGuardVerificationEntries = new Set();
+    const ORDER_GUARD_QUERY_CHUNK_SIZE = 30;
+    let orderGuardVerificationFlushScheduled = false;
 
     function addRealtimeUsageDiagnostic(key, amount){
       realtimeUsageDiagnostics[key] = Number(realtimeUsageDiagnostics[key] || 0) + Number(amount || 0);
@@ -58757,12 +58772,49 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       ].join(':');
     }
 
-    async function readOrderGuardDocumentOnce(kind, orderId, entry){
+    function retainOrderGuardVerification(orderId){
+      const id = String(orderId || '').trim();
+      if(!id) return false;
+      orderGuardVerificationRetainCounts.set(id, Number(orderGuardVerificationRetainCounts.get(id) || 0) + 1);
+      return true;
+    }
+
+    function releaseOrderGuardVerification(orderId){
+      const id = String(orderId || '').trim();
+      const count = Number(orderGuardVerificationRetainCounts.get(id) || 0);
+      if(count > 1) orderGuardVerificationRetainCounts.set(id, count - 1);
+      else orderGuardVerificationRetainCounts.delete(id);
+    }
+
+    function isOrderGuardVerificationEntryCurrent(entry){
+      return !!(entry
+        && !entry.released
+        && orderGuardVerificationEntries.get(entry.orderId) === entry);
+    }
+
+    function isOrderGuardVerificationReadBlocked(){
+      const quotaGuard = window.HaetsalFirestoreQuotaGuard;
+      const runtimeGuard = window.HaetsalRuntimeGuard;
+      return !!((quotaGuard && typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked())
+        || (runtimeGuard && typeof runtimeGuard.isStopped === 'function' && runtimeGuard.isStopped()));
+    }
+
+    async function readOrderGuardDocumentOnce(kind, orderId, entry, options){
+      const opts = options && typeof options === 'object' ? options : {};
+      if(!isOrderGuardVerificationEntryCurrent(entry) || isOrderGuardVerificationReadBlocked()){
+        return { ok:false, released:!isOrderGuardVerificationEntryCurrent(entry), stopped:isOrderGuardVerificationReadBlocked() };
+      }
       const collectionRef = kind === 'closed' ? closedOrderGuardCollectionRef : revivedOrderGuardCollectionRef;
       const guardDocId = kind === 'closed' ? makeClosedOrderGuardDocId(orderId) : makeRevivedOrderGuardDocId(orderId);
       try{
+        if(opts.fallback === true){
+          addRealtimeUsageDiagnostic('guardDirectFallbackRequests', 1);
+          addRealtimeUsageDiagnostic(kind === 'closed'
+            ? 'guardClosedDirectFallbackRequests'
+            : 'guardRevivedDirectFallbackRequests', 1);
+        }
         const snapshot = await getDocFromServer(doc(collectionRef, guardDocId));
-        if(entry.released) return { ok:false, released:true };
+        if(!isOrderGuardVerificationEntryCurrent(entry)) return { ok:false, released:true };
         addRealtimeUsageDiagnostic('guardSnapshotReads', 1);
         const normalized = normalizeGuardSnapshot(kind, snapshot);
         const guards = normalized ? [normalized] : [];
@@ -58774,6 +58826,132 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         console.error('Firestore 주문별 차단 기록 확인 실패:', error);
         return { ok:false, error };
       }
+    }
+
+    function splitOrderGuardVerificationEntries(entries){
+      const chunks = [];
+      for(let index = 0; index < entries.length; index += ORDER_GUARD_QUERY_CHUNK_SIZE){
+        chunks.push(entries.slice(index, index + ORDER_GUARD_QUERY_CHUNK_SIZE));
+      }
+      return chunks;
+    }
+
+    async function readOrderGuardDocumentsBounded(kind, entries){
+      const results = new Map();
+      const activeEntries = entries.filter(entry => {
+        if(isOrderGuardVerificationEntryCurrent(entry)) return true;
+        results.set(entry, { ok:false, released:true });
+        return false;
+      });
+      const collectionRef = kind === 'closed' ? closedOrderGuardCollectionRef : revivedOrderGuardCollectionRef;
+      for(const chunk of splitOrderGuardVerificationEntries(activeEntries)){
+        if(isOrderGuardVerificationReadBlocked()){
+          chunk.forEach(entry => results.set(entry, { ok:false, stopped:true }));
+          continue;
+        }
+        const entriesByDocId = new Map(chunk.map(entry => {
+          const guardDocId = kind === 'closed'
+            ? makeClosedOrderGuardDocId(entry.orderId)
+            : makeRevivedOrderGuardDocId(entry.orderId);
+          return [guardDocId, entry];
+        }));
+        try{
+          addRealtimeUsageDiagnostic('guardBoundedQueryRequests', 1);
+          addRealtimeUsageDiagnostic(kind === 'closed'
+            ? 'guardClosedBoundedQueryRequests'
+            : 'guardRevivedBoundedQueryRequests', 1);
+          realtimeUsageDiagnostics.guardMaxBoundedQuerySize = Math.max(
+            Number(realtimeUsageDiagnostics.guardMaxBoundedQuerySize || 0),
+            entriesByDocId.size
+          );
+          const snapshot = await getDocsFromServer(query(
+            collectionRef,
+            where(documentId(), 'in', Array.from(entriesByDocId.keys()))
+          ));
+          if(snapshot.metadata && snapshot.metadata.fromCache){
+            const cacheError = new Error('Guard server query returned a cache snapshot.');
+            cacheError.code = 'guard-query-from-cache';
+            throw cacheError;
+          }
+          addRealtimeUsageDiagnostic('guardSnapshotReads', 1);
+          addRealtimeUsageDiagnostic('guardReturnedDocuments', snapshot.size);
+          addRealtimeUsageDiagnostic(kind === 'closed'
+            ? 'guardClosedReturnedDocuments'
+            : 'guardRevivedReturnedDocuments', snapshot.size);
+          const guards = [];
+          snapshot.docs.forEach(docSnap => {
+            const entry = entriesByDocId.get(String(docSnap.id || ''));
+            if(!isOrderGuardVerificationEntryCurrent(entry)) return;
+            const normalized = normalizeGuardSnapshot(kind, docSnap);
+            if(normalized) guards.push(normalized);
+          });
+          receiveGuardRecords(kind, guards);
+          chunk.forEach(entry => {
+            results.set(entry, isOrderGuardVerificationEntryCurrent(entry)
+              ? { ok:true }
+              : { ok:false, released:true });
+          });
+        }catch(error){
+          const quotaBlocked = markFirestoreQuotaExceeded(error, kind + '-order-guard-query');
+          addRealtimeUsageDiagnostic('guardVerificationFailures', 1);
+          console.error('Firestore 주문 차단 기록 묶음 확인 실패:', error);
+          if(quotaBlocked || isOrderGuardVerificationReadBlocked()){
+            chunk.forEach(entry => results.set(entry, { ok:false, error, stopped:true }));
+            continue;
+          }
+          const fallbackResults = await Promise.all(chunk.map(entry => {
+            return readOrderGuardDocumentOnce(kind, entry.orderId, entry, { fallback:true });
+          }));
+          chunk.forEach((entry, index) => results.set(entry, fallbackResults[index]));
+        }
+      }
+      return results;
+    }
+
+    function settleOrderGuardVerificationEntry(entry, results){
+      if(!entry || entry.settled) return false;
+      entry.ready = isOrderGuardVerificationEntryCurrent(entry)
+        && results.every(result => result && result.ok === true);
+      entry.failed = !entry.ready;
+      entry.settled = true;
+      if(typeof entry.resolveReady === 'function') entry.resolveReady(entry.ready);
+      entry.resolveReady = null;
+      return entry.ready;
+    }
+
+    async function flushOrderGuardVerificationEntries(entries){
+      const pending = entries.filter(entry => entry && !entry.settled);
+      if(!pending.length) return;
+      addRealtimeUsageDiagnostic('guardVerificationBatches', 1);
+      const closedResults = await readOrderGuardDocumentsBounded('closed', pending);
+      const revivedResults = await readOrderGuardDocumentsBounded('revived', pending);
+      pending.forEach(entry => {
+        settleOrderGuardVerificationEntry(entry, [closedResults.get(entry), revivedResults.get(entry)]);
+      });
+    }
+
+    function scheduleOrderGuardVerification(entry){
+      pendingOrderGuardVerificationEntries.add(entry);
+      if(orderGuardVerificationFlushScheduled) return;
+      orderGuardVerificationFlushScheduled = true;
+      Promise.resolve().then(async() => {
+        const entries = Array.from(pendingOrderGuardVerificationEntries);
+        pendingOrderGuardVerificationEntries.clear();
+        try{
+          await flushOrderGuardVerificationEntries(entries);
+        }catch(error){
+          markFirestoreQuotaExceeded(error, 'order-guard-verification-batch');
+          addRealtimeUsageDiagnostic('guardVerificationFailures', 1);
+          console.error('Firestore 주문 차단 기록 묶음 확인 처리 실패:', error);
+          entries.forEach(entry => settleOrderGuardVerificationEntry(entry, [{ ok:false, error }]));
+        }finally{
+          orderGuardVerificationFlushScheduled = false;
+          if(pendingOrderGuardVerificationEntries.size){
+            const nextEntry = pendingOrderGuardVerificationEntries.values().next().value;
+            if(nextEntry) scheduleOrderGuardVerification(nextEntry);
+          }
+        }
+      });
     }
 
     function stopOrderGuardVerification(orderId){
@@ -58799,23 +58977,20 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         entry = null;
       }
       if(!entry){
-        entry = { orderId, fingerprint, released:false, ready:false, failed:false, readyPromise:null };
+        let resolveReady = null;
+        const readyPromise = new Promise(resolve => { resolveReady = resolve; });
+        entry = { orderId, fingerprint, released:false, ready:false, failed:false, settled:false, readyPromise, resolveReady };
         orderGuardVerificationEntries.set(orderId, entry);
         try{
-          entry.readyPromise = Promise.all([
-            readOrderGuardDocumentOnce('closed', orderId, entry),
-            readOrderGuardDocumentOnce('revived', orderId, entry)
-          ]).then(results => {
-            entry.ready = results.every(result => result && result.ok === true);
-            entry.failed = !entry.ready;
-            return entry.ready;
-          });
+          scheduleOrderGuardVerification(entry);
         }catch(error){
           markFirestoreQuotaExceeded(error, 'order-guard-verification-start');
           addRealtimeUsageDiagnostic('guardVerificationFailures', 1);
           entry.ready = false;
           entry.failed = true;
-          entry.readyPromise = Promise.resolve(null);
+          entry.settled = true;
+          if(typeof entry.resolveReady === 'function') entry.resolveReady(null);
+          entry.resolveReady = null;
         }
       }
       return entry.readyPromise.then(verified => {
@@ -58829,15 +59004,27 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
     async function filterIncomingOrdersByCloudGuards(values){
       const rows = Array.isArray(values) ? values : [];
-      const checked = await Promise.all(rows.map(async value => {
+      const pending = rows.map(value => {
         const order = value && value.order && typeof value.order === 'object' ? value.order : value;
-        if(!order || typeof order !== 'object') return null;
+        if(!order || typeof order !== 'object') return { value:null, verification:null, orderId:'' };
         const status = String(order.status || 'PENDING').toUpperCase();
-        if(['PICKUP_DONE','DELIVERY_DONE','CANCELLED','COMPLETED','DONE'].includes(status)) return value;
-        const guardResult = await ensureOrderGuardVerification(order);
-        return guardResult === false ? null : value;
-      }));
-      return checked.filter(Boolean);
+        if(['PICKUP_DONE','DELIVERY_DONE','CANCELLED','COMPLETED','DONE'].includes(status)){
+          return { value, verification:Promise.resolve(true), orderId:'' };
+        }
+        const orderId = String(order.id || '').trim();
+        retainOrderGuardVerification(orderId);
+        return { value, verification:ensureOrderGuardVerification(order), orderId };
+      });
+      try{
+        const checked = await Promise.all(pending.map(async item => {
+          if(!item.value) return null;
+          const guardResult = await item.verification;
+          return guardResult === false ? null : item.value;
+        }));
+        return checked.filter(Boolean);
+      }finally{
+        pending.forEach(item => releaseOrderGuardVerification(item.orderId));
+      }
     }
 
     const HISTORICAL_COMPLETION_FIRESTORE_TARGET_DATE = '2026-08-21';
@@ -59060,7 +59247,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         if(activeIds.has(orderId)) ensureOrderGuardVerification(order);
       });
       Array.from(orderGuardVerificationEntries.entries()).forEach(([orderId, entry]) => {
-        if(!activeIds.has(orderId)) stopOrderGuardVerification(orderId);
+        if(!activeIds.has(orderId) && !orderGuardVerificationRetainCounts.has(orderId)) stopOrderGuardVerification(orderId);
       });
     }
 
@@ -59233,6 +59420,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             filterIncomingOrdersByCloudGuards(changedLiveOrders).then(verifiedOrders => {
+              if(stopped || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
               finishSnapshot(verifiedOrders);
             });
           }else{
@@ -59294,6 +59482,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
         rememberLiveOrderDocumentWriteSignature(payload.data);
         filterIncomingOrdersByCloudGuards([payload.data]).then(verifiedOrders => {
+          if(scopeInstance && scopeInstance.released) return;
           if(verifiedOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '사용자 주문별 실시간 저장소', {
               remoteSnapshot:true,
