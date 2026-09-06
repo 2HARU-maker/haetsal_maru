@@ -13001,6 +13001,7 @@ window.HaetsalSharedStore = (function(){
     let firestoreQuotaRetryBlockedAt = 0;
     let firestoreQuotaRetryProbeAfter = 0;
     let revivedOrderSafetySweepPromise = null;
+    let revivedOrderSafetySweepRerunNeeded = false;
     let orderAppUiReady = false;
     const revivedOrderRefundCorrectionInFlightByOrder = new Set();
 
@@ -19183,9 +19184,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
     }
 
-    function runRevivedOrderSafetySweep(reason='revived-order-safety-sweep'){
-      if(revivedOrderSafetySweepPromise) return revivedOrderSafetySweepPromise;
-      revivedOrderSafetySweepPromise = (async() => {
+    async function runRevivedOrderSafetySweepPass(reason){
         const rows = Array.isArray(state.orders) ? state.orders.slice() : [];
         let guarded = 0;
         let removedCompletionRequests = 0;
@@ -19220,8 +19219,23 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           await Promise.all(correctionTasks);
         }
         return { guarded, filtered, removedCompletionRequests, correctionCount:correctionTasks.length };
+    }
+
+    function runRevivedOrderSafetySweep(reason='revived-order-safety-sweep'){
+      if(revivedOrderSafetySweepPromise){
+        revivedOrderSafetySweepRerunNeeded = true;
+        return revivedOrderSafetySweepPromise;
+      }
+      revivedOrderSafetySweepPromise = (async() => {
+        let result;
+        do{
+          revivedOrderSafetySweepRerunNeeded = false;
+          result = await runRevivedOrderSafetySweepPass(reason);
+        }while(revivedOrderSafetySweepRerunNeeded);
+        return result;
       })().finally(() => {
         revivedOrderSafetySweepPromise = null;
+        revivedOrderSafetySweepRerunNeeded = false;
       });
       return revivedOrderSafetySweepPromise;
     }
