@@ -20141,6 +20141,115 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
     }
 
+    const ORDER_SEQUENCE_CONTENTION_MANUAL_RETRY_LIMIT = 5;
+
+    function isOrderSequencePermissionDeniedError(error){
+      const code = String((error && (error.code || error.status || error.name)) || '').toLowerCase();
+      return code === 'permission-denied' || code === 'firestore/permission-denied' || code.endsWith('/permission-denied');
+    }
+
+    function createOrderSequenceEvidenceFailClosedError(error, code, needsCheck){
+      const details = getOrderSubmissionErrorDetails(error, code || 'order-sequence-evidence-failed');
+      const failure = createOrderSubmissionError(code || details.errorCode, details.errorMessage);
+      failure.needsCheck = needsCheck === true;
+      failure.orderSequenceEvidenceFailClosed = true;
+      try{ failure.cause = error; }catch(causeError){}
+      return failure;
+    }
+
+    function getOrderSequenceAttemptEvidence(error, expectedOrderId, expectedDateKey){
+      const source = error && error.orderSequenceAttemptEvidence && typeof error.orderSequenceAttemptEvidence === 'object'
+        ? error.orderSequenceAttemptEvidence
+        : null;
+      if(!source) return null;
+      const orderId = String(source.orderId || '');
+      const dateKey = String(source.dateKey || '');
+      const beforeSeq = Number(source.beforeSeq);
+      const attemptedSeq = Number(source.attemptedSeq);
+      const attemptedOrderNumber = String(source.attemptedOrderNumber || '');
+      if(orderId !== String(expectedOrderId || '')
+        || dateKey !== String(expectedDateKey || '')
+        || !Number.isInteger(beforeSeq)
+        || beforeSeq < 0
+        || !Number.isInteger(attemptedSeq)
+        || attemptedSeq !== beforeSeq + 1
+        || !attemptedOrderNumber){
+        return null;
+      }
+      return { orderId, dateKey, beforeSeq, attemptedSeq, attemptedOrderNumber };
+    }
+
+    async function reserveOrderSequenceAttemptWithEvidenceRetry(request, retryState){
+      const req = request && typeof request === 'object' ? request : {};
+      const stateRef = retryState && typeof retryState === 'object' ? retryState : { manualRetryCount:0 };
+      while(true){
+        try{
+          return await Promise.resolve(window.HaetsalLiveOrderDocs.reserveOrderSequence(req));
+        }catch(error){
+          if(!isOrderSequencePermissionDeniedError(error)) throw error;
+          try{
+            await assertOrderWritePreflightReady('order-sequence-evidence-retry');
+          }catch(preflightError){
+            throw createOrderSequenceEvidenceFailClosedError(preflightError, '', false);
+          }
+          const evidence = getOrderSequenceAttemptEvidence(error, req.orderId, req.dateKey);
+          if(!evidence){
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-evidence-invalid', true);
+          }
+          const api = window.HaetsalLiveOrderDocs;
+          if(!api
+            || typeof api.verifyOrderSequenceReservation !== 'function'
+            || typeof api.readOrderSequenceCounter !== 'function'){
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-evidence-module-not-ready', true);
+          }
+          let ownReservation;
+          try{
+            ownReservation = await api.verifyOrderSequenceReservation({
+              orderId:evidence.orderId,
+              dateKey:evidence.dateKey
+            });
+          }catch(verificationError){
+            throw createOrderSequenceEvidenceFailClosedError(verificationError, '', true);
+          }
+          if(ownReservation && ownReservation.status === 'reserved'){
+            const exactReservation = String(ownReservation.orderId || '') === evidence.orderId
+              && String(ownReservation.reservationId || '') === evidence.orderId
+              && String(ownReservation.dateKey || '') === evidence.dateKey
+              && Number(ownReservation.seq) === evidence.attemptedSeq
+              && String(ownReservation.orderNumber || '') === evidence.attemptedOrderNumber;
+            if(exactReservation){
+              return { ...ownReservation, ok:true, status:'recovered-existing' };
+            }
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-reservation-mismatch', true);
+          }
+          if(!ownReservation || ownReservation.status !== 'not-found'){
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-reservation-invalid', true);
+          }
+          let currentCounter;
+          try{
+            currentCounter = await api.readOrderSequenceCounter({ dateKey:evidence.dateKey });
+          }catch(verificationError){
+            throw createOrderSequenceEvidenceFailClosedError(verificationError, '', true);
+          }
+          const strongContentionEvidence = currentCounter
+            && currentCounter.ok === true
+            && currentCounter.status === 'current'
+            && String(currentCounter.dateKey || '') === evidence.dateKey
+            && Number.isInteger(Number(currentCounter.lastSeq))
+            && Number(currentCounter.lastSeq) >= evidence.attemptedSeq
+            && String(currentCounter.lastOrderId || '')
+            && String(currentCounter.lastOrderId || '') !== evidence.orderId;
+          if(!strongContentionEvidence){
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-contention-evidence-insufficient', false);
+          }
+          if(Number(stateRef.manualRetryCount || 0) >= ORDER_SEQUENCE_CONTENTION_MANUAL_RETRY_LIMIT){
+            throw createOrderSequenceEvidenceFailClosedError(error, 'order-sequence-contention-retry-limit', false);
+          }
+          stateRef.manualRetryCount = Number(stateRef.manualRetryCount || 0) + 1;
+        }
+      }
+    }
+
     async function reserveNewOrderSequenceWithRetry(orderId, dateKey, minimumSeq, createdAt, diagnosticContext){
       const safeOrderId = String(orderId || '');
       const safeDateKey = String(dateKey || '');
@@ -20243,17 +20352,20 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       let lastError = null;
       let lastRetryCount = 0;
       let sequenceNeedsCheck = false;
+      let sequenceEvidenceFailClosed = false;
+      const contentionRetryState = { manualRetryCount:0 };
+      const sequenceRequest = {
+        orderId:safeOrderId,
+        dateKey:safeDateKey,
+        minimumSeq:Math.max(0, Math.floor(Number(minimumSeq || 0)) || 0),
+        createdAt:String(createdAt || new Date().toISOString()),
+        clientSessionId:String(state.clientSessionId || '')
+      };
       for(let index = 0; index < delays.length; index += 1){
         if(delays[index]) await delayOrderLiveSaveRetry(delays[index]);
         try{
           applyLiveOrderSaveState('pending', index ? '제작대기 저장 재시도 중' : '제작대기 저장 중');
-          const result = await Promise.resolve(window.HaetsalLiveOrderDocs.reserveOrderSequence({
-            orderId:safeOrderId,
-            dateKey:safeDateKey,
-            minimumSeq:Math.max(0, Math.floor(Number(minimumSeq || 0)) || 0),
-            createdAt:String(createdAt || new Date().toISOString()),
-            clientSessionId:String(state.clientSessionId || '')
-          }));
+          const result = await reserveOrderSequenceAttemptWithEvidenceRetry(sequenceRequest, contentionRetryState);
           if(!result || result.ok !== true || !/^\d{8}$/.test(String(result.dateKey || '')) || !Number(result.seq || 0) || !String(result.orderNumber || '').trim()){
             const status = String((result && result.status) || 'order-sequence-reservation-failed');
             const resultError = createOrderSubmissionError(status, status);
@@ -20289,10 +20401,14 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
             || errorCode.includes('network-request-failed')
             || errorMessage.includes('network-request-failed');
           if(isTransientError) sequenceNeedsCheck = true;
-          if(!isTransientError || index >= delays.length - 1) break;
+          if(error && error.orderSequenceEvidenceFailClosed === true){
+            sequenceEvidenceFailClosed = true;
+            sequenceNeedsCheck = error.needsCheck === true;
+          }
+          if(!isTransientError || (error && error.orderSequenceEvidenceFailClosed === true) || index >= delays.length - 1) break;
         }
       }
-      if(sequenceNeedsCheck && window.HaetsalLiveOrderDocs && typeof window.HaetsalLiveOrderDocs.verifyOrderSequenceReservation === 'function'){
+      if(sequenceNeedsCheck && !sequenceEvidenceFailClosed && window.HaetsalLiveOrderDocs && typeof window.HaetsalLiveOrderDocs.verifyOrderSequenceReservation === 'function'){
         try{
           const verified = await window.HaetsalLiveOrderDocs.verifyOrderSequenceReservation({
             orderId:safeOrderId,
@@ -51335,6 +51451,22 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return Math.max(serverMaxSeq, Math.max(0, Math.floor(Number(localMinimumSeq || 0)) || 0));
   }
 
+  function createOrderSequenceAttemptEvidenceError(error, evidence){
+    const source = error && typeof error === 'object' ? error : null;
+    const wrapped = new Error(String((source && source.message) || error || 'permission-denied'));
+    wrapped.name = String((source && source.name) || 'FirebaseError');
+    wrapped.code = String((source && (source.code || source.status)) || 'permission-denied');
+    wrapped.orderSequenceAttemptEvidence = Object.freeze({
+      orderId:String(evidence && evidence.orderId || ''),
+      dateKey:String(evidence && evidence.dateKey || ''),
+      beforeSeq:Number(evidence && evidence.beforeSeq),
+      attemptedSeq:Number(evidence && evidence.attemptedSeq),
+      attemptedOrderNumber:String(evidence && evidence.attemptedOrderNumber || '')
+    });
+    try{ wrapped.cause = error; }catch(causeError){}
+    return wrapped;
+  }
+
   async function reserveOrderSequenceByTransaction(request){
     const req = request && typeof request === 'object' ? request : {};
     const orderId = String(req.orderId || '').trim();
@@ -51346,6 +51478,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     await firebaseReadyPromise;
 
     const initialFloor = await getInitialOrderSequenceFloor(dateKey, localMinimumSeq);
+    let lastAttemptEvidence = null;
     return runTransaction(db, async(transaction) => {
       const reservationRef = getOrderSequenceReservationRef(orderId);
       const reservationSnap = await transaction.get(reservationRef);
@@ -51390,6 +51523,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         ? String(counterData.createdAt)
         : allocatedAt;
 
+      lastAttemptEvidence = {
+        orderId,
+        dateKey,
+        beforeSeq:currentSeq,
+        attemptedSeq:nextSeq,
+        attemptedOrderNumber:orderNumber
+      };
       const nextCounter = {
         type:'ORDER_SEQUENCE_COUNTER',
         dateKey,
@@ -51427,7 +51567,45 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         reservationId:orderId,
         allocatedAt
       };
+    }).catch(error => {
+      const errorCode = String(error && (error.code || error.status) || '').toLowerCase();
+      if(lastAttemptEvidence
+        && (errorCode === 'permission-denied' || errorCode === 'firestore/permission-denied' || errorCode.endsWith('/permission-denied'))){
+        throw createOrderSequenceAttemptEvidenceError(error, lastAttemptEvidence);
+      }
+      throw error;
     });
+  }
+
+  async function readOrderSequenceCounterFromServer(request){
+    const req = request && typeof request === 'object' ? request : {};
+    const dateKey = normalizeOrderSequenceDateKey(req.dateKey);
+    if(!dateKey) return { ok:false, status:'needs-check', needsCheck:true };
+    await firebaseReadyPromise;
+    const counterSnapshot = await getDocFromServer(getOrderSequenceCounterRef(dateKey));
+    if(!counterSnapshot.exists()){
+      return { ok:true, status:'not-found', dateKey };
+    }
+    const counter = getPayloadData(counterSnapshot.data());
+    const counterDateKey = normalizeOrderSequenceDateKey(counter.dateKey);
+    const lastSeq = Number(counter.lastSeq);
+    const lastOrderId = String(counter.lastOrderId || '').trim();
+    const lastOrderNumber = String(counter.lastOrderNumber || '').trim();
+    if(counter.type !== 'ORDER_SEQUENCE_COUNTER'
+      || counterDateKey !== dateKey
+      || !Number.isInteger(lastSeq)
+      || lastSeq < 0
+      || (lastSeq > 0 && (!lastOrderId || !lastOrderNumber))){
+      return { ok:false, status:'needs-check', needsCheck:true, dateKey };
+    }
+    return {
+      ok:true,
+      status:'current',
+      dateKey:counterDateKey,
+      lastSeq,
+      lastOrderId,
+      lastOrderNumber
+    };
   }
 
   function inspectOrderSequenceReservationSnapshot(snapshot, orderId, expectedDateKey){
@@ -53002,6 +53180,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     saveOrders: saveLiveOrderDocuments,
     reserveOrderSequence: reserveOrderSequenceByTransaction,
     verifyOrderSequenceReservation: verifyOrderSequenceReservationFromServer,
+    readOrderSequenceCounter: readOrderSequenceCounterFromServer,
     commitReservedOrder: commitReservedOrderByTransaction,
     verifyReservedOrderCommit: verifyReservedOrderCommitFromServer,
     editOrder: editLiveOrderByTransaction,
