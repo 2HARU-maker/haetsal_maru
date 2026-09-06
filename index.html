@@ -58800,6 +58800,19 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         || (runtimeGuard && typeof runtimeGuard.isStopped === 'function' && runtimeGuard.isStopped()));
     }
 
+    function isOrderGuardVerificationRetryableError(error){
+      const code = String((error && (error.code || error.name)) || '').trim().toLowerCase();
+      return code === 'unavailable' || code === 'firestore/unavailable';
+    }
+
+    function isOrderGuardVerificationRetryableFailure(result){
+      return !!(result
+        && result.ok !== true
+        && !result.released
+        && !result.stopped
+        && isOrderGuardVerificationRetryableError(result.error));
+    }
+
     async function readOrderGuardDocumentOnce(kind, orderId, entry, options){
       const opts = options && typeof options === 'object' ? options : {};
       if(!isOrderGuardVerificationEntryCurrent(entry) || isOrderGuardVerificationReadBlocked()){
@@ -58914,6 +58927,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       entry.ready = isOrderGuardVerificationEntryCurrent(entry)
         && results.every(result => result && result.ok === true);
       entry.failed = !entry.ready;
+      const failedResults = results.filter(result => !(result && result.ok === true));
+      entry.retryable = entry.failed
+        && failedResults.length > 0
+        && failedResults.every(isOrderGuardVerificationRetryableFailure);
       entry.settled = true;
       if(typeof entry.resolveReady === 'function') entry.resolveReady(entry.ready);
       entry.resolveReady = null;
@@ -58979,10 +58996,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         stopOrderGuardVerification(orderId);
         entry = null;
       }
+      if(entry && opts.retryFailedEntry === true && entry.settled && entry.failed && entry.retryable === true){
+        stopOrderGuardVerification(orderId);
+        entry = null;
+      }
       if(!entry){
         let resolveReady = null;
         const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-        entry = { orderId, fingerprint, liveQueryGeneration, released:false, ready:false, failed:false, settled:false, readyPromise, resolveReady };
+        entry = { orderId, fingerprint, liveQueryGeneration, released:false, ready:false, failed:false, retryable:false, settled:false, readyPromise, resolveReady };
         orderGuardVerificationEntries.set(orderId, entry);
         try{
           scheduleOrderGuardVerification(entry);
@@ -58991,6 +59012,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           addRealtimeUsageDiagnostic('guardVerificationFailures', 1);
           entry.ready = false;
           entry.failed = true;
+          entry.retryable = isOrderGuardVerificationRetryableError(error);
           entry.settled = true;
           if(typeof entry.resolveReady === 'function') entry.resolveReady(null);
           entry.resolveReady = null;
@@ -59253,6 +59275,33 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       Array.from(orderGuardVerificationEntries.entries()).forEach(([orderId, entry]) => {
         if(!activeIds.has(orderId) && !orderGuardVerificationRetainCounts.has(orderId)) stopOrderGuardVerification(orderId);
       });
+    }
+
+    function retryFailedOrderGuardVerifications(){
+      if(isOrderGuardVerificationReadBlocked()
+        || !window.OrderModule
+        || typeof window.OrderModule.getProductionQueueOrderIds !== 'function') return false;
+      const activeIds = new Set(window.OrderModule.getProductionQueueOrderIds().map(value => String(value || '').trim()).filter(Boolean));
+      if(!activeIds.size) return false;
+      const stateOrders = window.OrderModule.state && Array.isArray(window.OrderModule.state.orders) ? window.OrderModule.state.orders : [];
+      const ordersById = new Map(stateOrders.map(order => [String((order && order.id) || '').trim(), order]));
+      let scheduled = false;
+      activeIds.forEach(orderId => {
+        const entry = orderGuardVerificationEntries.get(orderId);
+        const order = ordersById.get(orderId);
+        if(!order
+          || !isOrderGuardVerificationEntryCurrent(entry)
+          || !entry.settled
+          || !entry.failed
+          || entry.retryable !== true
+          || entry.fingerprint !== getOrderGuardVerificationFingerprint(order)) return;
+        ensureOrderGuardVerification(order, {
+          liveQueryGeneration:entry.liveQueryGeneration,
+          retryFailedEntry:true
+        });
+        scheduled = true;
+      });
+      return scheduled;
     }
 
     function getCurrentManagerBusinessDateKey(){
@@ -59793,6 +59842,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
     function runScopedRealtimeHealthCheck(){
       if(!isScopedRealtimeRecoveryAllowed()) return false;
+      const guardVerificationGeneration = liveOrderQueryGuardVerificationGeneration;
       scopedRealtimeRetryStates.forEach((retryState, key) => {
         if(scopedRealtimeSubscriptions.has(key)) return;
         if(retryState.timer) clearTimeout(retryState.timer);
@@ -59806,7 +59856,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           exhausted:false
         });
       });
-      return syncScopedRealtimeSubscriptions();
+      const synced = syncScopedRealtimeSubscriptions();
+      if(liveOrderQueryGuardVerificationGeneration === guardVerificationGeneration){
+        retryFailedOrderGuardVerifications();
+      }
+      return synced;
     }
 
     function getRealtimeScopeState(){
