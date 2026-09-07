@@ -34174,7 +34174,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const user = getUserById(order.userId);
       if(!user){ showMessage('사용자를 찾을 수 없습니다.'); return; }
       const initialEditData = getOrderEditInitialComparableData();
-      if(!initialEditData || getOrderEditProtectedContentSnapshot(state.editOrderData) !== getOrderEditProtectedContentSnapshot(initialEditData)){
+      if(!initialEditData
+        || String(state.editOrderData.deliveryType || 'PICKUP').toUpperCase() !== String(initialEditData.deliveryType || 'PICKUP').toUpperCase()
+        || String(state.editOrderData.deliveryLocation || '').trim() !== String(initialEditData.deliveryLocation || '').trim()){
         showOrderEditValidation(ORDER_EDIT_MEMO_ONLY_MESSAGE, '', -1);
         return;
       }
@@ -51298,6 +51300,63 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     });
   }
 
+  function getOrderEditRentedTumblerAssignments(order){
+    return (Array.isArray(order && order.items) ? order.items : []).filter(item => item
+      && String(item.cupType || '').toUpperCase() === 'TUMBLER'
+      && String(item.assignedTumblerKind || '').toLowerCase() === 'rent');
+  }
+
+  function isOrderEditSamePhysicalTumbler(left, right){
+    if(!left || !right) return false;
+    if(String(left.id || left.tumblerId || '') && String(left.id || left.tumblerId || '') === String(right.id || right.tumblerId || '')) return true;
+    const leftType = String(left.type || left.tumblerType || '').toLowerCase();
+    const rightType = String(right.type || right.tumblerType || '').toLowerCase();
+    const leftNumber = String(left.number || left.tumblerNumber || '');
+    const rightNumber = String(right.number || right.tumblerNumber || '');
+    return !!leftType && !!leftNumber && leftType === rightType && leftNumber === rightNumber;
+  }
+
+  function verifyOrderEditRentedTumblerAssignments(tumblerData, currentOrder, requestedOrder){
+    const assignments = getOrderEditRentedTumblerAssignments(requestedOrder);
+    if(!assignments.length) return { ok:true, assignments:[] };
+    const data = tumblerData && typeof tumblerData === 'object' ? tumblerData : {};
+    const tumblers = Array.isArray(data.tumblers) ? data.tumblers : [];
+    const history = Array.isArray(data.rentalHistory) ? data.rentalHistory : [];
+    const userId = String(currentOrder && currentOrder.userId || '');
+    const orderId = String(currentOrder && currentOrder.id || '');
+    const orderOwnedIds = new Set((Array.isArray(currentOrder && currentOrder.rentOrderTumblers) ? currentOrder.rentOrderTumblers : [])
+      .map(item => String(item && (item.id || item.tumblerId || item.assignedTumblerId) || ''))
+      .filter(Boolean));
+    const verifiedIds = new Set();
+
+    for(const assignment of assignments){
+      const assignedId = String(assignment.assignedTumblerId || '').trim();
+      if(!assignedId || verifiedIds.has(assignedId)) return { ok:false, reason:'invalid-or-duplicate-assignment' };
+      const target = tumblers.find(item => String(item && item.id || '') === assignedId);
+      if(!target) return { ok:false, reason:'not-found' };
+      if(String(target.status || '') !== 'rented' || String(target.currentUserId || '') !== userId) return { ok:false, reason:'wrong-owner-or-status' };
+      const assignedType = String(assignment.assignedTumblerType || '').toLowerCase();
+      const assignedNumber = String(assignment.assignedTumblerNumber || '');
+      if((assignedType && assignedType !== String(target.type || '').toLowerCase())
+        || (assignedNumber && assignedNumber !== String(target.number || ''))){
+        return { ok:false, reason:'physical-mismatch' };
+      }
+      const openPhysicalHistory = history.filter(item => item
+        && String(item.status || '') === 'rented'
+        && !item.returnedAt
+        && isOrderEditSamePhysicalTumbler(item, target));
+      if(openPhysicalHistory.length !== 1 || String(openPhysicalHistory[0].userId || '') !== userId){
+        return { ok:false, reason:'stale-or-ambiguous-history' };
+      }
+      const historyOrderId = String(openPhysicalHistory[0].orderId || '');
+      if(orderOwnedIds.has(assignedId) && historyOrderId !== orderId){
+        return { ok:false, reason:'order-lineage-mismatch' };
+      }
+      verifiedIds.add(assignedId);
+    }
+    return { ok:true, assignments:Array.from(verifiedIds) };
+  }
+
   async function editLiveOrderByTransaction(request){
     const req = request && typeof request === 'object' ? request : {};
     const orderId = String(req.orderId || '').trim();
@@ -51316,6 +51375,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       ? prepareCouponEventCloudEntry(req.couponRecord, { reason:'order-edited-transaction' })
       : null;
     const deliveryRef = req.syncDelivery === true ? getDeliveryRecordRef(orderId) : null;
+    const tumblerRef = getOrderEditRentedTumblerAssignments(requestedOrder).length ? cloudDocRefs.tumbler : null;
     await firebaseReadyPromise;
     const result = await runArchiveCloudPromiseWithTimeout(
       runTransaction(db, async transaction => {
@@ -51323,6 +51383,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         const sharedSnapshot = couponDelta !== 0 ? await transaction.get(cloudDocRefs.shared) : null;
         const couponSnapshot = initialCouponEntry ? await transaction.get(initialCouponEntry.eventRef) : null;
         const deliverySnapshot = deliveryRef ? await transaction.get(deliveryRef) : null;
+        const tumblerSnapshot = tumblerRef ? await transaction.get(tumblerRef) : null;
         if(!liveSnapshot.exists()) throw new Error('order-edit-live-order-missing');
 
         const liveData = getPayloadData(liveSnapshot.data());
@@ -51364,6 +51425,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           || normalizeLifecycleRevision(currentOrder.statusRevision) !== normalizeLifecycleRevision(req.baseStatusRevision)
           || normalizeLifecycleRevision(currentOrder.stageRevision) !== normalizeLifecycleRevision(req.baseStageRevision)){
           throw new Error('order-edit-live-order-changed');
+        }
+        if(tumblerRef){
+          if(!tumblerSnapshot || !tumblerSnapshot.exists()) throw new Error('order-edit-tumbler-data-missing');
+          const tumblerVerification = verifyOrderEditRentedTumblerAssignments(getPayloadData(tumblerSnapshot.data()), currentOrder, requestedOrder);
+          if(!tumblerVerification.ok) throw new Error('order-edit-tumbler-truth-' + String(tumblerVerification.reason || 'mismatch'));
         }
         const expectedCouponDelta = -(getOrderEditCouponCost(requestedOrder) - getOrderEditCouponCost(currentOrder));
         if(couponDelta !== expectedCouponDelta) throw new Error('order-edit-coupon-delta-mismatch');

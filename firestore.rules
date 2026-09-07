@@ -512,10 +512,7 @@ service cloud.firestore {
     }
 
     function orderEditCouponOperationUnchanged(before, after) {
-      return hasValidOrderEditCouponCost(before.order)
-        && hasValidOrderEditCouponCost(after.order)
-        && orderEditCouponCost(after.order) == orderEditCouponCost(before.order)
-        && (
+      return (
           (
             !after.order.keys().hasAny(['couponBalanceOperationId'])
             && !before.order.keys().hasAny(['couponBalanceOperationId'])
@@ -554,8 +551,6 @@ service cloud.firestore {
         && event.delta != 0
         && event.beforeCoupons is int
         && event.remainingCoupons is int
-        && hasValidOrderEditCouponCost(before.order)
-        && hasValidOrderEditCouponCost(after.order)
         && event.delta == -(orderEditCouponCost(after.order) - orderEditCouponCost(before.order))
         && event.beforeCoupons + event.delta == event.remainingCoupons
         && event.remainingCoupons == after.order.remainingCoupons;
@@ -604,7 +599,18 @@ service cloud.firestore {
           'couponBalanceVersion', 'lastRecalcRunId', 'editedAt', 'editedBy',
           'orderEditOperationId', 'orderEditCouponEventId'
         ])
-        && orderEditCouponOperationUnchanged(before, after);
+        && hasValidOrderEditCouponCost(before.order)
+        && hasValidOrderEditCouponCost(after.order)
+        && (
+          (
+            orderEditCouponCost(after.order) == orderEditCouponCost(before.order)
+            && orderEditCouponOperationUnchanged(before, after)
+          )
+          || (
+            orderEditCouponCost(after.order) != orderEditCouponCost(before.order)
+            && validOrderEditCouponMutation(before, after)
+          )
+        );
     }
 
     function validOpenLiveUpdate() {
@@ -862,53 +868,52 @@ service cloud.firestore {
         && hasPayloadMap()
         && before is map
         && (
-          (
-            after.reason == 'order-edited-transaction'
-            && validOrderEditLiveUpdate(docId)
-          )
-          || (
-            after.reason == 'order-completed-transaction'
-            && !isDoneStatus(before.status)
-            && isDoneStatus(after.status)
-            && (
-              (
-                after.keys().hasAll([
-                  'legacyCompletionNormalizedAt',
-                  'legacyCompletionNormalizedBy',
-                  'legacyCompletionNormalizedSourceAppVersion',
-                  'legacyCompletionNormalizedCurrentAppVersion'
-                ])
-                && validLegacyCompletionNormalizedLiveCompletionUpdate(docId)
-              )
-              || (
-                !after.keys().hasAny([
-                  'legacyCompletionNormalizedAt',
-                  'legacyCompletionNormalizedBy',
-                  'legacyCompletionNormalizedSourceAppVersion',
-                  'legacyCompletionNormalizedCurrentAppVersion'
-                ])
-                && validLiveCompletionUpdate(docId)
+          after.reason == 'order-edited-transaction'
+          ? validOrderEditLiveUpdate(docId)
+          : (
+            (
+              after.reason == 'order-completed-transaction'
+              && !isDoneStatus(before.status)
+              && isDoneStatus(after.status)
+              && (
+                (
+                  after.keys().hasAll([
+                    'legacyCompletionNormalizedAt',
+                    'legacyCompletionNormalizedBy',
+                    'legacyCompletionNormalizedSourceAppVersion',
+                    'legacyCompletionNormalizedCurrentAppVersion'
+                  ])
+                  && validLegacyCompletionNormalizedLiveCompletionUpdate(docId)
+                )
+                || (
+                  !after.keys().hasAny([
+                    'legacyCompletionNormalizedAt',
+                    'legacyCompletionNormalizedBy',
+                    'legacyCompletionNormalizedSourceAppVersion',
+                    'legacyCompletionNormalizedCurrentAppVersion'
+                  ])
+                  && validLiveCompletionUpdate(docId)
+                )
               )
             )
-          )
-          || (
-            isDoneStatus(before.status)
-            && isDoneStatus(after.status)
-            && preservesCompletedLiveState(docId)
-          )
-          || (
-            after.reason == 'order-reopened-transaction'
-            && isDoneStatus(before.status)
-            && !isDoneStatus(after.status)
-            && validLiveReopenUpdate(docId)
-          )
-          || (
-            after.reason != 'order-edited-transaction'
-            && after.reason != 'order-completed-transaction'
-            && after.reason != 'order-reopened-transaction'
-            && !isDoneStatus(before.status)
-            && !isDoneStatus(after.status)
-            && validOpenLiveUpdate()
+            || (
+              isDoneStatus(before.status)
+              && isDoneStatus(after.status)
+              && preservesCompletedLiveState(docId)
+            )
+            || (
+              after.reason == 'order-reopened-transaction'
+              && isDoneStatus(before.status)
+              && !isDoneStatus(after.status)
+              && validLiveReopenUpdate(docId)
+            )
+            || (
+              after.reason != 'order-completed-transaction'
+              && after.reason != 'order-reopened-transaction'
+              && !isDoneStatus(before.status)
+              && !isDoneStatus(after.status)
+              && validOpenLiveUpdate()
+            )
           )
         );
     }
@@ -2561,28 +2566,31 @@ service cloud.firestore {
       allow create: if docId != 'app_runtime_policy'
         && hasCouponBalanceGuardSchema(docId)
         && (
-          (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthCreate(docId))
-          || (isCouponEventDocId(docId) && validCouponEventCreate(docId))
-          || (isOfflineCouponUseDocId(docId) && validOfflineCouponUseCreate(docId))
-          || (isCouponRecordResolutionDocId(docId) && validCouponRecordResolutionCreate(docId))
-          || (isCouponRecalcRunDocId(docId) && validCouponRecalcRunCreate(docId))
-          || (isCouponRecalcItemDocId(docId) && validCouponRecalcItemCreate(docId))
-          || (isCouponRecalcLatestDocId(docId) && validCouponRecalcLatestCreate(docId))
-          || (isOrderEditDiagnosticDocId(docId) && validOrderEditDiagnosticCreate(docId))
-          || (
-            !isSharedPeopleAuthDocId(docId)
-            && !isCouponLedgerDocId(docId)
-            && !isCouponRestoreAuditDocId(docId)
-            && !isCouponRecalcDocId(docId)
-            && !isOrderEditDiagnosticDocId(docId)
-            && !isLiveOrderDocId(docId)
-            && isFreshClientCreate()
-          )
-          || (
-            !isCouponLedgerDocId(docId)
-            && !isCouponRecalcDocId(docId)
-            && isLiveOrderDocId(docId)
-            && validLiveOrderCreate(docId)
+          isCouponEventDocId(docId)
+          ? validCouponEventCreate(docId)
+          : (
+            (isSharedPeopleAuthDocId(docId) && validSharedPeopleAuthCreate(docId))
+            || (isOfflineCouponUseDocId(docId) && validOfflineCouponUseCreate(docId))
+            || (isCouponRecordResolutionDocId(docId) && validCouponRecordResolutionCreate(docId))
+            || (isCouponRecalcRunDocId(docId) && validCouponRecalcRunCreate(docId))
+            || (isCouponRecalcItemDocId(docId) && validCouponRecalcItemCreate(docId))
+            || (isCouponRecalcLatestDocId(docId) && validCouponRecalcLatestCreate(docId))
+            || (isOrderEditDiagnosticDocId(docId) && validOrderEditDiagnosticCreate(docId))
+            || (
+              !isSharedPeopleAuthDocId(docId)
+              && !isCouponLedgerDocId(docId)
+              && !isCouponRestoreAuditDocId(docId)
+              && !isCouponRecalcDocId(docId)
+              && !isOrderEditDiagnosticDocId(docId)
+              && !isLiveOrderDocId(docId)
+              && isFreshClientCreate()
+            )
+            || (
+              !isCouponLedgerDocId(docId)
+              && !isCouponRecalcDocId(docId)
+              && isLiveOrderDocId(docId)
+              && validLiveOrderCreate(docId)
+            )
           )
         );
       allow update: if docId != 'app_runtime_policy'
