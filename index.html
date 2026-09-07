@@ -24541,7 +24541,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function assignNewRentTumblerForOrderItem(index){
+    async function assignNewRentTumblerForOrderItem(index){
       ensureOrderItemsRuntime();
       const user = getUserById(state.selectedUserId);
       if(!state.orderItems[index] || !user){
@@ -24564,7 +24564,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 자동 배정 기능을 찾을 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
         return false;
       }
-      const result = window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기');
+      const result = await window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기');
       if(!result || !result.ok || !result.item){
         showMessage((result && result.message) || `대여 가능한 ${tumblerType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.`);
         clearOrderItemTumblerAssignment(item);
@@ -24598,7 +24598,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function assignNewRentTumblerForOrderUnit(index, unitIndex){
+    async function assignNewRentTumblerForOrderUnit(index, unitIndex){
       ensureOrderItemsRuntime();
       const user = getUserById(state.selectedUserId);
       const item = state.orderItems[index];
@@ -24619,7 +24619,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 자동 배정 기능을 찾을 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
         return false;
       }
-      const result = window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기');
+      const result = await window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기');
       if(!result || !result.ok || !result.item){
         showMessage((result && result.message) || `대여 가능한 ${tumblerType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.`);
         clearOrderItemTumblerAssignment(unit);
@@ -25552,7 +25552,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function addOrderGroupRentTumbler(index){
+    async function addOrderGroupRentTumbler(index){
       ensureOrderItemsRuntime();
       const item = state.orderItems[index];
       if(!item) return false;
@@ -25568,7 +25568,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('선택 가능한 잔이 없습니다. 다른 컵을 줄인 뒤 다시 선택해주세요.');
         return false;
       }
-      const result = assignNewRentTumblerForOrderUnit(index, unitIndex);
+      const result = await assignNewRentTumblerForOrderUnit(index, unitIndex);
       syncGroupedCupItemPrimary(index);
       return result;
     }
@@ -31522,7 +31522,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           showMessage('텀블러 임시 대여를 완료 처리할 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
           return;
         }
-        const completeResult = window.TumblerModule.completeReservedRentOrder(user.id, state.pendingOrderTumblers, order.id);
+        const completeResult = await window.TumblerModule.completeReservedRentOrder(user.id, state.pendingOrderTumblers, order.id);
         if(!completeResult || !completeResult.ok){
           showMessage((completeResult && completeResult.message) || '텀블러 임시 대여 시간이 만료되었습니다. 다시 신청해주세요.');
           state.pendingOrderTumblers = [];
@@ -44104,7 +44104,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('touchstart', handleOrderMenuSuggestionEarlySelect, true);
     document.addEventListener('mousedown', handleOrderMenuSuggestionEarlySelect, true);
 
-    document.addEventListener('click', (event) => {
+    document.addEventListener('click', async (event) => {
       const btn = event.target.closest('[data-action]');
       if(!btn) return;
       if(!(app.contains(btn) || modalRoot.contains(btn))) return;
@@ -44628,7 +44628,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(item) {
           item.temp = btn.dataset.value === 'HOT' ? 'HOT' : 'ICE';
           if(hadAutoRent){
-            assignNewRentTumblerForOrderItem(idx);
+            await assignNewRentTumblerForOrderItem(idx);
             render();
             return;
           }
@@ -44688,7 +44688,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       else if(action === 'new-order-group-rent-tumbler'){
         event.preventDefault();
-        addOrderGroupRentTumbler(Number(btn.dataset.index || 0));
+        await addOrderGroupRentTumbler(Number(btn.dataset.index || 0));
         render();
       }
       else if(action === 'set-order-unit-cup'){
@@ -44718,7 +44718,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         render();
       }
       else if(action === 'new-order-unit-rent-tumbler'){
-        assignNewRentTumblerForOrderUnit(Number(btn.dataset.index || 0), Number(btn.dataset.unitIndex || 0));
+        await assignNewRentTumblerForOrderUnit(Number(btn.dataset.index || 0), Number(btn.dataset.unitIndex || 0));
         render();
       }
       else if(action === 'cancel-order-unit-rent-tumbler'){
@@ -44788,7 +44788,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         addPersonalTumblerForOrderItem(Number(btn.dataset.index || 0));
       }
       else if(action === 'new-order-item-rent-tumbler'){
-        assignNewRentTumblerForOrderItem(Number(btn.dataset.index || 0));
+        await assignNewRentTumblerForOrderItem(Number(btn.dataset.index || 0));
         render();
       }
       else if(action === 'cancel-order-item-rent-tumbler'){
@@ -46356,6 +46356,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
   }
 
+  let personalTumblerMutationInFlight = 0;
+
   function applyCloudData(nextData){
     const normalized = normalizeData(nextData);
     const beforeSignature = JSON.stringify(normalizeData(tState.data));
@@ -46368,7 +46370,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     tState.saveState = 'saved';
     tState.saveStateText = `동기화 완료 ${formatAMPM(new Date())}`;
     if(expiredChanged || returnedWaitingChanged) saveData();
-    if(dataChanged){
+    if(dataChanged && personalTumblerMutationInFlight === 0){
       requestRentOrderScrollRestore();
       render();
     }
@@ -46899,6 +46901,126 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return tumblerList().filter(item => item.status === 'rented' && String(item.currentUserId || '') === String(staffId || ''));
   }
 
+  function isActivePersonalTumbler(item){
+    return !!(item
+      && (item.type === 'ice' || item.type === 'hot')
+      && ['rented','reserved','cancel_check'].includes(String(item.status || '')));
+  }
+
+  function hasActivePersonalTumblerForUser(items, userId, excludedIds){
+    const excluded = new Set((excludedIds || []).map(id => String(id)));
+    return (Array.isArray(items) ? items : []).some(item => isActivePersonalTumbler(item)
+      && !excluded.has(String(item.id || ''))
+      && String(item.currentUserId || '') === String(userId || ''));
+  }
+
+  function hasOpenPersonalRentalHistoryForUser(history, userId, excludedIds){
+    const excluded = new Set((excludedIds || []).map(id => String(id)));
+    return (Array.isArray(history) ? history : []).some(item => item
+      && (item.tumblerType === 'ice' || item.tumblerType === 'hot')
+      && item.status === 'rented'
+      && !item.returnedAt
+      && !excluded.has(String(item.tumblerId || ''))
+      && String(item.userId || '') === String(userId || ''));
+  }
+
+  function isSamePhysicalTumbler(left, right){
+    if(!left || !right) return false;
+    if(String(left.id || '') && String(left.id || '') === String(right.id || '')) return true;
+    return String(left.type || '') === String(right.type || '')
+      && String(left.number || '') === String(right.number || '');
+  }
+
+  function hasOpenRentalHistoryForPhysicalTumbler(history, target){
+    return (Array.isArray(history) ? history : []).some(item => item
+      && item.status === 'rented'
+      && !item.returnedAt
+      && (String(item.tumblerId || '') === String(target && target.id || '')
+        || (String(item.tumblerType || '') === String(target && target.type || '')
+          && String(item.tumblerNumber || '') === String(target && target.number || ''))));
+  }
+
+  async function commitPersonalTumblerMutation(mutator){
+    if(!(window.HaetsalTumblerTransactionStore && typeof window.HaetsalTumblerTransactionStore.mutate === 'function')){
+      return { ok:false, reason:'transaction-unavailable' };
+    }
+    personalTumblerMutationInFlight += 1;
+    try{
+      const result = await window.HaetsalTumblerTransactionStore.mutate(function(serverData){
+        return mutator(normalizeData(serverData));
+      });
+      if(result && result.ok && result.data){
+        const synced = window.HaetsalSharedStore && window.HaetsalSharedStore.syncTumblerData
+          ? window.HaetsalSharedStore.syncTumblerData(result.data)
+          : result.data;
+        if(window.HaetsalCloudStore && typeof window.HaetsalCloudStore.applyRemote === 'function'){
+          window.HaetsalCloudStore.applyRemote('tumbler', synced);
+        }else{
+          tState.data = normalizeData(synced);
+        }
+      }
+      return result || { ok:false, reason:'transaction-failed' };
+    }catch(error){
+      console.error('텀블러 대여 저장 실패', error);
+      return { ok:false, reason:'transaction-failed', error };
+    }finally{
+      personalTumblerMutationInFlight = Math.max(0, personalTumblerMutationInFlight - 1);
+    }
+  }
+
+  async function rentSelectedPersonalTumblers(userId, selectedIds, extensionDays){
+    const ids = (Array.isArray(selectedIds) ? selectedIds : []).map(id => String(id)).filter(Boolean);
+    if(ids.length !== 1) return { ok:false, reason:'multiple-selection' };
+    const rentedAt = new Date();
+    const dueDate = calculateDueDate(rentedAt, TUMBLER_DEFAULT_RENTAL_DAYS + Number(extensionDays || 0), holidays());
+    return commitPersonalTumblerMutation(function(serverData){
+      const person = (serverData.staff || []).find(item => String(item && item.id || '') === String(userId || ''));
+      const target = (serverData.tumblers || []).find(item => String(item && item.id || '') === ids[0]);
+      if(!person) return { ok:false, reason:'user-missing' };
+      if(hasActivePersonalTumblerForUser(serverData.tumblers, person.id)
+        || hasOpenPersonalRentalHistoryForUser(serverData.rentalHistory, person.id)) return { ok:false, reason:'active-user' };
+      if(!target || target.status !== 'available' || (target.type !== 'ice' && target.type !== 'hot')) return { ok:false, reason:'target-unavailable' };
+      if(hasOpenRentalHistoryForPhysicalTumbler(serverData.rentalHistory, target)
+        || (serverData.tumblers || []).some(item => item !== target && isActivePersonalTumbler(item) && isSamePhysicalTumbler(item, target))){
+        return { ok:false, reason:'entity-active' };
+      }
+      const history = {
+        id:uid(),
+        tumblerId:target.id,
+        tumblerType:target.type,
+        tumblerNumber:target.number,
+        userId:person.id,
+        userName:person.name,
+        rentalDate:rentedAt.toISOString(),
+        dueDate:dueDate.toISOString(),
+        status:'rented',
+        returnedAt:null,
+        returnedStatus:null
+      };
+      serverData.tumblers = serverData.tumblers.map(item => item === target ? {
+        ...item,
+        status:'rented',
+        currentUserId:person.id,
+        currentUserName:person.name,
+        rentalDate:rentedAt.toISOString(),
+        dueDate:dueDate.toISOString()
+      } : item);
+      serverData.staff = serverData.staff.map(item => String(item && item.id || '') === String(person.id) ? {
+        ...item,
+        totalRentalCount:Number(item.totalRentalCount || 0) + 1
+      } : item);
+      serverData.rentalHistory = [...(serverData.rentalHistory || []), history];
+      serverData.settings.totalSaved = Number(serverData.settings.totalSaved || 0) + 1;
+      return {
+        ok:true,
+        data:serverData,
+        person:{ id:person.id, name:person.name },
+        item:{ id:target.id, type:target.type, number:target.number },
+        dueDate:dueDate.toISOString()
+      };
+    });
+  }
+
   function selectStaff(staffId){
     tState.selectedStaffId = staffId;
     tState.selectedTumblers = [];
@@ -46918,7 +47040,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     render();
   }
 
-  function confirmRent(extensionDays){
+  async function confirmRent(extensionDays){
     const staffId = tState.selectedStaffId;
     const person = findStaff(staffId);
     if(!person) {
@@ -46929,66 +47051,29 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       showAlert('오류', '대여할 텀블러를 1개 이상 선택해주세요.');
       return;
     }
-    const rentedAt = new Date();
-    const dueDate = calculateDueDate(rentedAt, TUMBLER_DEFAULT_RENTAL_DAYS + Number(extensionDays || 0), holidays());
-    const selectedSet = new Set(tState.selectedTumblers);
-    let rentedCount = 0;
-    let iceCount = 0;
-    let hotCount = 0;
-    let tumblerNumbers = [];
-    const newRentalHistory = [];
-    tState.data.tumblers = tState.data.tumblers.map(item => {
-      if(selectedSet.has(item.id) && item.status === 'available'){
-        rentedCount += 1;
-        if(item.type === 'ice') iceCount += 1;
-        if(item.type === 'hot') hotCount += 1;
-        tumblerNumbers.push(item.number + '번');
-        newRentalHistory.push({
-          id: uid(),
-          tumblerId: item.id,
-          tumblerType: item.type,
-          tumblerNumber: item.number,
-          userId: person.id,
-          userName: person.name,
-          rentalDate: rentedAt.toISOString(),
-          dueDate: dueDate.toISOString(),
-          status: 'rented',
-          returnedAt: null,
-          returnedStatus: null
-        });
-        return {
-          ...item,
-          status: 'rented',
-          currentUserId: person.id,
-          currentUserName: person.name,
-          rentalDate: rentedAt.toISOString(),
-          dueDate: dueDate.toISOString()
-        };
-      }
-      return item;
-    });
-    if(rentedCount === 0){
+    const result = await rentSelectedPersonalTumblers(person.id, tState.selectedTumblers, extensionDays);
+    if(!result || !result.ok){
+      tState.selectedStaffId = null;
+      tState.selectedTumblers = [];
       showAlert('대여 불가', '선택한 텀블러 중 대여 가능한 텀블러가 없습니다.');
-      return;
+      return result || { ok:false };
     }
-    tState.data.staff = tState.data.staff.map(item => item.id === person.id ? { ...item, totalRentalCount: Number(item.totalRentalCount || 0) + rentedCount } : item);
-    tState.data.rentalHistory = [...rentalHistoryList(), ...newRentalHistory];
-    tState.data.settings.totalSaved = Number(tState.data.settings.totalSaved || 0) + rentedCount;
     tState.modal = null;
     tState.view = 'success';
     tState.lastRental = {
       userName: person.name,
-      tumblerNumber: tumblerNumbers.join(', '),
-      dueDate: dueDate.toISOString(),
-      totalCount: rentedCount,
-      iceCount,
-      hotCount,
+      tumblerNumber: result.item.number + '번',
+      dueDate: result.dueDate,
+      totalCount: 1,
+      iceCount: result.item.type === 'ice' ? 1 : 0,
+      hotCount: result.item.type === 'hot' ? 1 : 0,
       proxyRentMode: !!tState.proxyRentMode,
       proxyReturnView: tState.proxyReturnView
     };
     tState.selectedStaffId = null;
     tState.selectedTumblers = [];
-    saveAndRender();
+    render();
+    return result;
   }
 
   function syncRentOrderQtysFromInputs(){
@@ -47006,7 +47091,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     });
   }
 
-  function confirmRentOrderAndStartOrder(){
+  async function confirmRentOrderAndStartOrder(){
     syncRentOrderQtysFromInputs();
     cleanupExpiredRentOrderReservations(true);
     const staffId = tState.selectedStaffId;
@@ -47024,57 +47109,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       showAlert('대여 불가', `대여 가능한 텀블러가 부족합니다.<br>아이스 부족 ${selected.iceShortage}개 · 핫 부족 ${selected.hotShortage}개`);
       return;
     }
-
-    const selectedSet = new Set(selected.items.map(item => String(item.id)));
-    const currentTargets = tumblerList().filter(item => item && selectedSet.has(String(item.id)));
-    if(currentTargets.length !== selected.requestedTotal || currentTargets.some(item => item.status !== 'available')){
+    if(selected.requestedTotal !== 1){
       showAlert('대여 불가', '자동 배정 중 일부 텀블러가 이미 사용 중입니다. 다시 시도해 주세요.');
       return;
     }
-
-    const reservedAt = new Date();
-    const reservedUntil = new Date(reservedAt.getTime() + RENT_ORDER_RESERVATION_MINUTES * 60 * 1000);
-    const reservationSessionId = uid();
-    const assignedTumblers = [];
-
-    tState.data.tumblers = tState.data.tumblers.map(item => {
-      if(item && selectedSet.has(String(item.id)) && item.status === 'available'){
-        const assigned = {
-          id:item.id,
-          type:item.type,
-          number:item.number,
-          label:tumblerOrderLabel(item),
-          reservationSessionId,
-          reservedUntil:reservedUntil.toISOString()
-        };
-        assignedTumblers.push(assigned);
-        return {
-          ...item,
-          status:'reserved',
-          currentUserId:person.id,
-          currentUserName:person.name,
-          rentalDate:null,
-          dueDate:null,
-          reservedAt:reservedAt.toISOString(),
-          reservedUntil:reservedUntil.toISOString(),
-          reservationSessionId,
-          reservationSource:'텀블러 대여 및 주문'
-        };
-      }
-      return item;
-    });
-
-    if(assignedTumblers.length !== selected.requestedTotal){
-      releaseReservedRentOrder(assignedTumblers, person.id, true);
+    const reserveResult = await reserveSingleRentOrderTumbler(person.id, selected.items[0].type, '텀블러 대여 및 주문');
+    if(!reserveResult || !reserveResult.ok || !reserveResult.item){
       showAlert('대여 불가', '자동 배정 중 일부 텀블러가 이미 사용 중입니다. 다시 시도해 주세요.');
       return;
     }
+    const assignedTumblers = [reserveResult.item];
 
     if(window.OrderModule && typeof window.OrderModule.syncUsersForTumblerReservation === 'function'){
       window.OrderModule.syncUsersForTumblerReservation();
     }
 
-    saveData();
     tState.selectedTumblers = [];
     tState.selectedStaffId = null;
     tState.search = '';
@@ -47087,51 +47136,53 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(window.HaetsalCombinedApp) window.HaetsalCombinedApp.showRoute('order');
   }
 
-  function reserveSingleRentOrderTumbler(userId, type, sourceLabel){
+  async function reserveSingleRentOrderTumbler(userId, type, sourceLabel){
     refreshFromShared();
     cleanupExpiredRentOrderReservations(true);
     const person = findStaff(userId);
     const targetType = type === 'hot' ? 'hot' : 'ice';
     if(!person) return { ok:false, message:'사용자를 찾을 수 없습니다.' };
-    const target = getAvailableTumblersByType(targetType)[0] || null;
-    if(!target){
-      return { ok:false, message:`대여 가능한 ${targetType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.` };
-    }
     const reservedAt = new Date();
     const reservedUntil = new Date(reservedAt.getTime() + RENT_ORDER_RESERVATION_MINUTES * 60 * 1000);
     const reservationSessionId = uid();
-    let assigned = null;
-    tState.data.tumblers = tumblerList().map(item => {
-      if(item && String(item.id) === String(target.id) && item.status === 'available'){
-        assigned = {
-          id:item.id,
-          type:item.type,
-          number:item.number,
-          label:tumblerOrderLabel(item),
-          reservationSessionId,
-          reservedUntil:reservedUntil.toISOString()
-        };
-        return {
-          ...item,
-          status:'reserved',
-          currentUserId:person.id,
-          currentUserName:person.name,
-          rentalDate:null,
-          dueDate:null,
-          reservedAt:reservedAt.toISOString(),
-          reservedUntil:reservedUntil.toISOString(),
-          reservationSessionId,
-          reservationSource: sourceLabel || '주문 중 새로 대여하기'
-        };
+    const result = await commitPersonalTumblerMutation(function(serverData){
+      const serverPerson = (serverData.staff || []).find(item => String(item && item.id || '') === String(userId || ''));
+      if(!serverPerson) return { ok:false, reason:'user-missing' };
+      if(hasActivePersonalTumblerForUser(serverData.tumblers, serverPerson.id)
+        || hasOpenPersonalRentalHistoryForUser(serverData.rentalHistory, serverPerson.id)) return { ok:false, reason:'active-user' };
+      const target = (serverData.tumblers || []).find(item => item && item.type === targetType && item.status === 'available');
+      if(!target) return { ok:false, reason:'target-unavailable' };
+      if(hasOpenRentalHistoryForPhysicalTumbler(serverData.rentalHistory, target)
+        || (serverData.tumblers || []).some(item => item !== target && isActivePersonalTumbler(item) && isSamePhysicalTumbler(item, target))){
+        return { ok:false, reason:'entity-active' };
       }
-      return item;
+      const assigned = {
+        id:target.id,
+        type:target.type,
+        number:target.number,
+        label:tumblerOrderLabel(target),
+        reservationSessionId,
+        reservedUntil:reservedUntil.toISOString()
+      };
+      serverData.tumblers = serverData.tumblers.map(item => item === target ? {
+        ...item,
+        status:'reserved',
+        currentUserId:serverPerson.id,
+        currentUserName:serverPerson.name,
+        rentalDate:null,
+        dueDate:null,
+        reservedAt:reservedAt.toISOString(),
+        reservedUntil:reservedUntil.toISOString(),
+        reservationSessionId,
+        reservationSource:sourceLabel || '주문 중 새로 대여하기'
+      } : item);
+      return { ok:true, data:serverData, item:assigned };
     });
-    if(!assigned){
-      return { ok:false, message:'자동 배정 중 텀블러가 이미 사용 중입니다. 다시 시도해 주세요.' };
+    if(!result || !result.ok || !result.item){
+      return { ok:false, message:`대여 가능한 ${targetType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.` };
     }
-    saveData();
     render();
-    return { ok:true, item:assigned };
+    return { ok:true, item:result.item };
   }
 
   function releaseReservedRentOrder(assignedTumblers, userId, silent){
@@ -47165,81 +47216,85 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return { ok:true, released };
   }
 
-  function completeReservedRentOrder(userId, assignedTumblers, orderId){
+  async function completeReservedRentOrder(userId, assignedTumblers, orderId){
     refreshFromShared();
     cleanupExpiredRentOrderReservations(true);
-    const ids = (Array.isArray(assignedTumblers) ? assignedTumblers : [])
-      .map(item => String((item && item.id) || item || '').trim())
-      .filter(Boolean);
+    const assigned = Array.isArray(assignedTumblers) ? assignedTumblers : [];
+    const ids = assigned.map(item => String((item && item.id) || item || '').trim()).filter(Boolean);
     if(!ids.length) return { ok:true, completed:0 };
     const person = findStaff(userId);
     if(!person) return { ok:false, completed:0, message:'사용자를 찾을 수 없습니다.' };
-    const idSet = new Set(ids);
-    const targets = tumblerList().filter(item => item && idSet.has(String(item.id)));
-    if(targets.length !== ids.length){
-      return { ok:false, completed:0, message:'임시 대여 시간이 만료되었거나 이미 처리된 텀블러가 있습니다.' };
-    }
-    const invalidTarget = targets.find(item => {
-      const sameUser = String(item.currentUserId || '') === String(userId);
-      if(item.status === 'reserved' && sameUser) return false;
-      if(item.status === 'rented' && sameUser) return false;
-      return true;
-    });
-    if(invalidTarget){
-      return { ok:false, completed:0, message:'임시 대여 시간이 만료되었거나 이미 처리된 텀블러가 있습니다.' };
-    }
-    const alreadyCompletedCount = targets.filter(item => item.status === 'rented' && String(item.currentUserId || '') === String(userId)).length;
+    if(ids.length !== 1) return { ok:false, completed:0, message:'임시 대여 시간이 만료되었거나 이미 처리된 텀블러가 있습니다.' };
     const now = new Date();
     const dueDate = calculateDueDate(now, TUMBLER_DEFAULT_RENTAL_DAYS, holidays());
-    const newRentalHistory = [];
-    let completed = 0;
-
-    tState.data.tumblers = tumblerList().map(item => {
-      if(!item || !idSet.has(String(item.id))) return item;
-      if(item.status === 'rented' && String(item.currentUserId || '') === String(userId)) return item;
-      completed += 1;
-      newRentalHistory.push({
-        id: uid(),
-        tumblerId: item.id,
-        tumblerType: item.type,
-        tumblerNumber: item.number,
-        userId: person.id,
-        userName: person.name,
-        rentalDate: now.toISOString(),
-        dueDate: dueDate.toISOString(),
-        status: 'rented',
-        returnedAt: null,
-        returnedStatus: null,
-        source: '텀블러 대여 및 주문',
-        orderId: orderId || '',
-        reservedAt: item.reservedAt || ''
-      });
-      return {
+    const reservationSessionId = String((assigned[0] && assigned[0].reservationSessionId) || '');
+    const result = await commitPersonalTumblerMutation(function(serverData){
+      const serverPerson = (serverData.staff || []).find(item => String(item && item.id || '') === String(userId || ''));
+      const target = (serverData.tumblers || []).find(item => String(item && item.id || '') === ids[0]);
+      if(!serverPerson || !target) return { ok:false, reason:'target-missing' };
+      const sameUser = String(target.currentUserId || '') === String(userId || '');
+      if(target.status === 'rented' && sameUser){
+        const matchingHistory = (serverData.rentalHistory || []).some(item => item
+          && String(item.tumblerId || '') === String(target.id || '')
+          && String(item.userId || '') === String(userId || '')
+          && item.status === 'rented'
+          && !item.returnedAt
+          && (!orderId || String(item.orderId || '') === String(orderId)));
+        return matchingHistory
+          ? { ok:true, data:serverData, completed:1, recovered:true }
+          : { ok:false, reason:'reservation-mismatch' };
+      }
+      if(target.status !== 'reserved' || !sameUser) return { ok:false, reason:'reservation-mismatch' };
+      if(reservationSessionId && String(target.reservationSessionId || '') !== reservationSessionId){
+        return { ok:false, reason:'reservation-mismatch' };
+      }
+      if(hasActivePersonalTumblerForUser(serverData.tumblers, userId, ids)
+        || hasOpenPersonalRentalHistoryForUser(serverData.rentalHistory, userId, ids)) return { ok:false, reason:'active-user' };
+      if(hasOpenRentalHistoryForPhysicalTumbler(serverData.rentalHistory, target)
+        || (serverData.tumblers || []).some(item => item !== target && isActivePersonalTumbler(item) && isSamePhysicalTumbler(item, target))){
+        return { ok:false, reason:'entity-active' };
+      }
+      const history = {
+        id:uid(),
+        tumblerId:target.id,
+        tumblerType:target.type,
+        tumblerNumber:target.number,
+        userId:serverPerson.id,
+        userName:serverPerson.name,
+        rentalDate:now.toISOString(),
+        dueDate:dueDate.toISOString(),
+        status:'rented',
+        returnedAt:null,
+        returnedStatus:null,
+        source:'텀블러 대여 및 주문',
+        orderId:orderId || '',
+        reservedAt:target.reservedAt || ''
+      };
+      serverData.tumblers = serverData.tumblers.map(item => item === target ? {
         ...item,
         status:'rented',
-        currentUserId:person.id,
-        currentUserName:person.name,
+        currentUserId:serverPerson.id,
+        currentUserName:serverPerson.name,
         rentalDate:now.toISOString(),
         dueDate:dueDate.toISOString(),
         reservedAt:null,
         reservedUntil:null,
         reservationSessionId:null,
         reservationSource:null
-      };
+      } : item);
+      serverData.staff = serverData.staff.map(item => String(item && item.id || '') === String(serverPerson.id) ? {
+        ...item,
+        totalRentalCount:Number(item.totalRentalCount || 0) + 1
+      } : item);
+      serverData.rentalHistory = [...(serverData.rentalHistory || []), history];
+      serverData.settings.totalSaved = Number(serverData.settings.totalSaved || 0) + 1;
+      return { ok:true, data:serverData, completed:1 };
     });
-
-    if(completed + alreadyCompletedCount !== ids.length){
-      return { ok:false, completed, message:'임시 대여 시간이 만료되었거나 이미 처리된 텀블러가 있습니다.' };
+    if(!result || !result.ok){
+      return { ok:false, completed:0, message:'임시 대여 시간이 만료되었거나 이미 처리된 텀블러가 있습니다.' };
     }
-
-    if(completed > 0){
-      tState.data.staff = tState.data.staff.map(item => item.id === person.id ? { ...item, totalRentalCount: Number(item.totalRentalCount || 0) + completed } : item);
-      tState.data.rentalHistory = [...rentalHistoryList(), ...newRentalHistory];
-      tState.data.settings.totalSaved = Number(tState.data.settings.totalSaved || 0) + completed;
-    }
-    saveData();
     render();
-    return { ok:true, completed: completed + alreadyCompletedCount };
+    return { ok:true, completed:Number(result.completed || 1) };
   }
 
 
@@ -48353,7 +48408,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     render();
   }
 
-  function confirmProxyRent(){
+  async function confirmProxyRent(){
     const person = findStaff(tState.proxySelectedStaffId);
     if(!person){
       showAlert('오류', '사용자를 먼저 선택해주세요.');
@@ -48363,65 +48418,25 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       showAlert('오류', '대여할 텀블러를 1개 이상 선택해주세요.');
       return;
     }
-    const rentedAt = new Date();
-    const dueDate = calculateDueDate(rentedAt, TUMBLER_DEFAULT_RENTAL_DAYS, holidays());
-    const selectedSet = new Set(tState.proxySelectedTumblers);
-    let rentedCount = 0;
-    let iceCount = 0;
-    let hotCount = 0;
-    const tumblerLabels = [];
-    const newRentalHistory = [];
-    tState.data.tumblers = tState.data.tumblers.map(item => {
-      if(selectedSet.has(item.id) && item.status === 'available'){
-        rentedCount += 1;
-        if(item.type === 'ice') iceCount += 1;
-        if(item.type === 'hot') hotCount += 1;
-        tumblerLabels.push(`${categoryLabel(item.type)} ${item.number}번`);
-        newRentalHistory.push({
-          id: uid(),
-          tumblerId: item.id,
-          tumblerType: item.type,
-          tumblerNumber: item.number,
-          userId: person.id,
-          userName: person.name,
-          rentalDate: rentedAt.toISOString(),
-          dueDate: dueDate.toISOString(),
-          status: 'rented',
-          returnedAt: null,
-          returnedStatus: null
-        });
-        return {
-          ...item,
-          status: 'rented',
-          currentUserId: person.id,
-          currentUserName: person.name,
-          rentalDate: rentedAt.toISOString(),
-          dueDate: dueDate.toISOString()
-        };
-      }
-      return item;
-    });
-    if(rentedCount === 0){
+    const result = await rentSelectedPersonalTumblers(person.id, tState.proxySelectedTumblers, 0);
+    if(!result || !result.ok){
       showAlert('대여 불가', '선택한 텀블러 중 대여 가능한 텀블러가 없습니다.');
-      return;
+      return result || { ok:false };
     }
-    tState.data.staff = tState.data.staff.map(item => item.id === person.id ? { ...item, totalRentalCount: Number(item.totalRentalCount || 0) + rentedCount } : item);
-    tState.data.rentalHistory = [...rentalHistoryList(), ...newRentalHistory];
-    tState.data.settings.totalSaved = Number(tState.data.settings.totalSaved || 0) + rentedCount;
+    const tumblerLabel = `${categoryLabel(result.item.type)} ${result.item.number}번`;
     tState.modal = null;
     tState.lastRental = {
       userName: person.name,
-      tumblerNumber: tumblerLabels.join(', '),
-      dueDate: dueDate.toISOString(),
-      totalCount: rentedCount,
-      iceCount,
-      hotCount,
+      tumblerNumber: tumblerLabel,
+      dueDate: result.dueDate,
+      totalCount: 1,
+      iceCount: result.item.type === 'ice' ? 1 : 0,
+      hotCount: result.item.type === 'hot' ? 1 : 0,
       proxyRentMode: true,
       proxyReturnView: tState.proxyReturnView
     };
-    tState.proxyLastMessage = `${person.name}님 ${tumblerLabels.join(', ')} 대여 등록 완료 · 반납 예정일: ${formatDate(dueDate.toISOString())}`;
+    tState.proxyLastMessage = `${person.name}님 ${tumblerLabel} 대여 등록 완료 · 반납 예정일: ${formatDate(result.dueDate)}`;
     resetProxyPanelSelection(true);
-    saveData();
     render();
     requestAnimationFrame(function(){
       const embeddedRoot = getEmbeddedTumblerRoot();
@@ -48431,6 +48446,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         try{ input.focus({ preventScroll:true }); }catch(error){ input.focus(); }
       }
     });
+    return result;
   }
 
 
@@ -54967,6 +54983,25 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       clientWriteId
     };
   }
+
+  window.HaetsalTumblerTransactionStore = {
+    mutate: async function(mutator){
+      if(typeof mutator !== 'function') return { ok:false, reason:'invalid-mutation' };
+      await firebaseReadyPromise;
+      if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('tumbler-transaction')){
+        return { ok:false, reason:'runtime-stopped' };
+      }
+      return runTransaction(db, async transaction => {
+        const snapshot = await transaction.get(cloudDocRefs.tumbler);
+        if(!snapshot.exists()) return { ok:false, reason:'tumbler-data-missing' };
+        const current = getPayloadData(snapshot.data());
+        const result = await mutator(JSON.parse(JSON.stringify(current || {})));
+        if(!(result && result.ok === true && result.data)) return result || { ok:false, reason:'mutation-rejected' };
+        transaction.set(cloudDocRefs.tumbler, buildPayload(result.data));
+        return result;
+      });
+    }
+  };
 
 
   function buildPayloadWithServerOrderTimes(data, mode){
