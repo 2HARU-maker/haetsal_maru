@@ -50088,7 +50088,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return `
         <div class="tm-embedded-dashboard">
           ${layoutHtml}
-          <div id="embedded-tumbler-modal-root"></div>
+          <div id="embedded-tumbler-modal-root">${renderModal()}</div>
         </div>
       `;
     },
