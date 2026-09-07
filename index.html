@@ -12949,6 +12949,7 @@ window.HaetsalSharedStore = (function(){
     const ORDER_STAGE_TRANSITION_QUEUE_MAX_COUNT = 500;
     let completionRequestSerialTail = Promise.resolve();
     const completionRequestTaskByKey = new Map();
+    const completionRequestLeaseRetryTimers = new Map();
     const productionCompletionInteractionBusyOrderIds = new Set();
     let completionRequestRetryRunnerPromise = null;
     let completionRequestCloudHydrationPromise = null;
@@ -31771,7 +31772,31 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function removeCompletionRequestQueueItem(completionEventId){
       const id = String(completionEventId || '');
       if(!id) return;
+      const retryTimer = completionRequestLeaseRetryTimers.get(id);
+      if(retryTimer){
+        window.clearTimeout(retryTimer.timerId);
+        completionRequestLeaseRetryTimers.delete(id);
+      }
       writeCompletionRequestQueueLocal(readCompletionRequestQueueLocal().filter(item => item.completionEventId !== id));
+    }
+
+    function scheduleCompletionRequestAfterForeignLease(request, leaseUntilMs){
+      const activeRequest = normalizeCompletionRequestQueueItem(request);
+      if(!activeRequest) return;
+      const dueAt = Math.max(Date.now(), Number(leaseUntilMs || 0)) + 100;
+      const existing = completionRequestLeaseRetryTimers.get(activeRequest.completionEventId);
+      if(existing && Number(existing.dueAt || 0) <= dueAt) return;
+      if(existing) window.clearTimeout(existing.timerId);
+      const timerId = window.setTimeout(() => {
+        completionRequestLeaseRetryTimers.delete(activeRequest.completionEventId);
+        const queued = readCompletionRequestQueueLocal().find(item => item.completionEventId === activeRequest.completionEventId);
+        if(!queued || queued.status === 'needs-check') return;
+        processCompletionRequestQueueItem(queued, { silent:false }).catch(error => {
+          markFirestoreQuotaRetryBlocked(error);
+          console.warn('completion request lease retry failed', error);
+        });
+      }, Math.max(0, dueAt - Date.now()));
+      completionRequestLeaseRetryTimers.set(activeRequest.completionEventId, { dueAt, timerId });
     }
 
     function mergeCompletionRequestsIntoLocalQueue(items){
@@ -31790,6 +31815,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
         });
         if(!normalized) return;
         if(readRevivedOrderGuardMap()[normalized.orderId]) return;
+        if(cloudStatus === 'PROCESSING'){
+          scheduleCompletionRequestAfterForeignLease(normalized, raw && raw.processingLeaseUntilMs);
+        }
         const existing = byEventId.get(normalized.completionEventId);
         byEventId.set(normalized.completionEventId, normalizeCompletionRequestQueueItem({
           ...(existing || {}),
@@ -32199,6 +32227,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           if(claimResult && claimResult.status === 'processing-by-other'){
             updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'processing-by-other' });
             markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '다른 매니저 기기에서 완료 반영 확인 중');
+            scheduleCompletionRequestAfterForeignLease(activeRequest, claimResult.leaseUntilMs);
             if(!opts.silent) requestOrderLifecycleRender();
             return claimResult;
           }
@@ -32220,6 +32249,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(resultStatus === 'processing-by-other'){
           updateCompletionRequestQueueItem(activeRequest.completionEventId, { status:'pending', lastError:'processing-by-other' });
           markCompletionRequestOnLocalOrder(activeRequest.orderId, 'pending', '다른 매니저 기기에서 완료 반영 확인 중');
+          scheduleCompletionRequestAfterForeignLease(activeRequest, Date.now() + ORDER_COMPLETION_PROCESSING_LEASE_MS);
           if(!opts.silent) requestOrderLifecycleRender();
           return result;
         }
@@ -38342,6 +38372,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let orderScrollRestoreGeneration = 0;
     let orderLifecycleRenderQueued = false;
     let orderLifecycleRenderGeneration = 0;
+    let dashboardTouchInteraction = null;
+    let dashboardTouchRenderDeferred = false;
+    let dashboardTouchRenderFlushTimer = null;
     let preserveOrderEditModalScrollOnNextRender = false;
     let orderEditModalScrollSnapshot = null;
     let deferredOrderSearchRemoteRender = false;
@@ -38781,6 +38814,60 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return state.currentView === 'ADMIN_DASHBOARD' || state.currentView === 'MANAGER_DASHBOARD';
     }
 
+    function scheduleDashboardTouchRenderFlush(){
+      if(dashboardTouchRenderFlushTimer) window.clearTimeout(dashboardTouchRenderFlushTimer);
+      dashboardTouchRenderFlushTimer = window.setTimeout(() => {
+        dashboardTouchRenderFlushTimer = null;
+        if(dashboardTouchInteraction || !dashboardTouchRenderDeferred) return;
+        dashboardTouchRenderDeferred = false;
+        render();
+      }, 120);
+    }
+
+    function startDashboardTouchInteraction(event){
+      if(!isDashboardView() || !event.touches || event.touches.length !== 1) return;
+      const dashboardBody = getDashboardScrollContainer();
+      if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
+      dashboardTouchInteraction = `touch:${Number(event.touches[0].identifier)}`;
+      if(dashboardTouchRenderFlushTimer){
+        window.clearTimeout(dashboardTouchRenderFlushTimer);
+        dashboardTouchRenderFlushTimer = null;
+      }
+    }
+
+    function endDashboardTouchInteraction(event){
+      if(dashboardTouchInteraction == null) return;
+      const changedTouches = event.changedTouches || [];
+      const ended = Array.from(changedTouches).some(touch => `touch:${Number(touch.identifier)}` === dashboardTouchInteraction);
+      if(!ended && event.type !== 'touchcancel') return;
+      dashboardTouchInteraction = null;
+      if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
+    }
+
+    function startDashboardPointerInteraction(event){
+      if(event.pointerType !== 'touch' || !isDashboardView()) return;
+      const dashboardBody = getDashboardScrollContainer();
+      if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
+      if(dashboardTouchInteraction == null) dashboardTouchInteraction = `pointer:${Number(event.pointerId)}`;
+      if(dashboardTouchRenderFlushTimer){
+        window.clearTimeout(dashboardTouchRenderFlushTimer);
+        dashboardTouchRenderFlushTimer = null;
+      }
+    }
+
+    function endDashboardPointerInteraction(event){
+      if(dashboardTouchInteraction !== `pointer:${Number(event.pointerId)}`) return;
+      dashboardTouchInteraction = null;
+      if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
+    }
+
+    document.addEventListener('pointerdown', startDashboardPointerInteraction, true);
+    document.addEventListener('pointerup', endDashboardPointerInteraction, true);
+    document.addEventListener('pointercancel', endDashboardPointerInteraction, true);
+    document.addEventListener('touchstart', startDashboardTouchInteraction, true);
+    document.addEventListener('touchend', endDashboardTouchInteraction, true);
+    document.addEventListener('touchcancel', endDashboardTouchInteraction, true);
+
     function isOrderEditableTarget(element){
       return !!(element && ['INPUT','TEXTAREA','SELECT'].includes(element.tagName) && (app.contains(element) || modalRoot.contains(element)));
     }
@@ -38871,6 +38958,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
           ...captureOrderScrollPosition(),
           owner:current
         };
+        if(dashboardTouchRenderDeferred && dashboardTouchInteraction == null){
+          scheduleDashboardTouchRenderFlush();
+        }
       }
       const snapshot = getActiveOrderLifecycleScrollSnapshot();
       if(!snapshot) return;
@@ -39019,6 +39109,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
   function render(){
+      if(dashboardTouchInteraction != null && isDashboardView()){
+        dashboardTouchRenderDeferred = true;
+        return;
+      }
+      dashboardTouchRenderDeferred = false;
+      if(dashboardTouchRenderFlushTimer){
+        window.clearTimeout(dashboardTouchRenderFlushTimer);
+        dashboardTouchRenderFlushTimer = null;
+      }
       if(orderLifecycleRenderQueued){
         orderLifecycleRenderQueued = false;
         orderLifecycleRenderGeneration += 1;
