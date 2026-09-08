@@ -2661,42 +2661,38 @@ service cloud.firestore {
 
     match /{topCollection}/{document=**} {
       allow read: if isSignedIn()
-        && !(topCollection in [
-          'haetsalCombinedApp',
-          'haetsalRestoreAuditRuns',
-          'haetsalRestoreAudits',
-          'haetsalUserAccountStatus',
-          'haetsalUserAccountStatusEvents',
-          'haetsalMaterialSupport',
-          'haetsalMaterialSupportSummary',
-          'haetsalMilkSupportRequests',
-          'haetsalCouponRecordNotes',
-          'haetsalOfflineCouponEdits',
-          'haetsalTabletRuntimeDiagnostics'
-        ]);
+        && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalRestoreAuditRuns'
+        && topCollection != 'haetsalRestoreAudits'
+        && topCollection != 'haetsalUserAccountStatus'
+        && topCollection != 'haetsalUserAccountStatusEvents'
+        && topCollection != 'haetsalMaterialSupport'
+        && topCollection != 'haetsalMaterialSupportSummary'
+        && topCollection != 'haetsalMilkSupportRequests'
+        && topCollection != 'haetsalCouponRecordNotes'
+        && topCollection != 'haetsalOfflineCouponEdits'
+        && topCollection != 'haetsalTabletRuntimeDiagnostics';
       allow create, update, delete: if isSignedIn()
-        && !(topCollection in [
-          'haetsalCombinedApp',
-          'haetsalRestoreAuditRuns',
-          'haetsalRestoreAudits',
-          'haetsalCompletedOrders',
-          'haetsalOrderCompletionEvents',
-          'haetsalOrderCompletionRequests',
-          'haetsalOrderSequenceCounters',
-          'haetsalOrderSequenceReservations',
-          'haetsalOrderArchiveMarks',
-          'haetsalOrderDeliveryRecords',
-          'haetsalOrderClosedGuards',
-          'haetsalOrderRevivedGuards',
-          'haetsalUserAccountStatus',
-          'haetsalUserAccountStatusEvents',
-          'haetsalMaterialSupport',
-          'haetsalMaterialSupportSummary',
-          'haetsalMilkSupportRequests',
-          'haetsalCouponRecordNotes',
-          'haetsalOfflineCouponEdits',
-          'haetsalTabletRuntimeDiagnostics'
-        ]);
+        && topCollection != 'haetsalCombinedApp'
+        && topCollection != 'haetsalRestoreAuditRuns'
+        && topCollection != 'haetsalRestoreAudits'
+        && topCollection != 'haetsalCompletedOrders'
+        && topCollection != 'haetsalOrderCompletionEvents'
+        && topCollection != 'haetsalOrderCompletionRequests'
+        && topCollection != 'haetsalOrderSequenceCounters'
+        && topCollection != 'haetsalOrderSequenceReservations'
+        && topCollection != 'haetsalOrderArchiveMarks'
+        && topCollection != 'haetsalOrderDeliveryRecords'
+        && topCollection != 'haetsalOrderClosedGuards'
+        && topCollection != 'haetsalOrderRevivedGuards'
+        && topCollection != 'haetsalUserAccountStatus'
+        && topCollection != 'haetsalUserAccountStatusEvents'
+        && topCollection != 'haetsalMaterialSupport'
+        && topCollection != 'haetsalMaterialSupportSummary'
+        && topCollection != 'haetsalMilkSupportRequests'
+        && topCollection != 'haetsalCouponRecordNotes'
+        && topCollection != 'haetsalOfflineCouponEdits'
+        && topCollection != 'haetsalTabletRuntimeDiagnostics';
     }
 
     match /haetsalTabletRuntimeDiagnostics/{sessionId}/events/{eventId} {
