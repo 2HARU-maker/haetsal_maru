@@ -2435,38 +2435,274 @@ service cloud.firestore {
         && after.savedTime >= before.savedTime;
     }
 
+    function isTabletDiagnosticString(value, maxSize) {
+      return value is string
+        && value.size() <= maxSize;
+    }
+
+    function isTabletDiagnosticInt(value, maxValue) {
+      return value is int
+        && value >= 0
+        && value <= maxValue;
+    }
+
+    function isTabletDiagnosticNumber(value, maxValue) {
+      return value is number
+        && value >= 0
+        && value <= maxValue;
+    }
+
+    function validTabletDiagnosticSessionStartPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly([
+          'viewportWidth','viewportHeight','dpr','maxTouchPoints','deviceMemory','hardwareConcurrency',
+          'uaFamily','platform','online','visibility','effectiveType','rtt','downlink',
+          'usedJSHeapSize','jsHeapSizeLimit'
+        ])
+        && payload.keys().hasAll([
+          'viewportWidth','viewportHeight','dpr','maxTouchPoints','deviceMemory','hardwareConcurrency',
+          'uaFamily','platform','online','visibility','effectiveType','rtt','downlink',
+          'usedJSHeapSize','jsHeapSizeLimit'
+        ])
+        && isTabletDiagnosticInt(payload.viewportWidth, 20000)
+        && isTabletDiagnosticInt(payload.viewportHeight, 20000)
+        && isTabletDiagnosticNumber(payload.dpr, 20)
+        && isTabletDiagnosticInt(payload.maxTouchPoints, 100)
+        && isTabletDiagnosticNumber(payload.deviceMemory, 1024)
+        && isTabletDiagnosticInt(payload.hardwareConcurrency, 1024)
+        && isTabletDiagnosticString(payload.uaFamily, 24)
+        && isTabletDiagnosticString(payload.platform, 40)
+        && payload.online is bool
+        && isTabletDiagnosticString(payload.visibility, 16)
+        && isTabletDiagnosticString(payload.effectiveType, 16)
+        && isTabletDiagnosticInt(payload.rtt, 600000)
+        && isTabletDiagnosticNumber(payload.downlink, 100000)
+        && isTabletDiagnosticInt(payload.usedJSHeapSize, 9007199254740991)
+        && isTabletDiagnosticInt(payload.jsHeapSizeLimit, 9007199254740991);
+    }
+
+    function validTabletDiagnosticPreviousUncleanPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['previousHeartbeatAgeMs','previousSessionAgeMs'])
+        && payload.keys().hasAll(['previousHeartbeatAgeMs','previousSessionAgeMs'])
+        && isTabletDiagnosticInt(payload.previousHeartbeatAgeMs, 9007199254740991)
+        && isTabletDiagnosticInt(payload.previousSessionAgeMs, 9007199254740991);
+    }
+
+    function validTabletDiagnosticRealtimeStatePayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['scope','state','restartCount','errorCode','errorCategory','message'])
+        && payload.keys().hasAll(['scope','state','restartCount','errorCode','errorCategory','message'])
+        && isTabletDiagnosticString(payload.scope, 48)
+        && isTabletDiagnosticString(payload.state, 32)
+        && isTabletDiagnosticInt(payload.restartCount, 1000)
+        && isTabletDiagnosticString(payload.errorCode, 48)
+        && isTabletDiagnosticString(payload.errorCategory, 24)
+        && isTabletDiagnosticString(payload.message, 160);
+    }
+
+    function validTabletDiagnosticRealtimeSnapshotPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['scope','fromCache','hasPendingWrites','snapshotSize','changedCount','hasServerSnapshot','serverSnapshotAgeMs','matchedCompletionCount'])
+        && payload.keys().hasAll(['scope','fromCache','hasPendingWrites','snapshotSize','changedCount','hasServerSnapshot','serverSnapshotAgeMs','matchedCompletionCount'])
+        && isTabletDiagnosticString(payload.scope, 48)
+        && payload.fromCache is bool
+        && payload.hasPendingWrites is bool
+        && isTabletDiagnosticInt(payload.snapshotSize, 100000)
+        && isTabletDiagnosticInt(payload.changedCount, 100000)
+        && payload.hasServerSnapshot is bool
+        && isTabletDiagnosticInt(payload.serverSnapshotAgeMs, 9007199254740991)
+        && isTabletDiagnosticInt(payload.matchedCompletionCount, 10000);
+    }
+
+    function validTabletDiagnosticCompletionPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['action','phase','orderToken','result','busyCount','queueCount','remoteSnapshotSeen'])
+        && payload.keys().hasAll(['action','phase','orderToken','result','busyCount','queueCount','remoteSnapshotSeen'])
+        && isTabletDiagnosticString(payload.action, 48)
+        && isTabletDiagnosticString(payload.phase, 48)
+        && payload.orderToken is string
+        && payload.orderToken.matches('o[0-9]+')
+        && payload.orderToken.size() <= 16
+        && isTabletDiagnosticString(payload.result, 48)
+        && isTabletDiagnosticInt(payload.busyCount, 10000)
+        && isTabletDiagnosticInt(payload.queueCount, 10000)
+        && payload.remoteSnapshotSeen is bool;
+    }
+
+    function validTabletDiagnosticHeartbeatPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly([
+          'openOrderCount','hasServerSnapshot','serverSnapshotAgeMs','renderRequestCount','renderStartCount',
+          'renderCompletedCount','renderDeferredCount','deferredFlushCount','lastRenderDurationMs','maxRenderDurationMs',
+          'touchActive','touchDeferred','lifecycleQueued','lifecycleGeneration','completionBusyCount','completionQueueCount',
+          'stageQueueCount','online','visibility','effectiveType','rtt','downlink','usedJSHeapSize','jsHeapSizeLimit',
+          'diagnosticQueueCount','diagnosticDroppedCount','diagnosticSentCount','diagnosticFailedCount'
+        ])
+        && payload.keys().hasAll([
+          'openOrderCount','hasServerSnapshot','serverSnapshotAgeMs','renderRequestCount','renderStartCount',
+          'renderCompletedCount','renderDeferredCount','deferredFlushCount','lastRenderDurationMs','maxRenderDurationMs',
+          'touchActive','touchDeferred','lifecycleQueued','lifecycleGeneration','completionBusyCount','completionQueueCount',
+          'stageQueueCount','online','visibility','effectiveType','rtt','downlink','usedJSHeapSize','jsHeapSizeLimit',
+          'diagnosticQueueCount','diagnosticDroppedCount','diagnosticSentCount','diagnosticFailedCount'
+        ])
+        && isTabletDiagnosticInt(payload.openOrderCount, 100000)
+        && payload.hasServerSnapshot is bool
+        && isTabletDiagnosticInt(payload.serverSnapshotAgeMs, 9007199254740991)
+        && isTabletDiagnosticInt(payload.renderRequestCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.renderStartCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.renderCompletedCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.renderDeferredCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.deferredFlushCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.lastRenderDurationMs, 600000)
+        && isTabletDiagnosticInt(payload.maxRenderDurationMs, 600000)
+        && payload.touchActive is bool
+        && payload.touchDeferred is bool
+        && payload.lifecycleQueued is bool
+        && isTabletDiagnosticInt(payload.lifecycleGeneration, 9007199254740991)
+        && isTabletDiagnosticInt(payload.completionBusyCount, 10000)
+        && isTabletDiagnosticInt(payload.completionQueueCount, 10000)
+        && isTabletDiagnosticInt(payload.stageQueueCount, 10000)
+        && payload.online is bool
+        && isTabletDiagnosticString(payload.visibility, 16)
+        && isTabletDiagnosticString(payload.effectiveType, 16)
+        && isTabletDiagnosticInt(payload.rtt, 600000)
+        && isTabletDiagnosticNumber(payload.downlink, 100000)
+        && isTabletDiagnosticInt(payload.usedJSHeapSize, 9007199254740991)
+        && isTabletDiagnosticInt(payload.jsHeapSizeLimit, 9007199254740991)
+        && isTabletDiagnosticInt(payload.diagnosticQueueCount, 25)
+        && isTabletDiagnosticInt(payload.diagnosticDroppedCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.diagnosticSentCount, 9007199254740991)
+        && isTabletDiagnosticInt(payload.diagnosticFailedCount, 9007199254740991);
+    }
+
+    function validTabletDiagnosticErrorPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['source','errorName','errorCode','errorCategory','message'])
+        && payload.keys().hasAll(['source','errorName','errorCode','errorCategory','message'])
+        && isTabletDiagnosticString(payload.source, 32)
+        && isTabletDiagnosticString(payload.errorName, 48)
+        && isTabletDiagnosticString(payload.errorCode, 48)
+        && isTabletDiagnosticString(payload.errorCategory, 24)
+        && isTabletDiagnosticString(payload.message, 160);
+    }
+
+    function validTabletDiagnosticSessionEndPayload(payload) {
+      return payload is map
+        && payload.keys().hasOnly(['reason','lastHeartbeatAgeMs'])
+        && payload.keys().hasAll(['reason','lastHeartbeatAgeMs'])
+        && isTabletDiagnosticString(payload.reason, 32)
+        && isTabletDiagnosticInt(payload.lastHeartbeatAgeMs, 9007199254740991);
+    }
+
+    function validTabletDiagnosticPayload(type, payload) {
+      return type == 'session_start'
+        ? validTabletDiagnosticSessionStartPayload(payload)
+        : type == 'previous_session_unclean'
+          ? validTabletDiagnosticPreviousUncleanPayload(payload)
+          : (type == 'realtime_subscribe_start' || type == 'realtime_state')
+            ? validTabletDiagnosticRealtimeStatePayload(payload)
+            : type == 'realtime_snapshot'
+              ? validTabletDiagnosticRealtimeSnapshotPayload(payload)
+              : type == 'completion_trace'
+                ? validTabletDiagnosticCompletionPayload(payload)
+                : type == 'heartbeat'
+                  ? validTabletDiagnosticHeartbeatPayload(payload)
+                  : type == 'runtime_error'
+                    ? validTabletDiagnosticErrorPayload(payload)
+                    : type == 'session_end'
+                      ? validTabletDiagnosticSessionEndPayload(payload)
+                      : false;
+    }
+
+    function validTabletDiagnosticCategory(type, category) {
+      return (type == 'session_start' && category == 'session')
+        || (type == 'previous_session_unclean' && category == 'session')
+        || (type == 'realtime_subscribe_start' && category == 'realtime')
+        || (type == 'realtime_state' && category == 'realtime')
+        || (type == 'realtime_snapshot' && category == 'realtime')
+        || (type == 'completion_trace' && category == 'completion')
+        || (type == 'heartbeat' && category == 'heartbeat')
+        || (type == 'runtime_error' && category == 'error')
+        || (type == 'session_end' && category == 'session');
+    }
+
+    function validTabletRuntimeDiagnosticCreate(sessionId, eventId) {
+      let data = request.resource.data;
+      return isManager()
+        && data is map
+        && data.keys().hasOnly([
+          'schemaVersion','sessionId','eventId','type','category','clientAt','clientTimeMs',
+          'role','view','buildLabel','buildNumber','payload','serverCreatedAt'
+        ])
+        && data.schemaVersion == 1
+        && data.sessionId == sessionId
+        && data.eventId == eventId
+        && data.sessionId is string
+        && data.sessionId.size() >= 12
+        && data.sessionId.size() <= 64
+        && data.sessionId.matches('[A-Za-z0-9_-]+')
+        && data.eventId is string
+        && data.eventId.size() >= 8
+        && data.eventId.size() <= 64
+        && data.eventId.matches('[A-Za-z0-9_-]+')
+        && isTabletDiagnosticString(data.type, 40)
+        && isTabletDiagnosticString(data.category, 16)
+        && isTabletDiagnosticString(data.clientAt, 40)
+        && isTabletDiagnosticInt(data.clientTimeMs, 9007199254740991)
+        && ((data.role == 'ADMIN' && data.view == 'ADMIN_DASHBOARD')
+          || (data.role == 'MANAGER' && data.view == 'MANAGER_DASHBOARD'))
+        && isTabletDiagnosticString(data.buildLabel, 48)
+        && isTabletDiagnosticInt(data.buildNumber, 9007199254740991)
+        && data.serverCreatedAt == request.time
+        && validTabletDiagnosticCategory(data.type, data.category)
+        && validTabletDiagnosticPayload(data.type, data.payload);
+    }
+
     match /{topCollection}/{document=**} {
       allow read: if isSignedIn()
-        && topCollection != 'haetsalCombinedApp'
-        && topCollection != 'haetsalRestoreAuditRuns'
-        && topCollection != 'haetsalRestoreAudits'
-        && topCollection != 'haetsalUserAccountStatus'
-        && topCollection != 'haetsalUserAccountStatusEvents'
-        && topCollection != 'haetsalMaterialSupport'
-        && topCollection != 'haetsalMaterialSupportSummary'
-        && topCollection != 'haetsalMilkSupportRequests'
-        && topCollection != 'haetsalCouponRecordNotes'
-        && topCollection != 'haetsalOfflineCouponEdits';
+        && !(topCollection in [
+          'haetsalCombinedApp',
+          'haetsalRestoreAuditRuns',
+          'haetsalRestoreAudits',
+          'haetsalUserAccountStatus',
+          'haetsalUserAccountStatusEvents',
+          'haetsalMaterialSupport',
+          'haetsalMaterialSupportSummary',
+          'haetsalMilkSupportRequests',
+          'haetsalCouponRecordNotes',
+          'haetsalOfflineCouponEdits',
+          'haetsalTabletRuntimeDiagnostics'
+        ]);
       allow create, update, delete: if isSignedIn()
-        && topCollection != 'haetsalCombinedApp'
-        && topCollection != 'haetsalRestoreAuditRuns'
-        && topCollection != 'haetsalRestoreAudits'
-        && topCollection != 'haetsalCompletedOrders'
-        && topCollection != 'haetsalOrderCompletionEvents'
-        && topCollection != 'haetsalOrderCompletionRequests'
-        && topCollection != 'haetsalOrderSequenceCounters'
-        && topCollection != 'haetsalOrderSequenceReservations'
-        && topCollection != 'haetsalOrderArchiveMarks'
-        && topCollection != 'haetsalOrderDeliveryRecords'
-        && topCollection != 'haetsalOrderClosedGuards'
-        && topCollection != 'haetsalOrderRevivedGuards'
-        && topCollection != 'haetsalUserAccountStatus'
-        && topCollection != 'haetsalUserAccountStatusEvents'
-        && topCollection != 'haetsalMaterialSupport'
-        && topCollection != 'haetsalMaterialSupportSummary'
-        && topCollection != 'haetsalMilkSupportRequests'
-        && topCollection != 'haetsalCouponRecordNotes'
-        && topCollection != 'haetsalOfflineCouponEdits';
+        && !(topCollection in [
+          'haetsalCombinedApp',
+          'haetsalRestoreAuditRuns',
+          'haetsalRestoreAudits',
+          'haetsalCompletedOrders',
+          'haetsalOrderCompletionEvents',
+          'haetsalOrderCompletionRequests',
+          'haetsalOrderSequenceCounters',
+          'haetsalOrderSequenceReservations',
+          'haetsalOrderArchiveMarks',
+          'haetsalOrderDeliveryRecords',
+          'haetsalOrderClosedGuards',
+          'haetsalOrderRevivedGuards',
+          'haetsalUserAccountStatus',
+          'haetsalUserAccountStatusEvents',
+          'haetsalMaterialSupport',
+          'haetsalMaterialSupportSummary',
+          'haetsalMilkSupportRequests',
+          'haetsalCouponRecordNotes',
+          'haetsalOfflineCouponEdits',
+          'haetsalTabletRuntimeDiagnostics'
+        ]);
+    }
+
+    match /haetsalTabletRuntimeDiagnostics/{sessionId}/events/{eventId} {
+      allow get, list: if isAdmin();
+      allow create: if validTabletRuntimeDiagnosticCreate(sessionId, eventId);
+      allow update, delete: if false;
     }
 
     match /haetsalOfflineCouponEdits/{docId} {

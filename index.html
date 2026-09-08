@@ -13006,6 +13006,13 @@ window.HaetsalSharedStore = (function(){
     let orderAppUiReady = false;
     const revivedOrderRefundCorrectionInFlightByOrder = new Set();
 
+    function observeTabletRuntime(method, detail){
+      try{
+        const diagnostics = window.HaetsalTabletRuntimeDiagnostics;
+        if(diagnostics && typeof diagnostics[method] === 'function') diagnostics[method](detail || {});
+      }catch(error){}
+    }
+
     function isFirestoreQuotaExceededError(error){
       const code = String((error && (error.code || error.name)) || '').toLowerCase();
       const status = Number(error && (error.status || error.statusCode));
@@ -31721,6 +31728,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }else{
           window.localStorage.removeItem(ORDER_COMPLETION_REQUEST_QUEUE_LOCAL_KEY);
         }
+        observeTabletRuntime('observeCompletionQueue', { kind:'completion', count:limited.length });
         return limited;
       }catch(error){
         console.warn('completion request queue write failed', error);
@@ -32896,6 +32904,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }else{
           window.localStorage.removeItem(ORDER_STAGE_TRANSITION_QUEUE_LOCAL_KEY);
         }
+        observeTabletRuntime('observeCompletionQueue', { kind:'stage', count:limited.length });
         return limited;
       }catch(error){
         console.warn('order stage transition queue write failed', error);
@@ -33007,6 +33016,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const id = String(orderId || '').trim();
       if(!id || productionCompletionInteractionBusyOrderIds.has(id)) return false;
       productionCompletionInteractionBusyOrderIds.add(id);
+      observeTabletRuntime('observeCompletion', {
+        action:'completion-busy',
+        phase:'busy-set',
+        orderId:id,
+        result:'busy',
+        busyCount:productionCompletionInteractionBusyOrderIds.size
+      });
       requestOrderLifecycleRender();
       return true;
     }
@@ -33014,6 +33030,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function endProductionCompletionInteraction(orderId){
       const id = String(orderId || '').trim();
       if(!id || !productionCompletionInteractionBusyOrderIds.delete(id)) return false;
+      observeTabletRuntime('observeCompletion', {
+        action:'completion-busy',
+        phase:'busy-clear',
+        orderId:id,
+        result:'idle',
+        busyCount:productionCompletionInteractionBusyOrderIds.size
+      });
       requestOrderLifecycleRender();
       return true;
     }
@@ -33022,8 +33045,27 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      const diagnosticAction = String(opts.diagnosticAction || '');
+      if(diagnosticAction){
+        observeTabletRuntime('observeCompletion', {
+          action:diagnosticAction,
+          phase:'handler-entry',
+          orderId:order.id,
+          result:'entered',
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
+      }
       const trackProductionCompletionBusy = opts.immediateProductionCompletionFeedback === true;
       if(trackProductionCompletionBusy && isProductionCompletionInteractionBusy(order.id)){
+        if(diagnosticAction){
+          observeTabletRuntime('observeCompletion', {
+            action:diagnosticAction,
+            phase:'busy-skip',
+            orderId:order.id,
+            result:'pending',
+            busyCount:productionCompletionInteractionBusyOrderIds.size
+          });
+        }
         return { status:'pending', skipped:true, reason:'production-completion-interaction-busy' };
       }
       const safeTargetStage = normalizeOrderWorkStage(targetStage);
@@ -33050,6 +33092,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
       };
       try{
         enqueueOrderStageTransitionRequest(lifecycleBase, { status:'retrying', lastAttemptAt:new Date().toISOString(), lastError:'' });
+        if(diagnosticAction){
+          observeTabletRuntime('observeCompletion', {
+            action:diagnosticAction,
+            phase:'stage-update-start',
+            orderId:order.id,
+            result:'started',
+            busyCount:productionCompletionInteractionBusyOrderIds.size
+          });
+        }
         const result = await window.HaetsalLiveOrderDocs.updateStage({
           orderId:lifecycleBase.orderId,
           targetStage:safeTargetStage,
@@ -33060,6 +33111,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
           order:safeJsonClone(order)
         });
         const resultStatus = String((result && result.status) || '');
+        if(diagnosticAction){
+          observeTabletRuntime('observeCompletion', {
+            action:diagnosticAction,
+            phase:'stage-update-result',
+            orderId:order.id,
+            result:resultStatus || (result && result.ok ? 'ok' : 'unknown'),
+            busyCount:productionCompletionInteractionBusyOrderIds.size
+          });
+        }
         if(result && result.order){
           applyOrderStageTransactionToState(result.order, resultStatus || 'order-stage-transaction');
         }
@@ -33084,6 +33144,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         showMessage(`${actionLabel || '단계 변경'} 처리를 완료하지 못했습니다. 주문 상태를 확인해주세요.`);
       }catch(error){
+        if(diagnosticAction){
+          observeTabletRuntime('observeCompletion', {
+            action:diagnosticAction,
+            phase:'stage-update-failure',
+            orderId:order.id,
+            result:String((error && (error.code || error.name)) || 'error'),
+            busyCount:productionCompletionInteractionBusyOrderIds.size
+          });
+        }
         console.error('order stage transaction failed', error);
         await saveOrderLifecycleAttemptSafely({
           ...lifecycleBase,
@@ -33106,7 +33175,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function handleDeliveryProductionCompleteOrder(orderId){
       return handleOrderStageTransition(orderId, 'DELIVERY_WAITING', '', '제작완료', {
         productionCompleted:true,
-        immediateProductionCompletionFeedback:true
+        immediateProductionCompletionFeedback:true,
+        diagnosticAction:'delivery-production-complete-order'
       });
     }
 
@@ -33145,14 +33215,42 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      observeTabletRuntime('observeCompletion', {
+        action:'complete-order',
+        phase:'handler-entry',
+        orderId:order.id,
+        result:'entered',
+        busyCount:productionCompletionInteractionBusyOrderIds.size
+      });
       const trackProductionCompletionBusy = opts.forceFinal !== true;
       if(trackProductionCompletionBusy && isProductionCompletionInteractionBusy(order.id)){
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'busy-skip',
+          orderId:order.id,
+          result:'pending',
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
         return { status:'pending', skipped:true, reason:'production-completion-interaction-busy' };
       }
       beginOrderLifecycleScrollPreservation(`order-complete:${String(orderId || '')}`);
       if(trackProductionCompletionBusy) beginProductionCompletionInteraction(order.id);
       try{
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'cloud-hydration-start',
+          orderId:order.id,
+          result:'started',
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
         const hydratedCompletionRequest = await hydrateCompletionRequestForOrderFromCloud(order);
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'cloud-hydration-result',
+          orderId:order.id,
+          result:String((hydratedCompletionRequest && hydratedCompletionRequest.cloudStatus) || 'none'),
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
         if(hydratedCompletionRequest && hydratedCompletionRequest.cloudStatus === 'COMPLETED'){
           const verified = hydratedCompletionRequest.request ? await verifyCompletionRequestServerState(hydratedCompletionRequest.request) : null;
           if(verified && verified.confirmed === true){
@@ -33165,6 +33263,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         const request = (hydratedCompletionRequest && hydratedCompletionRequest.request) || enqueueCompletionRequest(order);
         if(!request){
+          observeTabletRuntime('observeCompletion', {
+            action:'complete-order',
+            phase:'request-create-failure',
+            orderId:order.id,
+            result:'needs-check',
+            busyCount:productionCompletionInteractionBusyOrderIds.size
+          });
           clearOrderLifecycleScrollPreservation();
           showMessage('주문 상태 확인 필요: 완료 요청을 만들 수 없습니다.');
           return;
@@ -33180,7 +33285,21 @@ body.mobile-tablet-device .pos-keyboard-btn{
         }
         markCompletionRequestOnLocalOrder(order.id, 'pending', '동기화 대기 중');
         requestOrderLifecycleRender();
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'transaction-start',
+          orderId:order.id,
+          result:'started',
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
         const result = await processCompletionRequestQueueItem(request, { silent:false });
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'transaction-result',
+          orderId:order.id,
+          result:String((result && result.status) || (result && result.ok ? 'ok' : 'unknown')),
+          busyCount:productionCompletionInteractionBusyOrderIds.size
+        });
         if(result && (result.status === 'pending' || result.status === 'retrying')){
           showMessage('네트워크 연결 후 제작완료 반영을 다시 확인합니다.');
         }else if(result && result.needsCheck){
@@ -38822,6 +38941,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
         dashboardTouchRenderFlushTimer = null;
         if(dashboardTouchInteraction || !dashboardTouchRenderDeferred) return;
         dashboardTouchRenderDeferred = false;
+        observeTabletRuntime('observeTouchState', {
+          phase:'deferred-flush',
+          active:false,
+          deferred:false,
+          lifecycleQueued:orderLifecycleRenderQueued,
+          lifecycleGeneration:orderLifecycleRenderGeneration
+        });
         render();
       }, 120);
     }
@@ -38831,6 +38957,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const dashboardBody = getDashboardScrollContainer();
       if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
       dashboardTouchInteraction = `touch:${Number(event.touches[0].identifier)}`;
+      observeTabletRuntime('observeTouchState', {
+        phase:'touch-start',
+        active:true,
+        deferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
       if(dashboardTouchRenderFlushTimer){
         window.clearTimeout(dashboardTouchRenderFlushTimer);
         dashboardTouchRenderFlushTimer = null;
@@ -38843,6 +38976,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const ended = Array.from(changedTouches).some(touch => `touch:${Number(touch.identifier)}` === dashboardTouchInteraction);
       if(!ended && event.type !== 'touchcancel') return;
       dashboardTouchInteraction = null;
+      observeTabletRuntime('observeTouchState', {
+        phase:'touch-end',
+        active:false,
+        deferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
       if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
     }
 
@@ -38851,6 +38991,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const dashboardBody = getDashboardScrollContainer();
       if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
       if(dashboardTouchInteraction == null) dashboardTouchInteraction = `pointer:${Number(event.pointerId)}`;
+      observeTabletRuntime('observeTouchState', {
+        phase:'pointer-start',
+        active:true,
+        deferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
       if(dashboardTouchRenderFlushTimer){
         window.clearTimeout(dashboardTouchRenderFlushTimer);
         dashboardTouchRenderFlushTimer = null;
@@ -38860,6 +39007,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function endDashboardPointerInteraction(event){
       if(dashboardTouchInteraction !== `pointer:${Number(event.pointerId)}`) return;
       dashboardTouchInteraction = null;
+      observeTabletRuntime('observeTouchState', {
+        phase:'pointer-end',
+        active:false,
+        deferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
       if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
     }
 
@@ -38937,12 +39091,22 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function requestOrderLifecycleRender(){
       if(!getActiveOrderLifecycleScrollSnapshot()){
+        observeTabletRuntime('observeRenderState', {
+          phase:'lifecycle-direct',
+          lifecycleQueued:orderLifecycleRenderQueued,
+          lifecycleGeneration:orderLifecycleRenderGeneration
+        });
         render();
         return;
       }
       if(orderLifecycleRenderQueued) return;
       orderLifecycleRenderQueued = true;
       const generation = ++orderLifecycleRenderGeneration;
+      observeTabletRuntime('observeRenderState', {
+        phase:'lifecycle-queued',
+        lifecycleQueued:true,
+        lifecycleGeneration:generation
+      });
       requestAnimationFrame(() => {
         if(!orderLifecycleRenderQueued || generation !== orderLifecycleRenderGeneration) return;
         orderLifecycleRenderQueued = false;
@@ -39111,8 +39275,23 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
   function render(){
+      const tabletRuntimeRenderStartedAt = window.performance && typeof window.performance.now === 'function'
+        ? window.performance.now()
+        : Date.now();
+      observeTabletRuntime('observeRenderRequest', {
+        touchActive:dashboardTouchInteraction != null,
+        touchDeferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
       if(dashboardTouchInteraction != null && isDashboardView()){
         dashboardTouchRenderDeferred = true;
+        observeTabletRuntime('observeRenderDeferred', {
+          touchActive:true,
+          touchDeferred:true,
+          lifecycleQueued:orderLifecycleRenderQueued,
+          lifecycleGeneration:orderLifecycleRenderGeneration
+        });
         return;
       }
       dashboardTouchRenderDeferred = false;
@@ -39158,6 +39337,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(window.HaetsalRealtimeScope && typeof window.HaetsalRealtimeScope.sync === 'function'){
         window.HaetsalRealtimeScope.sync();
       }
+      const tabletRuntimeRenderCompletedAt = window.performance && typeof window.performance.now === 'function'
+        ? window.performance.now()
+        : Date.now();
+      observeTabletRuntime('observeRenderCompleted', {
+        durationMs:Math.max(0, tabletRuntimeRenderCompletedAt - tabletRuntimeRenderStartedAt),
+        touchActive:dashboardTouchInteraction != null,
+        touchDeferred:dashboardTouchRenderDeferred,
+        lifecycleQueued:orderLifecycleRenderQueued,
+        lifecycleGeneration:orderLifecycleRenderGeneration
+      });
     }
 
     function networkBar(){
@@ -43964,6 +44153,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function startCompletionPointerGesture(event){
       const btn = getCompletionScrollGuardButton(event.target);
       if(!btn || event.isPrimary === false) return;
+      observeTabletRuntime('observeCompletion', {
+        action:String(btn.dataset.action || ''),
+        phase:'pointer-delegation',
+        orderId:String(btn.dataset.orderId || ''),
+        result:'entered'
+      });
       completionBlockedClick = null;
       const scrollContainer = getCompletionScrollContainer();
       completionScrollGesture = {
@@ -44014,6 +44209,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const btn = getCompletionScrollGuardButton(event.target);
       const touch = event.changedTouches && event.changedTouches[0];
       if(!btn || !touch) return;
+      observeTabletRuntime('observeCompletion', {
+        action:String(btn.dataset.action || ''),
+        phase:'touch-delegation',
+        orderId:String(btn.dataset.orderId || ''),
+        result:'entered'
+      });
       completionBlockedClick = null;
       const scrollContainer = getCompletionScrollContainer();
       completionScrollGesture = {
@@ -45300,12 +45501,24 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         approveCarryoverOrder(btn.dataset.orderId);
       }
       else if(action === 'complete-order'){
+        observeTabletRuntime('observeCompletion', {
+          action:'complete-order',
+          phase:'click-delegation',
+          orderId:String(btn.dataset.orderId || ''),
+          result:'entered'
+        });
         handleCompleteOrder(btn.dataset.orderId);
       }
       else if(action === 'measure-complete-order'){
         handleMeasureCompleteOrder(btn.dataset.orderId);
       }
       else if(action === 'delivery-production-complete-order'){
+        observeTabletRuntime('observeCompletion', {
+          action:'delivery-production-complete-order',
+          phase:'click-delegation',
+          orderId:String(btn.dataset.orderId || ''),
+          result:'entered'
+        });
         handleDeliveryProductionCompleteOrder(btn.dataset.orderId);
       }
       else if(action === 'delivery-record-start'){
@@ -50642,6 +50855,625 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   const revivedOrderGuardCollectionRef = collection(db, 'haetsalOrderRevivedGuards');
   const combinedAppCollectionRef = collection(db, 'haetsalCombinedApp');
   const offlineCouponEditCollectionRef = collection(db, 'haetsalOfflineCouponEdits');
+
+  // TABLET_RUNTIME_DIAGNOSTICS_START
+  const tabletRuntimeDiagnostics = (() => {
+    const COLLECTION_NAME = 'haetsalTabletRuntimeDiagnostics';
+    const MARKER_KEY = 'haetsalmaru_tablet_runtime_diagnostic_session_v1';
+    const SCHEMA_VERSION = 1;
+    const HEARTBEAT_MS = 10000;
+    const SNAPSHOT_COALESCE_MS = 2000;
+    const MAX_QUEUE_SIZE = 24;
+    const MAX_COMPLETION_TRACKED = 64;
+    const COMPLETION_TRACK_MS = 5 * 60 * 1000;
+    const queue = [];
+    const pendingSnapshots = new Map();
+    const snapshotTimers = new Map();
+    const lastRealtimeState = new Map();
+    const orderTokens = new Map();
+    const completionByToken = new Map();
+    const busyTokens = new Set();
+    const renderMetrics = {
+      requestCount:0,
+      startCount:0,
+      completedCount:0,
+      deferredCount:0,
+      deferredFlushCount:0,
+      lastDurationMs:0,
+      maxDurationMs:0,
+      touchActive:false,
+      touchDeferred:false,
+      lifecycleQueued:false,
+      lifecycleGeneration:0
+    };
+    const queueMetrics = {
+      completionCount:0,
+      stageCount:0,
+      droppedCount:0,
+      sentCount:0,
+      failedCount:0
+    };
+    const viewportMin = Math.min(
+      Math.max(0, Number(window.innerWidth || (window.screen && window.screen.width) || 0)),
+      Math.max(0, Number(window.innerHeight || (window.screen && window.screen.height) || 0))
+    );
+    const touchCapable = Number(navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+    const targetDevice = touchCapable && viewportMin >= 600;
+    const sessionId = makeSafeId('rt');
+    const sessionStartedAt = Date.now();
+    let eventSerial = 0;
+    let orderSerial = 0;
+    let active = false;
+    let sessionStarted = false;
+    let sending = false;
+    let heartbeatTimer = null;
+    let lastHeartbeatAt = 0;
+    let lastServerSnapshotAt = 0;
+    let previousUnclean = null;
+
+    function clampInteger(value, minimum=0, maximum=Number.MAX_SAFE_INTEGER){
+      const numeric = Math.round(Number(value || 0));
+      if(!Number.isFinite(numeric)) return minimum;
+      return Math.min(maximum, Math.max(minimum, numeric));
+    }
+
+    function clampNumber(value, minimum=0, maximum=1000000){
+      const numeric = Number(value || 0);
+      if(!Number.isFinite(numeric)) return minimum;
+      return Math.min(maximum, Math.max(minimum, numeric));
+    }
+
+    function safeText(value, limit){
+      return String(value == null ? '' : value)
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .trim()
+        .slice(0, Math.max(0, Number(limit || 0)));
+    }
+
+    function sanitizeErrorMessage(value){
+      return safeText(value, 600)
+        .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+        .replace(/\b[A-Za-z0-9_-]{20,}\b/g, '[token]')
+        .replace(/\d{4,}/g, '#')
+        .slice(0, 160);
+    }
+
+    function makeSafeId(prefix){
+      let randomPart = '';
+      try{
+        if(window.crypto && typeof window.crypto.getRandomValues === 'function'){
+          const values = new Uint32Array(2);
+          window.crypto.getRandomValues(values);
+          randomPart = Array.from(values).map(value => value.toString(36)).join('');
+        }
+      }catch(error){}
+      if(!randomPart) randomPart = Math.random().toString(36).slice(2, 14);
+      return `${prefix}_${Date.now().toString(36)}_${randomPart}`.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+    }
+
+    function getContext(){
+      const state = window.OrderModule && window.OrderModule.state ? window.OrderModule.state : null;
+      return {
+        role:safeText(state && state.appRole, 16) || 'GUEST',
+        view:safeText(state && state.currentView, 32) || 'ORDER_MAIN'
+      };
+    }
+
+    function isVerifiedDashboardContext(context){
+      const currentUser = auth.currentUser;
+      return !!(targetDevice
+        && currentUser
+        && !currentUser.isAnonymous
+        && verifiedManagerUid
+        && verifiedManagerUid === String(currentUser.uid || '')
+        && (context.role === 'ADMIN' || context.role === 'MANAGER')
+        && ((context.role === 'ADMIN' && context.view === 'ADMIN_DASHBOARD')
+          || (context.role === 'MANAGER' && context.view === 'MANAGER_DASHBOARD')));
+    }
+
+    function getBuild(){
+      const guard = window.HaetsalRuntimeGuard || {};
+      return {
+        label:safeText(guard.APP_BUILD_LABEL || 'unknown', 48),
+        number:clampInteger(guard.APP_BUILD_NUMBER, 0)
+      };
+    }
+
+    function getUaFamily(){
+      const ua = String(navigator.userAgent || '');
+      if(/Edg\//.test(ua)) return 'Edge';
+      if(/CriOS\//.test(ua)) return 'Chrome-iOS';
+      if(/Chrome\//.test(ua) && /; wv\)/.test(ua)) return 'Android-WebView';
+      if(/Chrome\//.test(ua)) return 'Chrome';
+      if(/Firefox\//.test(ua)) return 'Firefox';
+      if(/Safari\//.test(ua) && /Version\//.test(ua)) return 'Safari';
+      return 'Other';
+    }
+
+    function getNetworkInfo(){
+      const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+      return {
+        online:navigator.onLine !== false,
+        visibility:safeText(document.visibilityState || (document.hidden ? 'hidden' : 'visible'), 16),
+        effectiveType:safeText(connection && connection.effectiveType, 16),
+        rtt:clampInteger(connection && connection.rtt, 0, 600000),
+        downlink:clampNumber(connection && connection.downlink, 0, 100000)
+      };
+    }
+
+    function getMemoryInfo(){
+      const memory = window.performance && window.performance.memory ? window.performance.memory : null;
+      return {
+        usedJSHeapSize:clampInteger(memory && memory.usedJSHeapSize, 0),
+        jsHeapSizeLimit:clampInteger(memory && memory.jsHeapSizeLimit, 0)
+      };
+    }
+
+    function getDevicePayload(){
+      const connection = getNetworkInfo();
+      const memory = getMemoryInfo();
+      const userAgentData = navigator.userAgentData || null;
+      return {
+        viewportWidth:clampInteger(window.innerWidth || 0, 0, 20000),
+        viewportHeight:clampInteger(window.innerHeight || 0, 0, 20000),
+        dpr:clampNumber(window.devicePixelRatio || 1, 0, 20),
+        maxTouchPoints:clampInteger(navigator.maxTouchPoints || 0, 0, 100),
+        deviceMemory:clampNumber(navigator.deviceMemory || 0, 0, 1024),
+        hardwareConcurrency:clampInteger(navigator.hardwareConcurrency || 0, 0, 1024),
+        uaFamily:getUaFamily(),
+        platform:safeText((userAgentData && userAgentData.platform) || navigator.platform || '', 40),
+        ...connection,
+        ...memory
+      };
+    }
+
+    function classifyError(error){
+      const code = safeText(error && (error.code || error.name), 48).toLowerCase();
+      const message = String((error && error.message) || error || '').toLowerCase();
+      if(code.includes('permission-denied') || message.includes('permission-denied')) return 'permission';
+      if(code.includes('resource-exhausted') || message.includes('quota')) return 'quota';
+      if(code.includes('unavailable') || message.includes('network') || message.includes('offline')) return 'network';
+      if(code.includes('failed-precondition')) return 'precondition';
+      return 'runtime';
+    }
+
+    function sanitizeScope(value){
+      const scope = String(value || 'unknown');
+      if(scope.startsWith('user-live-order:')) return 'user-live-order';
+      if(scope.startsWith('delivery-record:')) return 'delivery-record';
+      return safeText(scope.replace(/[^A-Za-z0-9:_-]/g, '-'), 48);
+    }
+
+    function getOrderToken(orderId){
+      const id = String(orderId || '').trim();
+      if(!id) return 'o0';
+      if(!orderTokens.has(id)) orderTokens.set(id, `o${++orderSerial}`);
+      return orderTokens.get(id);
+    }
+
+    function writeMarker(clean){
+      if(!targetDevice) return false;
+      try{
+        window.localStorage.setItem(MARKER_KEY, JSON.stringify({
+          version:SCHEMA_VERSION,
+          sessionId,
+          clean:clean === true,
+          startedAt:sessionStartedAt,
+          lastHeartbeatAt:lastHeartbeatAt || Date.now()
+        }));
+        return true;
+      }catch(error){
+        return false;
+      }
+    }
+
+    function readPreviousMarker(){
+      if(!targetDevice) return null;
+      try{
+        const raw = window.localStorage.getItem(MARKER_KEY);
+        const marker = raw ? JSON.parse(raw) : null;
+        if(!marker || marker.version !== SCHEMA_VERSION || marker.clean !== false) return null;
+        const now = Date.now();
+        return {
+          previousHeartbeatAgeMs:clampInteger(now - Number(marker.lastHeartbeatAt || marker.startedAt || now), 0),
+          previousSessionAgeMs:clampInteger(now - Number(marker.startedAt || now), 0)
+        };
+      }catch(error){
+        return null;
+      }
+    }
+
+    function eventCategory(type){
+      if(type.startsWith('realtime_')) return 'realtime';
+      if(type === 'completion_trace') return 'completion';
+      if(type === 'heartbeat') return 'heartbeat';
+      if(type === 'runtime_error') return 'error';
+      return 'session';
+    }
+
+    function schedulePump(){
+      Promise.resolve().then(pumpQueue).catch(() => null);
+    }
+
+    function enqueueEvent(type, payload, options){
+      if(!active) return false;
+      const opts = options || {};
+      const context = getContext();
+      const build = getBuild();
+      const eventId = `${Date.now().toString(36)}_${(++eventSerial).toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        coalesceKey:safeText(opts.coalesceKey, 80),
+        critical:opts.critical === true,
+        eventId,
+        data:{
+          schemaVersion:SCHEMA_VERSION,
+          sessionId,
+          eventId,
+          type:safeText(type, 40),
+          category:eventCategory(String(type || '')),
+          clientAt:new Date().toISOString(),
+          clientTimeMs:Date.now(),
+          role:context.role,
+          view:context.view,
+          buildLabel:build.label,
+          buildNumber:build.number,
+          payload,
+          serverCreatedAt:serverTimestamp()
+        }
+      };
+      if(entry.coalesceKey){
+        const index = queue.findIndex(item => item.coalesceKey === entry.coalesceKey);
+        if(index >= 0){
+          queue[index] = entry;
+          schedulePump();
+          return true;
+        }
+      }
+      if(queue.length >= MAX_QUEUE_SIZE){
+        if(!entry.critical){
+          queueMetrics.droppedCount += 1;
+          return false;
+        }
+        const removableIndex = queue.findIndex(item => item.critical !== true);
+        queue.splice(removableIndex >= 0 ? removableIndex : 0, 1);
+        queueMetrics.droppedCount += 1;
+      }
+      queue.push(entry);
+      schedulePump();
+      return true;
+    }
+
+    async function pumpQueue(){
+      if(sending || !queue.length) return;
+      sending = true;
+      try{
+        while(queue.length){
+          const entry = queue.shift();
+          try{
+            const events = collection(db, COLLECTION_NAME, sessionId, 'events');
+            await setDoc(doc(events, entry.eventId), entry.data);
+            queueMetrics.sentCount += 1;
+          }catch(error){
+            queueMetrics.failedCount += 1;
+          }
+        }
+      }finally{
+        sending = false;
+        if(queue.length) schedulePump();
+      }
+    }
+
+    function ensureHeartbeatTimer(){
+      if(heartbeatTimer) return;
+      heartbeatTimer = window.setInterval(flushHeartbeat, HEARTBEAT_MS);
+    }
+
+    function syncContext(){
+      const context = getContext();
+      const shouldActivate = isVerifiedDashboardContext(context);
+      active = shouldActivate;
+      if(!active) return false;
+      if(!sessionStarted){
+        sessionStarted = true;
+        enqueueEvent('session_start', getDevicePayload(), { critical:true });
+        if(previousUnclean){
+          enqueueEvent('previous_session_unclean', previousUnclean, { critical:true });
+          previousUnclean = null;
+        }
+      }
+      ensureHeartbeatTimer();
+      return true;
+    }
+
+    function pruneCompletionTracking(){
+      const cutoff = Date.now() - COMPLETION_TRACK_MS;
+      Array.from(completionByToken.entries()).forEach(([token, entry]) => {
+        if(Number(entry && entry.startedAt || 0) < cutoff){
+          completionByToken.delete(token);
+          busyTokens.delete(token);
+        }
+      });
+      while(completionByToken.size > MAX_COMPLETION_TRACKED){
+        const token = completionByToken.keys().next().value;
+        completionByToken.delete(token);
+        busyTokens.delete(token);
+      }
+    }
+
+    function observeCompletion(detail){
+      if(!syncContext()) return false;
+      const input = detail || {};
+      const token = getOrderToken(input.orderId);
+      const phase = safeText(input.phase || 'state', 48);
+      const action = safeText(input.action || 'completion', 48);
+      const current = completionByToken.get(token) || {
+        orderId:String(input.orderId || ''),
+        action,
+        startedAt:Date.now(),
+        remoteSnapshotSeen:false
+      };
+      if(action && action !== 'completion-busy') current.action = action;
+      if(input.orderId) current.orderId = String(input.orderId);
+      completionByToken.set(token, current);
+      if(phase === 'busy-set') busyTokens.add(token);
+      if(phase === 'busy-clear') busyTokens.delete(token);
+      pruneCompletionTracking();
+      return enqueueEvent('completion_trace', {
+        action,
+        phase,
+        orderToken:token,
+        result:safeText(input.result || 'unknown', 48),
+        busyCount:clampInteger(input.busyCount == null ? busyTokens.size : input.busyCount, 0, 10000),
+        queueCount:clampInteger(queueMetrics.completionCount + queueMetrics.stageCount, 0, 10000),
+        remoteSnapshotSeen:current.remoteSnapshotSeen === true
+      }, { critical:true });
+    }
+
+    function observeCompletionQueue(detail){
+      const input = detail || {};
+      const kind = input.kind === 'stage' ? 'stage' : 'completion';
+      const count = clampInteger(input.count, 0, 10000);
+      const field = kind === 'stage' ? 'stageCount' : 'completionCount';
+      if(queueMetrics[field] === count) return false;
+      queueMetrics[field] = count;
+      return observeCompletion({
+        action:`${kind}-queue`,
+        phase:'queue-state',
+        result:count ? 'queued' : 'empty',
+        busyCount:busyTokens.size
+      });
+    }
+
+    function observeRenderRequest(detail){
+      syncContext();
+      renderMetrics.requestCount += 1;
+      renderMetrics.startCount += 1;
+      observeRenderState(detail);
+      return true;
+    }
+
+    function observeRenderDeferred(detail){
+      renderMetrics.startCount = Math.max(0, renderMetrics.startCount - 1);
+      renderMetrics.deferredCount += 1;
+      renderMetrics.touchDeferred = true;
+      observeRenderState(detail);
+      return true;
+    }
+
+    function observeRenderCompleted(detail){
+      const input = detail || {};
+      const duration = clampInteger(input.durationMs, 0, 600000);
+      renderMetrics.completedCount += 1;
+      renderMetrics.lastDurationMs = duration;
+      renderMetrics.maxDurationMs = Math.max(renderMetrics.maxDurationMs, duration);
+      observeRenderState(input);
+      return true;
+    }
+
+    function observeRenderState(detail){
+      const input = detail || {};
+      if(Object.prototype.hasOwnProperty.call(input, 'touchActive')) renderMetrics.touchActive = input.touchActive === true;
+      if(Object.prototype.hasOwnProperty.call(input, 'touchDeferred')) renderMetrics.touchDeferred = input.touchDeferred === true;
+      if(Object.prototype.hasOwnProperty.call(input, 'lifecycleQueued')) renderMetrics.lifecycleQueued = input.lifecycleQueued === true;
+      if(Object.prototype.hasOwnProperty.call(input, 'lifecycleGeneration')) renderMetrics.lifecycleGeneration = clampInteger(input.lifecycleGeneration, 0);
+      return true;
+    }
+
+    function observeTouchState(detail){
+      const input = detail || {};
+      renderMetrics.touchActive = input.active === true;
+      renderMetrics.touchDeferred = input.deferred === true;
+      if(input.phase === 'deferred-flush') renderMetrics.deferredFlushCount += 1;
+      observeRenderState(input);
+      return true;
+    }
+
+    function observeRealtimeState(detail){
+      if(!syncContext()) return false;
+      const input = detail || {};
+      const scope = sanitizeScope(input.scope);
+      const state = safeText(input.state || 'unknown', 32);
+      if(lastRealtimeState.get(scope) === state && state === 'healthy') return false;
+      lastRealtimeState.set(scope, state);
+      const error = input.error || null;
+      return enqueueEvent(state === 'subscribe-start' || state === 'restarted' ? 'realtime_subscribe_start' : 'realtime_state', {
+        scope,
+        state,
+        restartCount:clampInteger(input.restartCount, 0, 1000),
+        errorCode:safeText(error && (error.code || error.name), 48),
+        errorCategory:error ? classifyError(error) : '',
+        message:error ? sanitizeErrorMessage(error && (error.message || error)) : ''
+      }, { critical:state === 'failed' });
+    }
+
+    function flushPendingSnapshot(scope){
+      snapshotTimers.delete(scope);
+      const snapshot = pendingSnapshots.get(scope);
+      pendingSnapshots.delete(scope);
+      if(!snapshot || !syncContext()) return false;
+      return enqueueEvent('realtime_snapshot', snapshot, { coalesceKey:`snapshot:${scope}` });
+    }
+
+    function observeRealtimeSnapshot(detail){
+      if(!syncContext()) return false;
+      const input = detail || {};
+      const scope = sanitizeScope(input.scope);
+      const serverConfirmed = input.fromCache !== true && input.hasPendingWrites !== true;
+      if(serverConfirmed) lastServerSnapshotAt = Date.now();
+      let matchedCompletionCount = 0;
+      const ids = Array.isArray(input.orderIds) ? input.orderIds : [];
+      ids.forEach(orderId => {
+        const token = orderTokens.get(String(orderId || ''));
+        const tracked = token && completionByToken.get(token);
+        if(!tracked) return;
+        tracked.remoteSnapshotSeen = true;
+        matchedCompletionCount += 1;
+        enqueueEvent('completion_trace', {
+          action:safeText(tracked.action || 'completion', 48),
+          phase:'remote-snapshot',
+          orderToken:token,
+          result:'observed',
+          busyCount:clampInteger(busyTokens.size, 0, 10000),
+          queueCount:clampInteger(queueMetrics.completionCount + queueMetrics.stageCount, 0, 10000),
+          remoteSnapshotSeen:true
+        }, { critical:true });
+      });
+      const previous = pendingSnapshots.get(scope);
+      pendingSnapshots.set(scope, {
+        scope,
+        fromCache:input.fromCache === true,
+        hasPendingWrites:input.hasPendingWrites === true,
+        snapshotSize:clampInteger(input.snapshotSize, 0, 100000),
+        changedCount:clampInteger(Number(input.changedCount || 0) + Number(previous && previous.changedCount || 0), 0, 100000),
+        hasServerSnapshot:lastServerSnapshotAt > 0,
+        serverSnapshotAgeMs:lastServerSnapshotAt ? clampInteger(Date.now() - lastServerSnapshotAt, 0) : 0,
+        matchedCompletionCount:clampInteger(Number(matchedCompletionCount) + Number(previous && previous.matchedCompletionCount || 0), 0, 10000)
+      });
+      if(!snapshotTimers.has(scope)){
+        snapshotTimers.set(scope, window.setTimeout(() => flushPendingSnapshot(scope), SNAPSHOT_COALESCE_MS));
+      }
+      return true;
+    }
+
+    function getOpenOrderCount(){
+      try{
+        if(window.OrderModule && typeof window.OrderModule.getProductionQueueOrderIds === 'function'){
+          return clampInteger(window.OrderModule.getProductionQueueOrderIds().length, 0, 100000);
+        }
+      }catch(error){}
+      return 0;
+    }
+
+    function flushHeartbeat(){
+      if(!syncContext()) return false;
+      const network = getNetworkInfo();
+      const memory = getMemoryInfo();
+      lastHeartbeatAt = Date.now();
+      writeMarker(false);
+      return enqueueEvent('heartbeat', {
+        openOrderCount:getOpenOrderCount(),
+        hasServerSnapshot:lastServerSnapshotAt > 0,
+        serverSnapshotAgeMs:lastServerSnapshotAt ? clampInteger(lastHeartbeatAt - lastServerSnapshotAt, 0) : 0,
+        renderRequestCount:clampInteger(renderMetrics.requestCount, 0),
+        renderStartCount:clampInteger(renderMetrics.startCount, 0),
+        renderCompletedCount:clampInteger(renderMetrics.completedCount, 0),
+        renderDeferredCount:clampInteger(renderMetrics.deferredCount, 0),
+        deferredFlushCount:clampInteger(renderMetrics.deferredFlushCount, 0),
+        lastRenderDurationMs:clampInteger(renderMetrics.lastDurationMs, 0),
+        maxRenderDurationMs:clampInteger(renderMetrics.maxDurationMs, 0),
+        touchActive:renderMetrics.touchActive === true,
+        touchDeferred:renderMetrics.touchDeferred === true,
+        lifecycleQueued:renderMetrics.lifecycleQueued === true,
+        lifecycleGeneration:clampInteger(renderMetrics.lifecycleGeneration, 0),
+        completionBusyCount:clampInteger(busyTokens.size, 0, 10000),
+        completionQueueCount:clampInteger(queueMetrics.completionCount, 0, 10000),
+        stageQueueCount:clampInteger(queueMetrics.stageCount, 0, 10000),
+        online:network.online,
+        visibility:network.visibility,
+        effectiveType:network.effectiveType,
+        rtt:network.rtt,
+        downlink:network.downlink,
+        usedJSHeapSize:memory.usedJSHeapSize,
+        jsHeapSizeLimit:memory.jsHeapSizeLimit,
+        diagnosticQueueCount:clampInteger(queue.length + (sending ? 1 : 0), 0, MAX_QUEUE_SIZE + 1),
+        diagnosticDroppedCount:clampInteger(queueMetrics.droppedCount, 0),
+        diagnosticSentCount:clampInteger(queueMetrics.sentCount, 0),
+        diagnosticFailedCount:clampInteger(queueMetrics.failedCount, 0)
+      }, { coalesceKey:'heartbeat' });
+    }
+
+    function observeError(source, error){
+      if(!syncContext()) return false;
+      return enqueueEvent('runtime_error', {
+        source:safeText(source || 'runtime', 32),
+        errorName:safeText(error && error.name, 48),
+        errorCode:safeText(error && error.code, 48),
+        errorCategory:classifyError(error),
+        message:sanitizeErrorMessage(error && (error.message || error))
+      }, { critical:true });
+    }
+
+    function closeSession(reason){
+      if(active){
+        enqueueEvent('session_end', {
+          reason:safeText(reason || 'pagehide', 32),
+          lastHeartbeatAgeMs:lastHeartbeatAt ? clampInteger(Date.now() - lastHeartbeatAt, 0) : 0
+        }, { critical:true });
+      }
+      writeMarker(true);
+      return true;
+    }
+
+    function getState(){
+      return {
+        targetDevice,
+        active,
+        sessionStarted,
+        sessionId,
+        queueLength:queue.length,
+        sending,
+        maxQueueSize:MAX_QUEUE_SIZE,
+        heartbeatMs:HEARTBEAT_MS,
+        snapshotCoalesceMs:SNAPSHOT_COALESCE_MS,
+        metrics:{ ...renderMetrics, ...queueMetrics }
+      };
+    }
+
+    previousUnclean = readPreviousMarker();
+    writeMarker(false);
+    window.addEventListener('error', event => {
+      observeError('window.error', (event && event.error) || { name:'ErrorEvent', message:event && event.message });
+    });
+    window.addEventListener('unhandledrejection', event => {
+      const reason = event && event.reason;
+      observeError('unhandledrejection', reason instanceof Error ? reason : { name:'UnhandledRejection', message:String(reason || '') });
+    });
+    window.addEventListener('pagehide', () => closeSession('pagehide'));
+    window.addEventListener('pageshow', event => {
+      if(event && event.persisted) writeMarker(false);
+    });
+
+    return {
+      syncContext,
+      observeCompletion,
+      observeCompletionQueue,
+      observeRenderRequest,
+      observeRenderDeferred,
+      observeRenderCompleted,
+      observeRenderState,
+      observeTouchState,
+      observeRealtimeState,
+      observeRealtimeSnapshot,
+      observeError,
+      flushHeartbeat,
+      closeSession,
+      getState
+    };
+  })();
+  window.HaetsalTabletRuntimeDiagnostics = tabletRuntimeDiagnostics;
+  tabletRuntimeDiagnostics.syncContext();
+  // TABLET_RUNTIME_DIAGNOSTICS_END
+
   const liveOrderDocPrefix = 'live_order_';
   const LIVE_OPEN_ORDER_QUERY_LIMIT = 300;
   const liveOrderQueryRef = query(liveOrderCollectionRef, where(documentId(), '>=', liveOrderDocPrefix), where(documentId(), '<', liveOrderDocPrefix + '\uf8ff'));
@@ -59838,6 +60670,17 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             changedLiveOrders.push(payload.data);
             if(!(change.doc.metadata && change.doc.metadata.hasPendingWrites)) remoteLifecycleRows.push(payload.data);
           });
+          tabletRuntimeDiagnostics.observeRealtimeSnapshot({
+            scope:'live-order-query',
+            fromCache:snapshotMetadata.fromCache,
+            hasPendingWrites:snapshotMetadata.hasPendingWrites,
+            snapshotSize:Number(snapshot.size || 0),
+            changedCount:Number(snapshot.docChanges().length || 0),
+            orderIds:changedLiveOrders.map(value => {
+              const row = value && value.order && typeof value.order === 'object' ? value.order : value;
+              return String((row && (row.id || row.orderId)) || '');
+            }).filter(Boolean)
+          });
           if(remoteLifecycleRows.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.prepareRemoteLifecycleScroll === 'function'){
             window.HaetsalOrderLiveQueue.prepareRemoteLifecycleScroll(remoteLifecycleRows, '오늘 주문별 실시간 저장소', {
               ...snapshotMetadata,
@@ -60026,6 +60869,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
       entry.status = 'healthy';
       entry.lastHealthyAt = Date.now();
+      tabletRuntimeDiagnostics.observeRealtimeState({
+        scope:key,
+        state:'healthy',
+        restartCount:Number((scopedRealtimeRetryStates.get(key) || {}).attempt || 0)
+      });
       clearScopedRealtimeRetryState(key);
       return true;
     }
@@ -60101,6 +60949,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const entry = scopedRealtimeSubscriptions.get(key);
       if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
       const label = entry.label;
+      tabletRuntimeDiagnostics.observeRealtimeState({
+        scope:key,
+        state:'failed',
+        restartCount:Number((scopedRealtimeRetryStates.get(key) || {}).attempt || 0),
+        error
+      });
       stopScopedRealtimeSubscription(key, { preserveRetry:true });
       return scheduleScopedRealtimeSubscriptionRetry(key, label, error);
     }
@@ -60114,6 +60968,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         retryState.ready = false;
         scopedRealtimeRetryStates.set(key, retryState);
       }
+      tabletRuntimeDiagnostics.observeRealtimeState({
+        scope:key,
+        state:retryState ? 'restarted' : 'subscribe-start',
+        restartCount:Number((retryState && retryState.attempt) || 0)
+      });
       const entry = {
         key,
         label,
@@ -60171,6 +61030,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         if(!preserveRetry) clearScopedRealtimeRetryState(key);
         return false;
       }
+      tabletRuntimeDiagnostics.observeRealtimeState({
+        scope:key,
+        state:preserveRetry ? 'stopped-for-retry' : 'stopped',
+        restartCount:Number((scopedRealtimeRetryStates.get(key) || {}).attempt || 0)
+      });
       entry.preserveRetry = preserveRetry;
       if(typeof entry.release === 'function') entry.release();
       else{
@@ -60285,6 +61149,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         return false;
       }
       const scope = getRealtimeScopeState();
+      tabletRuntimeDiagnostics.syncContext();
       setScopedRealtimeSubscription('cloud-doc-shared', 'cloud-doc-shared', true, scopeInstance => subscribeCloudDoc('shared', scopeInstance));
       setScopedRealtimeSubscription('cloud-doc-tumbler', 'cloud-doc-tumbler', true, scopeInstance => subscribeCloudDoc('tumbler', scopeInstance));
       setScopedRealtimeSubscription('cloud-doc-order', 'cloud-doc-order', scope.orderRoute, scopeInstance => subscribeCloudDoc('order', scopeInstance));
