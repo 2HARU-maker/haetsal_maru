@@ -42895,18 +42895,18 @@ body.mobile-tablet-device .pos-keyboard-btn{
             ${state.editOrderValidation && state.editOrderValidation.message ? `<div class="edit-order-global-error" role="alert">${escapeHtml(state.editOrderValidation.message)}</div>` : ''}
             <div class="user-order-edit-note">${escapeHtml(ORDER_EDIT_MEMO_ONLY_MESSAGE)}</div>
             ${editingOrder ? `<div class="help-note" style="margin-bottom:12px">주문번호: ${escapeHtml(editingOrder.orderNumber || editingOrder.id)} · ${escapeHtml(editingOrder.userNameDisplay || editingOrder.userName || '')}(${escapeHtml(editingOrder.userDept || '소속없음')})</div>` : ''}
-            <fieldset disabled style="border:0;padding:0;margin:0;min-width:0" aria-label="수정할 수 없는 주문 정보">
+            <fieldset style="border:0;padding:0;margin:0;min-width:0" aria-label="수정할 수 없는 주문 정보">
               ${renderEditOrderItemsSection()}
               <div class="row">
                 <div class="field">
                   <label>수령방법</label>
                   <div class="edit-order-receive-buttons">
-                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}">픽업</button>
-                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}">배달</button>
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}" disabled>픽업</button>
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}" disabled>배달</button>
                   </div>
                   ${renderOrderEditInlineError('deliveryType', -1)}
                 </div>
-                ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}">${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
+                ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}" disabled>${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
               </div>
               ${state.editOrderData.items.some(item => item.cupType === 'TUMBLER') ? `<div class="field"><label>공통 텀블러 정보</label><input id="editOrderTumblerInfo" class="input" type="text" placeholder="예: 개인 텀블러 또는 추가 설명" value="${escapeHtml(state.editOrderData.tumblerInfo)}"></div>` : ''}
             </fieldset>
