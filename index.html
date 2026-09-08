@@ -42893,7 +42893,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
           <div class="modal-head"><h3>✏️ 주문 정보 수정</h3><button type="button" class="modal-close" data-action="close-edit-order" ${state.editOrderSaveInFlight ? 'disabled' : ''}>❌</button></div>
           <div class="edit-order-modal-body">
             ${state.editOrderValidation && state.editOrderValidation.message ? `<div class="edit-order-global-error" role="alert">${escapeHtml(state.editOrderValidation.message)}</div>` : ''}
-            <div class="user-order-edit-note">${escapeHtml(ORDER_EDIT_MEMO_ONLY_MESSAGE)}</div>
             ${editingOrder ? `<div class="help-note" style="margin-bottom:12px">주문번호: ${escapeHtml(editingOrder.orderNumber || editingOrder.id)} · ${escapeHtml(editingOrder.userNameDisplay || editingOrder.userName || '')}(${escapeHtml(editingOrder.userDept || '소속없음')})</div>` : ''}
             <fieldset style="border:0;padding:0;margin:0;min-width:0" aria-label="수정할 수 없는 주문 정보">
               ${renderEditOrderItemsSection()}
