@@ -3565,6 +3565,11 @@ body.order-keyboard-submit-active{
   z-index:10020;
   margin:0 !important;
 }
+#order-screen.active .selected-card > .order-submit-actions.order-keyboard-fixed{
+  padding-top:3px;
+  padding-bottom:3px;
+  row-gap:4px !important;
+}
 @media (max-width:420px){
   .order-submit-actions{
     grid-template-columns:minmax(78px,.58fr) minmax(0,1.9fr);
@@ -11081,6 +11086,15 @@ body.order-keyboard-submit-active{
   }
   #order-screen.active .dashboard-orders .order-work-complete .delivery-record-action-btn{
     font-size:15px !important;
+  }
+}
+
+#order-screen.active .selected-card > .order-submit-actions.order-keyboard-fixed .btn{
+  min-height:48px !important;
+}
+@media (min-width:900px){
+  #order-screen.active .selected-card > .order-submit-actions.order-keyboard-fixed .order-submit-btn{
+    padding-top:12px !important;
   }
 }
 </style>
@@ -43317,6 +43331,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const visualHeight = (viewport && viewport.height) || window.innerHeight || document.documentElement.clientHeight || 0;
           const visualOffsetTop = Number(viewport && viewport.offsetTop || 0);
           const fixedActions = app.querySelector('.order-submit-actions.order-keyboard-fixed');
+          if(orderKeyboardSubmitState.active && fixedActions && element === getFocusedOrderKeyboardInput()){
+            const page = element.closest('.page-order');
+            if(page){
+              page.scrollTop = Math.max(0, Math.min(page.scrollHeight - page.clientHeight, page.scrollTop + rect.top - 24));
+              return;
+            }
+          }
           const fixedHeight = fixedActions ? Math.ceil(fixedActions.getBoundingClientRect().height || 0) + 16 : 72;
           const topLimit = visualOffsetTop + 24;
           const bottomLimit = Math.max(topLimit + 120, visualOffsetTop + visualHeight - fixedHeight);
