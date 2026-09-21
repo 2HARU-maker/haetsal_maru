@@ -38508,6 +38508,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let orderLifecycleRenderQueued = false;
     let orderLifecycleRenderGeneration = 0;
     let dashboardTouchInteraction = null;
+    let dashboardTouchScrollObserved = false;
     let dashboardTouchRenderDeferred = false;
     let dashboardTouchRenderFlushTimer = null;
     let preserveOrderEditModalScrollOnNextRender = false;
@@ -38953,7 +38954,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(dashboardTouchRenderFlushTimer) window.clearTimeout(dashboardTouchRenderFlushTimer);
       dashboardTouchRenderFlushTimer = window.setTimeout(() => {
         dashboardTouchRenderFlushTimer = null;
-        if(dashboardTouchInteraction || !dashboardTouchRenderDeferred) return;
+        if(dashboardTouchInteraction === 'scroll-settling'){
+          dashboardTouchInteraction = null;
+        }else if(dashboardTouchInteraction){
+          return;
+        }
+        if(!dashboardTouchRenderDeferred) return;
         dashboardTouchRenderDeferred = false;
         observeTabletRuntime('observeTouchState', {
           phase:'deferred-flush',
@@ -38971,6 +38977,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const dashboardBody = getDashboardScrollContainer();
       if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
       dashboardTouchInteraction = `touch:${Number(event.touches[0].identifier)}`;
+      dashboardTouchScrollObserved = false;
       observeTabletRuntime('observeTouchState', {
         phase:'touch-start',
         active:true,
@@ -38989,7 +38996,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const changedTouches = event.changedTouches || [];
       const ended = Array.from(changedTouches).some(touch => `touch:${Number(touch.identifier)}` === dashboardTouchInteraction);
       if(!ended && event.type !== 'touchcancel') return;
-      dashboardTouchInteraction = null;
+      const shouldSettle = event.type === 'touchcancel' || dashboardTouchScrollObserved;
+      dashboardTouchInteraction = shouldSettle ? 'scroll-settling' : null;
+      dashboardTouchScrollObserved = false;
       observeTabletRuntime('observeTouchState', {
         phase:'touch-end',
         active:false,
@@ -38997,14 +39006,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
         lifecycleQueued:orderLifecycleRenderQueued,
         lifecycleGeneration:orderLifecycleRenderGeneration
       });
-      if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
+      if(dashboardTouchInteraction === 'scroll-settling' || dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
     }
 
     function startDashboardPointerInteraction(event){
       if(event.pointerType !== 'touch' || !isDashboardView()) return;
       const dashboardBody = getDashboardScrollContainer();
       if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
-      if(dashboardTouchInteraction == null) dashboardTouchInteraction = `pointer:${Number(event.pointerId)}`;
+      if(dashboardTouchInteraction == null || dashboardTouchInteraction === 'scroll-settling'){
+        dashboardTouchInteraction = `pointer:${Number(event.pointerId)}`;
+      }
+      dashboardTouchScrollObserved = false;
       observeTabletRuntime('observeTouchState', {
         phase:'pointer-start',
         active:true,
@@ -39020,7 +39032,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function endDashboardPointerInteraction(event){
       if(dashboardTouchInteraction !== `pointer:${Number(event.pointerId)}`) return;
-      dashboardTouchInteraction = null;
+      const shouldSettle = event.type === 'pointercancel' || dashboardTouchScrollObserved;
+      dashboardTouchInteraction = shouldSettle ? 'scroll-settling' : null;
+      dashboardTouchScrollObserved = false;
       observeTabletRuntime('observeTouchState', {
         phase:'pointer-end',
         active:false,
@@ -39028,7 +39042,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         lifecycleQueued:orderLifecycleRenderQueued,
         lifecycleGeneration:orderLifecycleRenderGeneration
       });
-      if(dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
+      if(dashboardTouchInteraction === 'scroll-settling' || dashboardTouchRenderDeferred) scheduleDashboardTouchRenderFlush();
     }
 
     document.addEventListener('pointerdown', startDashboardPointerInteraction, true);
@@ -39138,7 +39152,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
           ...captureOrderScrollPosition(),
           owner:current
         };
-        if(dashboardTouchRenderDeferred && dashboardTouchInteraction == null){
+        if(dashboardTouchInteraction && dashboardTouchInteraction !== 'scroll-settling'){
+          dashboardTouchScrollObserved = true;
+        }
+        if(dashboardTouchInteraction === 'scroll-settling'
+          || (dashboardTouchRenderDeferred && dashboardTouchInteraction == null)){
           scheduleDashboardTouchRenderFlush();
         }
       }
