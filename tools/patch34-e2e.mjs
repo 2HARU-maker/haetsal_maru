@@ -65,7 +65,7 @@ const smokeResults=[];
 try{
   for(const [w,h] of [[390,844],[768,1024],[1024,768],[1366,768]]){
     const profile=fs.mkdtempSync(path.join(os.tmpdir(),'haetsal-chrome-'));
-    const args=['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--no-first-run','--no-default-browser-check',`--window-size=${w},${h}`,`--user-data-dir=${profile}`,'--virtual-time-budget=1000','--dump-dom','http://127.0.0.1:18080/'];
+    const args=['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--no-first-run','--no-default-browser-check',`--window-size=${w},${h}`,`--user-data-dir=${profile}`,'--dump-dom','http://127.0.0.1:18080/'];
     const dom=execFileSync(chrome,args,{encoding:'utf8',maxBuffer:20*1024*1024,timeout:25000,stdio:['ignore','pipe','pipe']});
     const m=dom.match(/<meta id="patch34-smoke-result" data-json="([^"]*)"/i);if(!m){console.log("SMOKE_DOM_DEBUG_START",dom.slice(0,2500));console.log("SMOKE_DOM_DEBUG_END",dom.slice(-5000));throw new Error(`smoke result missing ${w}x${h}`)}const data=JSON.parse(decodeURIComponent(m[1].replace(/&amp;/g,'&')));assert(data.ok,`browser smoke failed ${w}x${h}: ${data.error||''}`);assert(Array.isArray(data.errors)&&data.errors.length===0,`browser errors ${w}x${h}: ${data.errors}`);assert(data.results.length===4,`view count ${w}x${h}`);for(const row of data.results){assert(row.html>1000,`empty render ${row.label}`);if(row.label!=='ORDER_MAIN') assert(row.view==='ADMIN_DASHBOARD',`admin view failed ${row.label}`);else assert(row.view==='ORDER_MAIN','guest view failed')};smokeResults.push({requested:[w,h],actual:[data.innerWidth,data.innerHeight],views:data.results.map(x=>x.label),maxOverflow:Math.max(...data.results.map(x=>x.scrollWidth-x.clientWidth))});
   }
