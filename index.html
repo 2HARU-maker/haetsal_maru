@@ -50901,6 +50901,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const MARKER_KEY = 'haetsalmaru_tablet_runtime_diagnostic_session_v1';
     const SCHEMA_VERSION = 1;
     const HEARTBEAT_MS = 10000;
+    const FIRESTORE_EVENT_WRITE_ENABLED = (() => {
+      try{
+        return new URLSearchParams(window.location.search || '').get('haetsalDiagnostics') === '1';
+      }catch(error){
+        return false;
+      }
+    })();
     const SNAPSHOT_COALESCE_MS = 2000;
     const MAX_QUEUE_SIZE = 24;
     const MAX_COMPLETION_TRACKED = 64;
@@ -51135,7 +51142,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     function enqueueEvent(type, payload, options){
-      if(!active) return false;
+      if(!active || !FIRESTORE_EVENT_WRITE_ENABLED) return false;
       const opts = options || {};
       const context = getContext();
       const build = getBuild();
@@ -51203,7 +51210,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     function ensureHeartbeatTimer(){
-      if(heartbeatTimer) return;
+      if(!FIRESTORE_EVENT_WRITE_ENABLED || heartbeatTimer) return;
       heartbeatTimer = window.setInterval(flushHeartbeat, HEARTBEAT_MS);
     }
 
@@ -60174,6 +60181,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           console.error('Firestore 주문 차단 기록 묶음 확인 실패:', error);
           if(quotaBlocked || isOrderGuardVerificationReadBlocked()){
             chunk.forEach(entry => results.set(entry, { ok:false, error, stopped:true }));
+            continue;
+          }
+          if(isOrderGuardVerificationRetryableError(error)){
+            chunk.forEach(entry => results.set(entry, { ok:false, error }));
             continue;
           }
           const fallbackResults = await Promise.all(chunk.map(entry => {
