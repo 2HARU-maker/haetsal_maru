@@ -17,3 +17,31 @@ jobs:
           node-version: '22'
       - name: Verify candidate
         run: node tools/patch34-e2e.mjs
+  emulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare emulator config
+        run: |
+          cat > /tmp/firebase.patch34.json <<'JSON'
+          {
+            "firestore": {"rules": "firestore.rules"},
+            "emulators": {
+              "auth": {"host": "127.0.0.1", "port": 9099},
+              "firestore": {"host": "127.0.0.1", "port": 8080},
+              "ui": {"enabled": false},
+              "singleProjectMode": true
+            }
+          }
+          JSON
+      - name: Verify Firebase emulator startup
+        run: npx -y firebase-tools@13.31.2 emulators:exec --only auth,firestore --project demo-haetsalmaru --config /tmp/firebase.patch34.json "node tools/patch34-firebase-emulator.mjs"
