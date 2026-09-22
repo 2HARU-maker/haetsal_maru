@@ -32,7 +32,7 @@ jobs:
           java-version: '21'
       - name: Prepare emulator config
         run: |
-          cat > /tmp/firebase.patch34.json <<'JSON'
+          cat > firebase.patch34.test.json <<'JSON'
           {
             "firestore": {"rules": "firestore.rules"},
             "emulators": {
@@ -44,4 +44,4 @@ jobs:
           }
           JSON
       - name: Verify Firebase emulator startup
-        run: npx -y firebase-tools@13.31.2 emulators:exec --only auth,firestore --project demo-haetsalmaru --config /tmp/firebase.patch34.json "node tools/patch34-firebase-emulator.mjs"
+        run: npx -y firebase-tools@13.31.2 emulators:exec --only auth,firestore --project demo-haetsalmaru --config firebase.patch34.test.json "node tools/patch34-firebase-emulator.mjs"
