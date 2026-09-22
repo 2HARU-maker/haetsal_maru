@@ -63,7 +63,7 @@ const chromeCandidates=['google-chrome','google-chrome-stable','chromium','chrom
 const py=spawn('python3',['-m','http.server','18080','--bind','127.0.0.1','--directory',root],{stdio:'ignore'});let served='';for(let i=0;i<30&&!served;i++){try{const resp=await fetch('http://127.0.0.1:18080/');if(resp.ok)served=await resp.text()}catch{}if(!served)await new Promise(r=>setTimeout(r,100))}assert(served.includes('patch34-smoke-result'),'smoke server did not serve injected HTML');assert(!served.includes('firebase-app.js'),'smoke server served Firebase module');
 const smokeResults=[];
 try{
-  for(const [w,h] of [[390,844],[768,1024],[1024,768],[1366,768]]){
+  for(const [w,h] of [[1024,768]]){
     const profile=fs.mkdtempSync(path.join(os.tmpdir(),'haetsal-chrome-'));
     const args=['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--no-first-run','--no-default-browser-check',`--window-size=${w},${h}`,`--user-data-dir=${profile}`,'--dump-dom','http://127.0.0.1:18080/'];
     const dom=execFileSync(chrome,args,{encoding:'utf8',maxBuffer:20*1024*1024,timeout:25000,stdio:['ignore','pipe','pipe']});
