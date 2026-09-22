@@ -1,0 +1,19 @@
+name: PATCH34 Candidate E2E
+on:
+  push:
+    branches:
+      - test/firestore-usage-burst-guard-34-e2e
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify candidate
+        run: node tools/patch34-e2e.mjs
