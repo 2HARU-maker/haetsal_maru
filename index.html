@@ -52303,6 +52303,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           || normalizeLifecycleRevision(currentOrder.stageRevision) !== normalizeLifecycleRevision(req.baseStageRevision)){
           throw new Error('order-edit-live-order-changed');
         }
+        if(String(currentOrder.deliveryType || '').toUpperCase() === 'DELIVERY'
+          && String(requestedOrder.deliveryType || '').toUpperCase() === 'DELIVERY'
+          && String(currentOrder.deliveryLocation || '').trim() !== String(requestedOrder.deliveryLocation || '').trim()
+          && deliverySnapshot && deliverySnapshot.exists()
+          && normalizeDeliveryRecordCloudStatus(getPayloadData(deliverySnapshot.data()).status) === 'CANCELLED'){
+          throw new Error('order-edit-cancelled-delivery-location-change');
+        }
         if(tumblerRef){
           if(!tumblerSnapshot || !tumblerSnapshot.exists()) throw new Error('order-edit-tumbler-data-missing');
           const tumblerVerification = verifyOrderEditRentedTumblerAssignments(getPayloadData(tumblerSnapshot.data()), currentOrder, requestedOrder);
