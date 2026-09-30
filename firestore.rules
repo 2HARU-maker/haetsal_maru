@@ -2222,18 +2222,7 @@ service cloud.firestore {
       let live = getAfter(
         /databases/$(database)/documents/haetsalCombinedApp/$(liveDocId)
       ).data.data;
-      return isSignedIn()
-        && hasProtectedExternalWriteEnvelope()
-        && validDeliveryRecordData(docId, after)
-        && before is map
-        && after.reason == 'order-edited-transaction'
-        && before.orderId == after.orderId
-        && before.type == after.type
-        && before.version == after.version
-        && before.userId == after.userId
-        && before.orderNumber == after.orderNumber
-        && before.createdAt == after.createdAt
-        && before.orderCreatedAt == after.orderCreatedAt
+      return after.reason == 'order-edited-transaction'
         && live.reason == 'order-edited-transaction'
         && live.orderId == after.orderId
         && live.order is map
@@ -2262,21 +2251,20 @@ service cloud.firestore {
     function validDeliveryRecordUpdate(docId) {
       let before = resource.data.data;
       let after = request.resource.data.data;
-      return (
-          isManager()
-          && hasProtectedExternalWriteEnvelope()
-          && validDeliveryRecordData(docId, after)
-          && before is map
-          && before.orderId == after.orderId
-          && before.type == after.type
-          && before.version == after.version
-          && before.userId == after.userId
-          && before.orderNumber == after.orderNumber
-          && before.createdAt == after.createdAt
-          && before.orderCreatedAt == after.orderCreatedAt
-          && validDeliveryStatusTransition(before.status, after.status)
-        )
-        || validDeliveryOrderEditUpdate(docId, before, after);
+      return hasProtectedExternalWriteEnvelope()
+        && validDeliveryRecordData(docId, after)
+        && before is map
+        && before.orderId == after.orderId
+        && before.type == after.type
+        && before.version == after.version
+        && before.userId == after.userId
+        && before.orderNumber == after.orderNumber
+        && before.createdAt == after.createdAt
+        && before.orderCreatedAt == after.orderCreatedAt
+        && (
+          (isManager() && validDeliveryStatusTransition(before.status, after.status))
+          || validDeliveryOrderEditUpdate(docId, before, after)
+        );
     }
 
     function isClosedGuardStatus(status) {
