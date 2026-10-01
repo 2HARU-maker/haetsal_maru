@@ -2820,15 +2820,16 @@ service cloud.firestore {
           || (isCouponRecalcLatestDocId(docId) && validCouponRecalcLatestUpdate(docId))
           || (isOrderEditDiagnosticDocId(docId) && validOrderEditDiagnosticUpdate(docId))
           || (
-            !isSharedPeopleAuthDocId(docId)
-            && !isCouponLedgerDocId(docId)
-            && !isCouponRestoreAuditDocId(docId)
-            && !isCouponRecalcDocId(docId)
-            && !isOrderEditDiagnosticDocId(docId)
-            && (
-              (!isLiveOrderDocId(docId) && isFreshClientUpdate())
-              || (isLiveOrderDocId(docId) && validLiveOrderUpdate(docId))
-            )
+            isLiveOrderDocId(docId)
+              ? validLiveOrderUpdate(docId)
+              : (
+                !isSharedPeopleAuthDocId(docId)
+                && !isCouponLedgerDocId(docId)
+                && !isCouponRestoreAuditDocId(docId)
+                && !isCouponRecalcDocId(docId)
+                && !isOrderEditDiagnosticDocId(docId)
+                && isFreshClientUpdate()
+              )
           )
         );
 
