@@ -54020,6 +54020,23 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     };
   }
 
+  function isValidClosedOrderGuardRecoveryData(data, guardId){
+    if(!data || typeof data !== 'object' || Array.isArray(data)) return false;
+    const stringKeys = ['type', 'id', 'orderId', 'guardId', 'orderNumber', 'status', 'deliveryType', 'statusUpdatedAt', 'updatedAt', 'processedAt', 'cancelledAt', 'reason', 'savedAt'];
+    const integerKeys = ['version', 'statusTime', 'productionCycle', 'statusRevision', 'savedTime', 'expiresAt'];
+    const keys = [...stringKeys, ...integerKeys, '__haetsalDataGuard'];
+    return Object.keys(data).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(data, key))
+      && stringKeys.every(key => typeof data[key] === 'string')
+      && integerKeys.every(key => Number.isSafeInteger(data[key]))
+      && data.version === 1 && data.type === 'ORDER_CLOSED_GUARD'
+      && data.orderId.length > 0 && data.id === data.orderId
+      && data.guardId === guardId && guardId === 'closed_guard_' + data.orderId
+      && isLiveOrderClosedStatus(data.status)
+      && data.statusTime > 0 && data.productionCycle >= 1 && data.statusRevision >= 1
+      && data.savedTime > 0 && data.expiresAt >= data.savedTime
+      && !!data.__haetsalDataGuard && typeof data.__haetsalDataGuard === 'object' && !Array.isArray(data.__haetsalDataGuard);
+  }
+
   async function saveClosedOrderGuardDocument(record, reason){
     const payload = normalizeClosedOrderGuardCloudPayload({
       ...(record || {}),
@@ -54029,7 +54046,32 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     await firebaseReadyPromise;
     const builtPayload = buildPayload(payload);
     builtPayload.serverUpdatedAt = serverTimestamp();
-    await setDoc(doc(closedOrderGuardCollectionRef, payload.guardId), builtPayload, { merge:true });
+    const ref = doc(closedOrderGuardCollectionRef, payload.guardId);
+    try{
+      await setDoc(ref, builtPayload, { merge:true });
+    }catch(error){
+      if(!error || !['permission-denied', 'firestore/permission-denied'].includes(error.code)) throw error;
+      try{
+        const user = auth.currentUser;
+        const token = user && await getIdTokenResult(user);
+        const claims = token && token.claims;
+        const validEnvelope = Number.isSafeInteger(builtPayload.clientBuildNumber) && builtPayload.clientBuildNumber >= 202607111414
+          && typeof builtPayload.clientBuildLabel === 'string'
+          && Number.isSafeInteger(builtPayload.writeSchemaVersion) && builtPayload.writeSchemaVersion >= 5
+          && typeof builtPayload.clientWriteAt === 'string' && typeof builtPayload.clientWriteId === 'string' && builtPayload.clientWriteId.length > 0;
+        if(!claims || !(claims.manager === true || claims.admin === true) || !validEnvelope || !isValidClosedOrderGuardRecoveryData(builtPayload.data, payload.guardId)) throw error;
+        const snapshot = await getDocFromServer(ref);
+        const server = snapshot.exists() ? getPayloadData(snapshot.data()) : null;
+        const sameKeys = ['id', 'orderId', 'guardId', 'version', 'type', 'status', 'deliveryType', 'statusTime', 'productionCycle', 'statusRevision'];
+        if(isValidClosedOrderGuardRecoveryData(server, payload.guardId)
+          && sameKeys.every(key => server[key] === payload[key]) && server.savedTime >= payload.savedTime && server.expiresAt >= payload.expiresAt){
+          return { saved:true, alreadySatisfied:true, raceRecovered:true, reason:'ALREADY_SATISFIED_BY_NEWER_SAME_GUARD', orderId:payload.orderId, guard:server };
+        }
+      }catch(recoveryError){
+        // Preserve the original write failure when server evidence cannot be verified.
+      }
+      throw error;
+    }
     return { saved:true, orderId:payload.orderId, guard:payload };
   }
 
