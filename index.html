@@ -39056,6 +39056,31 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return !!(element && ['INPUT','TEXTAREA','SELECT'].includes(element.tagName) && (app.contains(element) || modalRoot.contains(element)));
     }
 
+    function getDashboardOrderScrollAnchor(owner, orderId){
+      const body = getDashboardScrollContainer();
+      if(!owner || !body || !isDashboardView() || state.dashboardTab !== 'ORDERS') return null;
+      const ownerRect = owner === (document.scrollingElement || document.documentElement)
+        ? { top:0, bottom:window.innerHeight }
+        : owner.getBoundingClientRect();
+      const center = (ownerRect.top + ownerRect.bottom) / 2;
+      let anchor = null;
+      let distance = Infinity;
+      for(const card of body.querySelectorAll('.dashboard-orders .order-work-card')){
+        const control = card.querySelector('[data-order-id]');
+        const cardOrderId = String(control && control.dataset.orderId || '');
+        if(!cardOrderId || (orderId && cardOrderId !== orderId)) continue;
+        const rect = card.getBoundingClientRect();
+        if(orderId) return { orderId:cardOrderId, offset:rect.top - ownerRect.top };
+        if(rect.bottom <= ownerRect.top || rect.top >= ownerRect.bottom) continue;
+        const nextDistance = Math.abs((rect.top + rect.bottom) / 2 - center);
+        if(nextDistance < distance){
+          anchor = { orderId:cardOrderId, offset:rect.top - ownerRect.top };
+          distance = nextDistance;
+        }
+      }
+      return anchor;
+    }
+
     function captureOrderScrollPosition(){
       const page = getOrderScrollContainer();
       const dashboardOwner = getDashboardScrollOwner();
@@ -39066,6 +39091,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         selectedUserId: state.selectedUserId || '',
         pageTop: page ? Number(page.scrollTop || 0) : 0,
         dashboardTop: getDashboardScrollTop(dashboardOwner),
+        dashboardAnchor: getDashboardOrderScrollAnchor(dashboardOwner),
         windowTop: Number(window.pageYOffset || (scrollingElement ? scrollingElement.scrollTop : 0) || 0)
       };
     }
@@ -39184,8 +39210,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
         try{
           const dashboardOwner = getDashboardScrollOwner();
           if(dashboardOwner){
-            const restoredTop = restoreDashboardScrollTop(dashboardOwner, snapshot.dashboardTop);
+            let dashboardTop = Number(snapshot.dashboardTop || 0);
+            const anchor = snapshot.dashboardAnchor && getDashboardOrderScrollAnchor(dashboardOwner, snapshot.dashboardAnchor.orderId);
+            if(anchor && Number.isFinite(Number(snapshot.dashboardAnchor.offset))){
+              dashboardTop = getDashboardScrollTop(dashboardOwner) + anchor.offset - Number(snapshot.dashboardAnchor.offset);
+            }
+            const restoredTop = restoreDashboardScrollTop(dashboardOwner, dashboardTop);
             if(orderLifecycleScrollSnapshot === snapshot){
+              snapshot.dashboardTop = restoredTop;
               snapshot.restoredOwner = dashboardOwner;
               snapshot.restoredTop = restoredTop;
             }
