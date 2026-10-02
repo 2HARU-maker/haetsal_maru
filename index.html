@@ -13656,7 +13656,7 @@ window.HaetsalSharedStore = (function(){
         historicalCompletionSelectedIds: [],
         pendingVisibleCount: 6,
         orderQueueFilter: 'ALL',
-        deliveryQueueViewMode: 'LOCATION',
+        deliveryQueueViewMode: 'ORDER',
         statsPeriodType: 'DAY',
         statsStartDate: getTodayString(),
         statsEndDate: getTodayString(),
@@ -50816,6 +50816,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return !!(user && !user.isAnonymous && verifiedAdminUid && verifiedAdminUid === String(user.uid || ''));
     },
     login: async function(email, password){
+      await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseAdminUser(credential.user, true);
@@ -50843,6 +50844,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return !!(user && !user.isAnonymous && verifiedManagerUid && verifiedManagerUid === String(user.uid || ''));
     },
     login: async function(email, password){
+      await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseManagerUser(credential.user, true);
