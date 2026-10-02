@@ -12121,6 +12121,7 @@ window.HaetsalOperatorSession = (function(){
     isActive: function(){ return this.getRole() !== 'GUEST'; },
     setRole: function(role){
       const normalized = normalizeRole(role);
+      if(normalized !== state.role && window.OrderModule && window.OrderModule.resetCarryoverOrderScope) window.OrderModule.resetCarryoverOrderScope(true);
       if(normalized === 'ADMIN' && !hasVerifiedFirebaseAdmin()) return 'GUEST';
       if(normalized === 'MANAGER' && !hasVerifiedFirebaseManager()) return 'GUEST';
       state = { role: normalized };
@@ -12128,6 +12129,7 @@ window.HaetsalOperatorSession = (function(){
       return state.role;
     },
     clear: function(){
+      if(window.OrderModule && window.OrderModule.resetCarryoverOrderScope) window.OrderModule.resetCarryoverOrderScope(true);
       state = { role:'GUEST' };
       save();
     },
@@ -12892,6 +12894,14 @@ window.HaetsalSharedStore = (function(){
     const ORDER_MENU_CATALOG_PROTECTION_VERSION = 1;
     const ORDER_EMERGENCY_BACKUP_KEY = 'haetsalmaru_order_emergency_backup_v1';
     const ORDER_LIVE_QUEUE_LOCAL_KEY = 'haetsalmaru_order_live_queue_cache_v1';
+    // Provenance only: persisted IDs never restore a carryover approval.
+    const ORDER_CARRYOVER_LOCAL_KEY = 'haetsalmaru_order_carryover_local_ids_v1';
+    const carryoverLocalOrderIds = new Set((function(){
+      try{ const ids = JSON.parse(localStorage.getItem(ORDER_CARRYOVER_LOCAL_KEY) || '[]'); return Array.isArray(ids) ? ids.map(String) : []; }
+      catch(error){ return []; }
+    })());
+    let carryoverApprovalSessionKey = '';
+    let carryoverApprovalDate = '';
     const ORDER_CLOSED_LIVE_GUARD_LOCAL_KEY = 'haetsalmaru_order_closed_live_guard_v1';
     const ORDER_CLOSED_LIVE_GUARD_CLOUD_QUEUE_LOCAL_KEY = 'haetsalmaru_order_closed_live_guard_cloud_queue_v1';
     const ORDER_REVIVED_GUARD_LOCAL_KEY = 'haetsalmaru_order_revived_guard_v1';
@@ -13639,6 +13649,9 @@ window.HaetsalSharedStore = (function(){
         completedOrderRecoveryLegacyScanned: 0,
         completedOrderRecoveryLegacyDone: false,
         carryoverOrderDate: getYesterdayDateKey(),
+        productionQueueDate: todayYmd(),
+        carryoverOrderPanelOpen: false,
+        carryoverOrderRequestId: 0,
         carryoverOrderLoading: false,
         carryoverOrderCandidates: [],
         carryoverApprovedOrderIds: [],
@@ -18687,7 +18700,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return (Array.isArray(orders) ? orders : []).filter(order => {
         if(!order || typeof order !== 'object') return false;
         if(isOrderClosedStatus(order)) return true;
-        return !shouldRejectOpenOrderByClosedLiveGuard(order) && !shouldRejectOpenOrderByRevivedGuard(order) && !hasCompletedProductionTraceWithoutReopen(order);
+        return !isDetachedCarryoverOrder(order) && !shouldRejectOpenOrderByClosedLiveGuard(order) && !shouldRejectOpenOrderByRevivedGuard(order) && !hasCompletedProductionTraceWithoutReopen(order);
       });
     }
 
@@ -19054,6 +19067,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     function isPastRevivedClickedOrderCandidate(order){
       if(!order || typeof order !== 'object') return false;
       if(!isPastBusinessOrder(order)) return false;
+      if(isCarryoverOrderApproved(order)) return false;
+      if(carryoverLocalOrderIds.has(String(order.id || '')) && isOrderClosedStatus(order)
+        && order.completionCommitted === true && order.completionEventId && readClosedOrderLiveGuardMap()[String(order.id || '')]) return false;
       if(hasTodayInteractionOnOrder(order)) return true;
       return !!String(order.completionRequestStatus || '').trim();
     }
@@ -19207,6 +19223,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     async function runRevivedOrderSafetySweepPass(reason){
+        syncCarryoverOrderScope();
         const rows = Array.isArray(state.orders) ? state.orders.slice() : [];
         let guarded = 0;
         let removedCompletionRequests = 0;
@@ -19354,13 +19371,22 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
+    function isServerSafeOpenOrder(order){
+      return !!(order && typeof order === 'object' && isOrderOpenStatus(order)
+        && !shouldRejectOpenOrderByClosedLiveGuard(order) && !shouldRejectOpenOrderByRevivedGuard(order)
+        && !hasCompletedProductionTraceWithoutReopen(order));
+    }
+
     function shouldIncludeOrderInProductionQueue(order){
-      return !!(order && typeof order === 'object' && isOrderOpenStatus(order) && !shouldRejectOpenOrderByClosedLiveGuard(order) && !hasCompletedProductionTraceWithoutReopen(order));
+      return !!(order && typeof order === 'object' && isOrderOpenStatus(order) && !isDetachedCarryoverOrder(order) && !shouldRejectOpenOrderByClosedLiveGuard(order) && !hasCompletedProductionTraceWithoutReopen(order));
     }
 
     function isCarryoverOrderApproved(orderOrId){
       const orderId = String(orderOrId && typeof orderOrId === 'object' ? orderOrId.id : orderOrId || '').trim();
-      return !!orderId && (Array.isArray(state.carryoverApprovedOrderIds) ? state.carryoverApprovedOrderIds : []).includes(orderId);
+      return !!carryoverApprovalSessionKey && carryoverApprovalSessionKey === getCarryoverOrderSessionKey()
+        && carryoverApprovalDate === String(state.carryoverOrderDate || '')
+        && (state.appRole !== 'MANAGER' || carryoverApprovalDate === state.productionQueueDate)
+        && !!orderId && (Array.isArray(state.carryoverApprovedOrderIds) ? state.carryoverApprovedOrderIds : []).includes(orderId);
     }
 
     let currentDayLiveOrderAuthority = {
@@ -19373,6 +19399,58 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     function isOrderForBusinessDate(order, dateKey){
       const targetDate = String(dateKey || todayYmd()).trim();
       return !!targetDate && getOrderBusinessDateKey(order) === targetDate;
+    }
+
+    function isOrderForSelectedProductionDate(order, dateKey){
+      const businessDate = String(order && order.businessDate || '').trim();
+      return dateKey < todayYmd() && isValidDateKey(businessDate)
+        ? businessDate === dateKey : isOrderForBusinessDate(order, dateKey);
+    }
+
+    function isDetachedCarryoverOrder(order){
+      return !!(order && carryoverLocalOrderIds.has(String(order.id || '')) && isOrderOpenStatus(order)
+        && isPastBusinessOrder(order) && !isCarryoverOrderApproved(order));
+    }
+
+    function pruneCarryoverOrderLocalSources(){
+      for(const key of [ORDER_LIVE_QUEUE_LOCAL_KEY, ORDER_EMERGENCY_BACKUP_KEY]){
+        try{
+          const value = JSON.parse(localStorage.getItem(key) || 'null');
+          if(!value || !Array.isArray(value.orders)) continue;
+          const orders = value.orders.filter(order => !isDetachedCarryoverOrder(order));
+          if(orders.length === value.orders.length) continue;
+          value.orders = orders;
+          if(value.meta) value.meta.openOrderCount = orders.filter(isOrderOpenStatus).length;
+          localStorage.setItem(key, JSON.stringify(value));
+        }catch(error){ console.warn('이전 주문 로컬 목록 분리 실패', error); }
+      }
+    }
+
+    function resetCarryoverOrderScope(resetDate=false){
+      state.carryoverOrderRequestId += 1;
+      // Detach before withdrawing approval; no generic save/cloud write.
+      state.orders = (Array.isArray(state.orders) ? state.orders : []).filter(order =>
+        !(carryoverLocalOrderIds.has(String(order && order.id || '')) && isOrderOpenStatus(order) && isPastBusinessOrder(order)));
+      carryoverApprovalSessionKey = '';
+      carryoverApprovalDate = '';
+      pruneCarryoverOrderLocalSources();
+      state.carryoverApprovedOrderIds = [];
+      state.carryoverOrderCandidates = [];
+      state.carryoverOrderLoading = false;
+      state.carryoverOrderError = '';
+      state.carryoverOrderCursor = '';
+      state.carryoverOrderHasMore = false;
+      state.carryoverOrderScannedCount = 0;
+      state.carryoverOrderBlockedCount = 0;
+      if(resetDate){
+        state.productionQueueDate = todayYmd();
+        state.carryoverOrderDate = getYesterdayDateKey();
+        state.carryoverOrderPanelOpen = false;
+      }
+    }
+
+    function syncCarryoverOrderScope(){
+      if(carryoverApprovalSessionKey && carryoverApprovalSessionKey !== getCarryoverOrderSessionKey()) resetCarryoverOrderScope(true);
     }
 
     function isCurrentBusinessDayOrder(order){
@@ -21230,7 +21308,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
 
     function mergeOrderLiveDocumentIntoState(value, sourceLabel='주문별 제작대기 저장소'){
       const remoteOrder = getOrderFromLiveDocument(value);
-      if(!remoteOrder) return { added:0, updated:0, count:0, order:null, sourceLabel };
+      if(!remoteOrder || isDetachedCarryoverOrder(remoteOrder)) return { added:0, updated:0, count:0, order:null, sourceLabel };
       const id = String(remoteOrder.id || '');
       if(!id) return { added:0, updated:0, count:0, order:null, sourceLabel };
       if(isOrderClosedStatus(remoteOrder)){
@@ -22151,6 +22229,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     state.menuNamesDraft = state.sysSettings.menuCatalog.map(item => item.name).join('\n');
     state.orderAppVersion = ORDER_APP_VERSION;
     applyArchivedOrderMarksToState('startup-local-archive-mark-filter', { render:false, persistLocal:false });
+    pruneCarryoverOrderLocalSources();
     runRevivedOrderSafetySweep('startup-revived-order-sweep');
     scheduleArchivedOrderMarksServerHydration('startup-server-archive-mark-prehydrate', { delayMs:600, render:true, persistLocal:true, showStatus:true, force:true });
     scheduleEmergencyCompactArchiveCloudHydration('startup-emergency-compact-hydrate', { delayMs:900, render:true, timeoutMs:4000 });
@@ -38554,7 +38633,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!element || !isDashboardView()) return false;
       if(!(app.contains(element) || modalRoot.contains(element))) return false;
       const id = String(element.id || '');
-      return id === 'completedFilterDate' || id === 'completedOrderRecoveryDate';
+      return id === 'completedFilterDate' || id === 'completedOrderRecoveryDate' || id === 'carryoverOrderDate';
     }
 
     function isDashboardDateInputFocusedForRemoteRender(){
@@ -38619,6 +38698,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     async function cancelManagerQueueChoice(){
+      resetCarryoverOrderScope(true);
       state.showManagerQueueChoiceModal = false;
       if(window.HaetsalManagerAuth && typeof window.HaetsalManagerAuth.logout === 'function'){
         try{ await window.HaetsalManagerAuth.logout(); }catch(error){ console.error('Firebase 매니저 로그인 취소 처리 실패', error); }
@@ -38710,6 +38790,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     async function handleDashboardLogout(){
+      resetCarryoverOrderScope(true);
       const wasAdmin = state.appRole === 'ADMIN'
         || (window.HaetsalOperatorSession && window.HaetsalOperatorSession.getRole() === 'ADMIN');
       const wasManager = state.appRole === 'MANAGER'
@@ -40492,7 +40573,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
       `;
     }
 
+    function getCarryoverOrderSessionKey(){
+      const user = window.firebaseAuth && window.firebaseAuth.currentUser;
+      if(!user || user.isAnonymous) return '';
+      return (state.appRole === 'ADMIN' && isFirebaseAdminVerified()) || (state.appRole === 'MANAGER' && isFirebaseManagerVerified())
+        ? state.appRole + ':' + user.uid : '';
+    }
+
+    function isCarryoverOrderAuthorized(){ return !!getCarryoverOrderSessionKey(); }
+
     async function loadCarryoverOrderCandidates(options){
+      if(!isCarryoverOrderAuthorized()) return;
       if(state.carryoverOrderLoading) return;
       const append = !!(options && options.append);
       const dateKey = String(state.carryoverOrderDate || '').trim();
@@ -40505,6 +40596,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         showMessage('이전 날짜 미처리 주문 조회 모듈이 준비되지 않았습니다.');
         return;
       }
+      const requestId = ++state.carryoverOrderRequestId;
+      const sessionKey = getCarryoverOrderSessionKey();
+      carryoverApprovalSessionKey = sessionKey;
+      carryoverApprovalDate = dateKey;
+      const current = () => requestId === state.carryoverOrderRequestId && dateKey === state.carryoverOrderDate && sessionKey === getCarryoverOrderSessionKey();
       state.carryoverOrderLoading = true;
       state.carryoverOrderError = '';
       if(!append){
@@ -40520,6 +40616,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           limit:20,
           startAfterDocId:append ? String(state.carryoverOrderCursor || '') : ''
         });
+        if(!current()) return;
         const byId = new Map((append && Array.isArray(state.carryoverOrderCandidates) ? state.carryoverOrderCandidates : []).map(order => [String(order && order.id || ''), order]));
         (Array.isArray(result && result.orders) ? result.orders : []).forEach(order => {
           const id = String(order && order.id || '').trim();
@@ -40534,14 +40631,22 @@ body.mobile-tablet-device .pos-keyboard-btn{
           state.carryoverOrderError = `완료·취소·격리 흔적이 확인된 ${Number(state.carryoverOrderBlockedCount)}건은 후보에서 제외했습니다.`;
         }
       }catch(error){
+        if(!current()) return;
         state.carryoverOrderError = String(error && error.message || error || '이전 주문을 확인하지 못했습니다.');
       }finally{
-        state.carryoverOrderLoading = false;
-        render();
+        if(current()){
+          state.carryoverOrderLoading = false;
+          render();
+        }
       }
     }
 
     async function approveCarryoverOrder(orderId){
+      if(!isCarryoverOrderAuthorized()) return;
+      const requestId = state.carryoverOrderRequestId;
+      const dateKey = state.carryoverOrderDate;
+      const sessionKey = getCarryoverOrderSessionKey();
+      const current = () => requestId === state.carryoverOrderRequestId && dateKey === state.carryoverOrderDate && sessionKey === getCarryoverOrderSessionKey();
       const id = String(orderId || '').trim();
       const candidate = (Array.isArray(state.carryoverOrderCandidates) ? state.carryoverOrderCandidates : []).find(order => String(order && order.id || '') === id);
       if(!candidate) return;
@@ -40549,7 +40654,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!cloud || typeof cloud.verifyOne !== 'function') return;
       try{
         const result = await cloud.verifyOne(candidate);
-        if(!result || !result.order) throw new Error('서버에서 이 주문을 미처리 상태로 확인하지 못했습니다.');
+        if(!current()) return;
+        if(!result || !result.order || String(result.order.id || '') !== id || String(result.order.businessDate || '') !== dateKey) throw new Error('서버에서 이 주문을 미처리 상태로 확인하지 못했습니다.');
+        carryoverLocalOrderIds.add(id);
+        localStorage.setItem(ORDER_CARRYOVER_LOCAL_KEY, JSON.stringify(Array.from(carryoverLocalOrderIds)));
+        carryoverApprovalSessionKey = sessionKey;
+        carryoverApprovalDate = dateKey;
         state.carryoverApprovedOrderIds = Array.from(new Set([...(Array.isArray(state.carryoverApprovedOrderIds) ? state.carryoverApprovedOrderIds : []), id]));
         if(window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
           window.HaetsalOrderLiveQueue.receiveLiveOrderDocs([result.payload || { order:result.order, isOpen:true }], '관리자 확인 이전 날짜 미처리 주문');
@@ -40557,22 +40667,24 @@ body.mobile-tablet-device .pos-keyboard-btn{
         state.carryoverOrderCandidates = state.carryoverOrderCandidates.filter(order => String(order && order.id || '') !== id);
         render();
       }catch(error){
-        showMessage(String(error && error.message || error));
+        if(current()) showMessage(String(error && error.message || error));
       }
     }
 
     function renderCarryoverOrderRecoverySection(){
       const rows = Array.isArray(state.carryoverOrderCandidates) ? state.carryoverOrderCandidates : [];
+      const manager = state.appRole === 'MANAGER';
+      const dateKey = manager ? state.productionQueueDate : state.carryoverOrderDate;
       return `
-        <details class="hint-box" style="margin-bottom:14px">
+        <details class="hint-box" data-carryover-order-panel="true" ${state.carryoverOrderPanelOpen ? 'open' : ''} style="margin-bottom:14px">
           <summary style="cursor:pointer;list-style:none"><div><div style="font-weight:900">이전 날짜 미처리 주문 확인</div><div class="table-sub">선택한 날짜의 열린 주문을 완료·취소 기록과 대조한 뒤 선택한 주문만 처리 목록에 표시합니다.</div></div></summary>
           <div style="display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap;margin-top:10px">
-            <input id="carryoverOrderDate" class="input" type="date" max="${escapeHtml(getYesterdayDateKey())}" value="${escapeHtml(state.carryoverOrderDate || getYesterdayDateKey())}" style="max-width:180px;background:#fff">
-            <button class="btn btn-outline" data-action="load-carryover-orders" ${state.carryoverOrderLoading ? 'disabled' : ''}>${state.carryoverOrderLoading ? '확인 중' : '미처리 후보 확인'}</button>
+            <input id="carryoverOrderDate" aria-label="제작대기 날짜" class="input" type="date" max="${escapeHtml(manager ? todayYmd() : getYesterdayDateKey())}" value="${escapeHtml(dateKey || (manager ? todayYmd() : getYesterdayDateKey()))}" style="max-width:180px;background:#fff">
+            ${!manager || dateKey < todayYmd() ? `<button class="btn btn-outline" data-action="load-carryover-orders" ${state.carryoverOrderLoading ? 'disabled' : ''}>${state.carryoverOrderLoading ? '확인 중' : '미처리 후보 확인'}</button>` : ''}
           </div>
           ${state.carryoverOrderScannedCount ? `<div class="table-sub" style="margin-top:8px">확인 ${Number(state.carryoverOrderScannedCount)}건 · 미처리 후보 ${rows.length}건</div>` : ''}
           ${state.carryoverOrderError ? `<div class="help-note" style="margin-top:10px">${escapeHtml(state.carryoverOrderError)}</div>` : ''}
-          ${rows.length ? `<div class="list-stack" style="margin-top:10px">${rows.map(order => `<div class="done-item"><div class="done-left"><div class="done-main"><div class="name">${escapeHtml(order.userNameDisplay || order.userName || '사용자 확인 필요')}</div><div class="sub">${escapeHtml(getOrderBusinessDateKey(order))} · #${escapeHtml(String(order.orderNumber || order.seq || '-'))} · ${Number(getOrderTotalQuantity(order) || 0)}잔</div><div style="margin-top:6px">${renderOrderItemLines(order)}</div></div></div><button class="btn btn-primary" data-action="approve-carryover-order" data-order-id="${escapeHtml(order.id)}">처리 목록에 표시</button></div>`).join('')}</div>` : (!state.carryoverOrderLoading ? '<div class="table-sub" style="margin-top:10px">확인된 후보가 없습니다.</div>' : '')}
+          ${rows.length ? `<div class="list-stack" style="margin-top:10px">${rows.map(order => `<div class="done-item"><div class="done-left"><div class="done-main"><div class="name">${escapeHtml(order.userNameDisplay || order.userName || '사용자 확인 필요')}</div><div class="sub">${escapeHtml(getOrderBusinessDateKey(order))} · #${escapeHtml(String(order.orderNumber || order.seq || '-'))} · ${Number(getOrderTotalQuantity(order) || 0)}잔</div><div style="margin-top:6px">${renderOrderItemLines(order)}</div></div></div><button class="btn btn-primary" data-action="approve-carryover-order" data-order-id="${escapeHtml(order.id)}">처리 목록에 표시</button></div>`).join('')}</div>` : (!state.carryoverOrderLoading && (!manager || dateKey < todayYmd()) ? '<div class="table-sub" style="margin-top:10px">확인된 후보가 없습니다.</div>' : '')}
           ${state.carryoverOrderHasMore ? `<button class="btn btn-outline" style="width:100%;margin-top:10px" data-action="load-more-carryover-orders" ${state.carryoverOrderLoading ? 'disabled' : ''}>다음 20건 확인</button>` : ''}
         </details>
       `;
@@ -41298,7 +41410,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       ensureDashboardRuntimeDefaults();
       if(state.appRole !== 'ADMIN' && state.dashboardTab === 'STABILITY') state.dashboardTab = 'ORDERS';
       const dashboardOrders = getSafeOrders();
-      const activeOrders = dashboardOrders.filter(order => shouldIncludeOrderInCurrentDayProductionQueue(order)).sort((a,b) => new Date(orderTimestamp(a)) - new Date(orderTimestamp(b)));
+      const activeOrders = dashboardOrders.filter(order => shouldIncludeOrderInCurrentDayProductionQueue(order))
+        .filter(order => state.appRole !== 'MANAGER' || isOrderForSelectedProductionDate(order, state.productionQueueDate || todayYmd())).sort((a,b) => new Date(orderTimestamp(a)) - new Date(orderTimestamp(b)));
       const productionPendingOrders = activeOrders.filter(order => shouldShowOrderInProductionQueue(order));
       const measurePendingOrders = activeOrders.filter(order => isOrderMeasureQueueStage(order));
       const deliveryPendingOrders = getOpenDeliveryOrdersForDashboard();
@@ -41442,7 +41555,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
                 <div class="main-col">
                   ${renderHistoricalCompletionPanel()}
-                  ${isHistoricalCompletionAdminAuthorized() ? renderCarryoverOrderRecoverySection() : ''}
+                  ${isCarryoverOrderAuthorized() && activeOrderFilter !== 'DELIVERY' ? renderCarryoverOrderRecoverySection() : ''}
                   <div class="main-card">
                     <div class="section-head order-queue-head">
                       <h2>${activeOrderFilter === 'DELIVERY' ? '🚚 배달 현황' : '🔔 제작 대기중'} <span class="pill rose">${visibleActiveOrders.length}건</span></h2>
@@ -43759,6 +43872,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('toggle', (event) => {
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
+      if(t && t.dataset && t.dataset.carryoverOrderPanel === 'true') state.carryoverOrderPanelOpen = !!t.open;
       if(t && t.dataset && t.dataset.completedOrderRecoveryPanel === 'true'){
         state.completedOrderRecoveryPanelOpen = !!t.open;
       }
@@ -43819,7 +43933,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(t.id === 'warningTimeSelect'){ updateSysSettings({ warningTime: Number(t.value) || 15 }); return; }
       if(t.id === 'orderCompleteAutoReturnSecondsSelect'){ updateSysSettings({ orderCompleteAutoReturnSeconds: Number(t.value) || 15 }); return; }
       if(t.id === 'completedFilterDate'){ state.completedFilterDate = t.value || getTodayString(); state.completedFilterDateUserSelected = true; state.completedVisibleCount = 10; loadArchivedCompletedOrdersForDate(state.completedFilterDate, { renderBefore:true }); return; }
-      if(t.id === 'carryoverOrderDate'){ state.carryoverOrderDate = t.value || getYesterdayDateKey(); state.carryoverOrderCandidates = []; state.carryoverOrderError = ''; state.carryoverOrderCursor = ''; state.carryoverOrderHasMore = false; state.carryoverOrderScannedCount = 0; state.carryoverOrderBlockedCount = 0; return; }
+      if(t.id === 'carryoverOrderDate'){
+        const dateKey = t.value || (state.appRole === 'MANAGER' ? todayYmd() : getYesterdayDateKey());
+        resetCarryoverOrderScope();
+        state.carryoverOrderDate = dateKey;
+        if(state.appRole === 'MANAGER') state.productionQueueDate = dateKey;
+        render();
+        return;
+      }
       if(t.id === 'completedOrderRecoveryDate'){ state.completedOrderRecoveryDate = t.value || getTodayString(); clearCompletedOrderRecoveryPreviewState(); render(); return; }
       if(t.dataset && t.dataset.completedOrderRecoveryId){ toggleCompletedOrderRecoverySelection(t.dataset.completedOrderRecoveryId, t.checked); return; }
       if(t.dataset && t.dataset.historicalCompletionId){ toggleHistoricalCompletionSelection(t.dataset.historicalCompletionId, t.checked); return; }
@@ -46257,6 +46378,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       state,
       render,
       refreshFromShared,
+      // Cloud truth is independent of local carryover detach provenance.
+      canAcceptCloudOrder:isServerSafeOpenOrder,
+      canAcceptCarryoverProductionOrder:function(order){
+        return isServerSafeOpenOrder(order) && shouldShowOrderInProductionQueue(order);
+      },
       canAcceptProductionOrder:function(order){
         return shouldIncludeOrderInProductionQueue(order);
       },
@@ -46310,6 +46436,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       receiveRevivedOrderGuards,
       retryRevivedOrderGuardSaves:retryRevivedOrderGuardCloudSaves,
       runRevivedOrderSafetySweep,
+      resetCarryoverOrderScope,
+      syncCarryoverOrderScope,
       retryCompletionRequests:retryCompletionRequestQueue,
       retryStageTransitions:retryOrderStageTransitionQueue,
       openDashboard: function(role, initialTab){
@@ -60378,8 +60506,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         if(entry.released) return null;
         if(!verified || entry.failed) return null;
         return !!(window.OrderModule
-          && typeof window.OrderModule.canAcceptProductionOrder === 'function'
-          && window.OrderModule.canAcceptProductionOrder(order));
+          && typeof window.OrderModule.canAcceptCloudOrder === 'function'
+          && window.OrderModule.canAcceptCloudOrder(order));
       });
     }
 
@@ -60560,7 +60688,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         return { allowed:false, reason:'완료 문서 또는 처리 요청 기록이 확인되었습니다.' };
       }
       const data = payload && typeof payload === 'object' ? payload : {};
-      if(data.isOpen !== true || isClosedLiveOrderPayload(data)){
+      if(data.isOpen !== true || data.isRevivedQuarantined === true || order.isRevivedQuarantined === true
+        || isClosedLiveOrderPayload(data) || !window.OrderModule.canAcceptCarryoverProductionOrder(order)){
         return { allowed:false, reason:'현재 열린 주문이 아닙니다.' };
       }
       return { allowed:true };
@@ -61252,6 +61381,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     function getRealtimeScopeState(){
+      if(window.OrderModule && window.OrderModule.syncCarryoverOrderScope) window.OrderModule.syncCarryoverOrderScope();
       const orderScreen = document.getElementById('order-screen');
       const orderRoute = !!(orderScreen && orderScreen.classList.contains('active'));
       const orderState = window.OrderModule && window.OrderModule.state ? window.OrderModule.state : null;
