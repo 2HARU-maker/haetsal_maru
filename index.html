@@ -13705,6 +13705,8 @@ window.HaetsalSharedStore = (function(){
         userCouponArchivedOrdersByUserId: {},
         userCouponArchivedLogsByUserId: {},
         userCouponHistoryLoadStateByUserId: {},
+        userCouponHistoryPageStateByUserId: {},
+        userCouponHistoryGeneration: 0,
         userRecentCouponHistoryLoadStateByUserId: {},
         userCouponIdentityWarningsByUserId: {},
         editingUserId: null,
@@ -15735,37 +15737,56 @@ window.HaetsalSharedStore = (function(){
       const targetUserId = String(userId || '').trim();
       if(!targetUserId) return false;
       const opts = options || {};
+      const paginated = opts.paginate === true;
+      const getSessionKey = () => String(state.userCouponHistoryGeneration || 0) + ':' + String(state.appRole || '') + ':' + String(window.firebaseAuthUser && window.firebaseAuthUser.uid || '');
+      const sessionKey = getSessionKey();
       state.userCouponHistoryLoadStateByUserId = state.userCouponHistoryLoadStateByUserId || {};
-      const previous = state.userCouponHistoryLoadStateByUserId[targetUserId] || {};
+      state.userCouponHistoryPageStateByUserId = state.userCouponHistoryPageStateByUserId || {};
+      const loadStates = paginated ? state.userCouponHistoryPageStateByUserId : state.userCouponHistoryLoadStateByUserId;
+      const stored = loadStates[targetUserId] || {};
+      const previous = paginated && stored.sessionKey !== sessionKey ? {} : stored;
       const previousLoadedAt = Number(previous.loadedAt || 0);
       if(previous.loading) return false;
+      const append = paginated && opts.nextPage === true && !!previousLoadedAt;
+      if(append && !previous.hasMore) return true;
       const cacheMs = opts.force ? ORDER_USER_COUPON_HISTORY_FORCE_CACHE_MS : ORDER_USER_COUPON_HISTORY_CACHE_MS;
-      if(previousLoadedAt && Date.now() - previousLoadedAt < cacheMs){
+      if(previousLoadedAt && (paginated ? !opts.nextPage : Date.now() - previousLoadedAt < cacheMs)){
         if(opts.renderAfter){
           try{ render(); }catch(error){ console.warn('쿠폰 전체 기록 캐시 화면 갱신 실패', error); }
         }
         return true;
       }
-      state.userCouponHistoryLoadStateByUserId[targetUserId] = { loading:true, loadedAt:previousLoadedAt, error:'' };
+      const requestState = { ...previous, loading:true, loadedAt:previousLoadedAt, error:'', sessionKey };
+      loadStates[targetUserId] = requestState;
+      const isCurrentRequest = () => {
+        if(!paginated) return true;
+        const historyOrder = getOrderById(state.currentOrderId);
+        const activeUserId = String(state.historyUserId || (state.ocShowHistory && ((historyOrder && historyOrder.userId) || state.selectedUserId)) || '');
+        return loadStates === state.userCouponHistoryPageStateByUserId && loadStates[targetUserId] === requestState && getSessionKey() === sessionKey && activeUserId === targetUserId;
+      };
       try{
         const targetUser = getUserById(targetUserId);
         const targetUserName = String((targetUser && targetUser.name) || '').trim();
         const targetUserNameKey = normalizeCouponIdentityText(targetUserName);
         const needsIdentityCheck = !!(targetUserNameKey && (Array.isArray(state.users) ? state.users : []).filter(user => normalizeCouponIdentityText(user && user.name) === targetUserNameKey).length > 1);
         const cloud = getCouponEventCloudStore();
-        const cloudPromise = cloud && typeof cloud.readRecords === 'function'
-          ? cloud.readRecords({ userId:targetUserId, reason:'user-coupon-history' })
-          : Promise.resolve({ records:[] });
-        const identityCloudPromise = needsIdentityCheck && cloud && typeof cloud.readRecords === 'function'
+        const cloudPromise = paginated
+          ? (cloud && typeof cloud.readPage === 'function'
+              ? cloud.readPage({ userId:targetUserId, cursor:append ? previous.nextCursor : null, reason:'user-coupon-history-page' })
+              : Promise.reject(new Error('쿠폰 개별 기록 조회 모듈이 아직 준비되지 않았습니다.')))
+          : (cloud && typeof cloud.readRecords === 'function'
+              ? cloud.readRecords({ userId:targetUserId, reason:'user-coupon-history' })
+              : Promise.resolve({ records:[] }));
+        const identityCloudPromise = !paginated && needsIdentityCheck && cloud && typeof cloud.readRecords === 'function'
           ? cloud.readRecords({ userName:targetUserName, reason:'user-coupon-identity-check' })
           : Promise.resolve({ records:[] });
-        const completedPromise = window.HaetsalCompletedOrderDocs && typeof window.HaetsalCompletedOrderDocs.readByUserId === 'function'
+        const completedPromise = !append && window.HaetsalCompletedOrderDocs && typeof window.HaetsalCompletedOrderDocs.readByUserId === 'function'
           ? window.HaetsalCompletedOrderDocs.readByUserId(targetUserId)
           : Promise.resolve({ payloads:[] });
-        const identityCompletedPromise = needsIdentityCheck && window.HaetsalCompletedOrderDocs && typeof window.HaetsalCompletedOrderDocs.readByUserName === 'function'
+        const identityCompletedPromise = !paginated && needsIdentityCheck && window.HaetsalCompletedOrderDocs && typeof window.HaetsalCompletedOrderDocs.readByUserName === 'function'
           ? window.HaetsalCompletedOrderDocs.readByUserName(targetUserName)
           : Promise.resolve({ payloads:[] });
-        const archivedLogsPromise = loadArchivedCouponLogs(ORDER_EMERGENCY_CLEANUP_MIN_DATE, getTodayString())
+        const archivedLogsPromise = append ? Promise.resolve([]) : loadArchivedCouponLogs(ORDER_EMERGENCY_CLEANUP_MIN_DATE, getTodayString())
           .catch(error => {
             console.warn('사용자 쿠폰 기록용 월별 로그 불러오기 실패', error);
             return loadLocalArchivedCouponLogs(ORDER_EMERGENCY_CLEANUP_MIN_DATE, getTodayString());
@@ -15777,7 +15798,11 @@ window.HaetsalSharedStore = (function(){
           identityCompletedPromise,
           archivedLogsPromise
         ]);
-        const cloudRecords = mergeCouponHistoryRecords(Array.isArray(cloudResult && cloudResult.records) ? cloudResult.records : [])
+        if(!isCurrentRequest()){
+          if(loadStates[targetUserId] === requestState) loadStates[targetUserId] = { ...previous, loading:false };
+          return false;
+        }
+        const cloudRecords = mergeCouponHistoryRecords(paginated ? getUserCouponCloudRecords(targetUserId) : [], Array.isArray(cloudResult && cloudResult.records) ? cloudResult.records : [])
           .filter(record => String(record.userId || '') === targetUserId);
         const archivedOrders = (Array.isArray(completedResult && completedResult.payloads) ? completedResult.payloads : [])
           .map(payload => normalizeArchivedCompletedPayloadToOrder(payload, '보관 완료문서'))
@@ -15822,14 +15847,21 @@ window.HaetsalSharedStore = (function(){
           scheduleCouponEventRetryFlush(ORDER_COUPON_EVENT_RETRY_DELAY_MS);
         }
 
-        state.userCouponHistoryLoadStateByUserId[targetUserId] = { loading:false, loadedAt:Date.now(), error:'' };
+        loadStates[targetUserId] = {
+          loading:false, loadedAt:Date.now(), error:'', sessionKey,
+          ...(paginated ? { nextCursor:cloudResult.nextCursor, hasMore:cloudResult.hasMore === true } : {})
+        };
         if(opts.renderAfter){
-          try{ render(); }catch(error){ console.warn('쿠폰 전체 기록 불러오기 후 화면 갱신 실패', error); }
+          try{ if(paginated) requestOrderScrollRestore(); render(); }catch(error){ console.warn('쿠폰 전체 기록 불러오기 후 화면 갱신 실패', error); }
         }
         return true;
       }catch(error){
+        if(!isCurrentRequest()){
+          if(loadStates[targetUserId] === requestState) loadStates[targetUserId] = { ...previous, loading:false };
+          return false;
+        }
         console.warn('사용자 쿠폰 전체 기록 불러오기 실패', error);
-        state.userCouponHistoryLoadStateByUserId[targetUserId] = { loading:false, loadedAt:0, error:String(error && error.message || error || '') };
+        loadStates[targetUserId] = { ...previous, loading:false, loadedAt:previousLoadedAt, error:String(error && error.message || error || ''), sessionKey };
         return false;
       }
     }
@@ -36639,20 +36671,34 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return Array.from(recordsByKey.values()).sort(compareCouponHistoryRecordsByTimeDesc);
     }
 
-    function getUserCouponLedgerDisplayRecords(userId, limitCount){
+    function getUserCouponLedgerDisplayRecords(userId, limitCount, fullCouponHistory){
       const targetUserId = String(userId || '');
       const records = buildCouponLedgerDisplayRecords(
         getCouponHistoryOrdersForUser(targetUserId),
         getCouponHistoryLogsForUser(targetUserId),
         targetUserId
       ).filter(record => String(record.userId || '') === targetUserId);
+      if(fullCouponHistory){
+        const tiedCouponRows = new Map();
+        records.forEach((record, index) => {
+          if(!String(record.docId || '').startsWith('coupon_event_')) return;
+          const time = getCouponHistorySortTime(record);
+          if(time === null) return;
+          if(!tiedCouponRows.has(time)) tiedCouponRows.set(time, []);
+          tiedCouponRows.get(time).push({ record, index });
+        });
+        tiedCouponRows.forEach(rows => {
+          const sorted = rows.map(row => row.record).sort((a, b) => a.docId < b.docId ? 1 : a.docId > b.docId ? -1 : 0);
+          rows.forEach((row, index) => { records[row.index] = sorted[index]; });
+        });
+      }
       return typeof limitCount === 'number' ? records.slice(0, limitCount) : records;
     }
 
     function renderUserCouponLedgerPanel(user, limitCount, options){
       if(!user) return '';
       const opts = options || {};
-      const records = getUserCouponLedgerDisplayRecords(user.id, limitCount);
+      const records = getUserCouponLedgerDisplayRecords(user.id, limitCount, opts.fullCouponHistory);
       const title = opts.title || '최근 쿠폰 변동 내역';
       const limitLabel = typeof limitCount === 'number' && limitCount > 0 ? `최근 ${limitCount}건` : '전체 내역';
       const panelHtml = `
@@ -38169,7 +38215,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       };
     }
 
-    function getCombinedHistory(userId, limitCount){
+    function getCombinedHistory(userId, limitCount, fullCouponHistory){
       const targetUserId = String(userId || '');
       const sourceOrders = getCouponHistoryOrdersForUser(targetUserId);
       const orderItems = sourceOrders
@@ -38198,6 +38244,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const latestTimelineResult = getLatestCouponRecalcTimelineResult(targetUserId, record.id);
           return {
           id: record.id,
+          docId: record.docId,
           userId: record.userId,
           type: record.type,
           timestamp: new Date(record.timestamp),
@@ -38262,6 +38309,20 @@ body.mobile-tablet-device .pos-keyboard-btn{
         ...visibleCouponItems,
         ...renameItems
       ].sort(compareCombinedHistoryItemsByTimeDesc);
+      if(fullCouponHistory){
+        const tiedCouponRows = new Map();
+        items.forEach((item, index) => {
+          if(!String(item.docId || '').startsWith('coupon_event_')) return;
+          const time = getCombinedHistoryItemTime(item);
+          if(time === null) return;
+          if(!tiedCouponRows.has(time)) tiedCouponRows.set(time, []);
+          tiedCouponRows.get(time).push({ item, index });
+        });
+        tiedCouponRows.forEach(rows => {
+          const sorted = rows.map(row => row.item).sort((a, b) => a.docId < b.docId ? 1 : a.docId > b.docId ? -1 : 0);
+          rows.forEach((row, index) => { items[row.index] = sorted[index]; });
+        });
+      }
       return typeof limitCount === 'number' ? items.slice(0, limitCount) : items;
     }
 
@@ -38790,6 +38851,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     async function handleDashboardLogout(){
+      state.userCouponHistoryGeneration = Number(state.userCouponHistoryGeneration || 0) + 1;
+      state.userCouponHistoryPageStateByUserId = {};
       resetCarryoverOrderScope(true);
       const wasAdmin = state.appRole === 'ADMIN'
         || (window.HaetsalOperatorSession && window.HaetsalOperatorSession.getRole() === 'ADMIN');
@@ -43008,11 +43071,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(state.ocShowHistory){
         const order = getOrderById(state.currentOrderId);
         const historyUserId = order ? order.userId : state.selectedUserId;
-        const fullHistory = historyUserId ? getCombinedHistory(historyUserId) : [];
+        const fullHistory = historyUserId ? getCombinedHistory(historyUserId, undefined, true) : [];
         const visibleCount = Math.max(5, Number(state.ownHistoryVisibleCount || 5));
         const history = fullHistory.slice(0, visibleCount);
-        const historyLoadState = historyUserId && state.userCouponHistoryLoadStateByUserId
-          ? (state.userCouponHistoryLoadStateByUserId[String(historyUserId)] || {})
+        const historyLoadState = historyUserId && state.userCouponHistoryPageStateByUserId
+          ? (state.userCouponHistoryPageStateByUserId[String(historyUserId)] || {})
           : {};
         const detailOrder = state.ownHistoryDetailOrderId
           ? getOwnHistoryDetailOrder(historyUserId, state.ownHistoryDetailOrderId)
@@ -43037,7 +43100,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
               </div>
             `).join('')}
           </div>
-          ${history.length < fullHistory.length ? `<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="show-more-own-history">이전 기록 15건 더보기</button>` : (history.length ? '<div class="center muted" style="padding:12px 4px 0;font-size:12px;font-weight:800">전체 기록을 모두 불러왔습니다.</div>' : '')}
+          ${history.length < fullHistory.length || historyLoadState.hasMore ? `<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="show-more-own-history" ${historyLoadState.loading ? 'disabled' : ''}>이전 기록 15건 더보기</button>` : (history.length ? '<div class="center muted" style="padding:12px 4px 0;font-size:12px;font-weight:800">전체 기록을 모두 불러왔습니다.</div>' : '')}
           `}
         `, 'large tall');
       }
@@ -43112,14 +43175,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
       if(state.historyUserId){
         const user = getUserById(state.historyUserId);
-        const history = user ? getCombinedHistory(user.id) : [];
+        const history = user ? getCombinedHistory(user.id, undefined, true).filter(item => !String(item.type || '').startsWith('COUPON_')) : [];
         const historyDetailOrder = user && state.adminHistoryDetailOrderId ? getOwnHistoryDetailOrder(user.id, state.adminHistoryDetailOrderId) : null;
+        const historyPageState = state.userCouponHistoryPageStateByUserId[String(state.historyUserId)] || {};
         html += modalShell(`
           <div class="modal-head"><h3>🕒 사용자 기록</h3><button class="modal-close" data-action="close-user-history">❌</button></div>
           ${!user ? `<div class="center muted" style="padding:30px 10px">사용자를 찾을 수 없습니다.</div>` : `
             <div class="help-note" style="margin-bottom:12px">${escapeHtml(user.name)}${user.dept ? ` (${escapeHtml(user.dept)})` : ''} 사용자의 주문 및 쿠폰 기록입니다.</div>
             ${historyDetailOrder ? `${renderOwnHistoryOrderDetail(historyDetailOrder)}<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="close-admin-history-order-detail">전체 기록으로 돌아가기</button>` : `
-            ${renderUserCouponLedgerPanel(user, undefined, { title:'전체 쿠폰 변동 내역', tall:true })}
+            ${renderUserCouponLedgerPanel(user, undefined, { title:'전체 쿠폰 변동 내역', tall:true, fullCouponHistory:true })}
             <div class="history-list">
               ${history.length === 0 ? `<div class="center muted" style="padding:30px 10px">기록이 없습니다.</div>` : history.map(item => `
                 <div class="history-item">
@@ -43135,6 +43199,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
                 </div>
               `).join('')}
             </div>
+            ${historyPageState.hasMore ? `<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="show-more-own-history" ${historyPageState.loading ? 'disabled' : ''}>이전 기록 15건 더보기</button>` : ''}
             `}
           `}
         `, 'large tall');
@@ -45315,12 +45380,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const historyOrder = getOrderById(state.currentOrderId);
         const historyUserId = String((historyOrder && historyOrder.userId) || state.selectedUserId || '').trim();
         if(historyUserId){
-          hydrateUserCouponHistorySources(historyUserId, { renderAfter:true, backfill:false }).catch(error => {
+          hydrateUserCouponHistorySources(historyUserId, { renderAfter:true, backfill:false, paginate:true }).catch(error => {
             console.warn('사용자 과거 기록 불러오기 실패', error);
           });
         }
       }
       else if(action === 'show-more-own-history'){
+        const historyOrder = getOrderById(state.currentOrderId);
+        const historyUserId = String(state.historyUserId || (historyOrder && historyOrder.userId) || state.selectedUserId || '');
+        const pageState = state.userCouponHistoryPageStateByUserId[historyUserId] || {};
+        if(pageState.loading) return;
         const modal = btn.closest('.modal');
         const previousScrollTop = modal ? modal.scrollTop : 0;
         state.ownHistoryVisibleCount = Math.max(5, Number(state.ownHistoryVisibleCount || 5)) + 15;
@@ -45330,6 +45399,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
           const nextModal = app.querySelector('.modal-backdrop .modal');
           if(nextModal) nextModal.scrollTop = previousScrollTop;
         });
+        if(pageState.hasMore && (state.historyUserId || state.ownHistoryVisibleCount > getCombinedHistory(historyUserId).length)){
+          hydrateUserCouponHistorySources(historyUserId, { renderAfter:true, backfill:false, paginate:true, nextPage:true });
+        }
       }
       else if(action === 'open-own-history-detail'){
         const modal = btn.closest('.modal');
@@ -45994,7 +46066,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         state.historyUserId = btn.dataset.userId;
         render();
         hydrateOfflineCouponUseCloudRecords('offline-coupon-use-user-history-open', { renderAfter:true });
-        hydrateUserCouponHistorySources(btn.dataset.userId, { renderAfter:true, backfill:false, force:true });
+        hydrateUserCouponHistorySources(btn.dataset.userId, { renderAfter:true, backfill:false, paginate:true });
         hydrateLatestCouponRecalcForUser(btn.dataset.userId, { renderAfter:true, force:true });
       }
       else if(action === 'close-user-history'){
@@ -50880,7 +50952,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-app.js";
   import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence, getIdTokenResult } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
-  import { getFirestore, doc, collection, onSnapshot, setDoc, getDoc, getDocFromServer, getDocs, getDocsFromServer, query, where, orderBy, limit, documentId, runTransaction, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
+  import { getFirestore, doc, collection, onSnapshot, setDoc, getDoc, getDocFromServer, getDocs, getDocsFromServer, query, where, orderBy, limit, startAfter, documentId, runTransaction, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBfEwPirSANZ2s7CzRvlUeFDnYNxWITuew",
@@ -52275,6 +52347,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         couponPrepared = prepareVersionedCouponMutation(unwrapCouponRecalcDocData(sharedSnapshot), couponMutation);
       }
       const built = buildPayloadWithServerOrderTimes(finalPayload, 'updated');
+      if(couponPrepared){
+        Object.assign(built.data.order, {
+          remainingCoupons:couponPrepared.nextUser.coupons,
+          couponBalanceVersion:couponPrepared.nextUser.couponBalanceVersion,
+          couponsUpdatedAt:couponPrepared.nextUser.couponsUpdatedAt,
+          lastRecalcRunId:couponPrepared.nextUser.lastRecalcRunId
+        });
+      }
       if(!existing.orderCancelledAtServer){
         built.orderProcessedAtServer = serverTimestamp();
         built.orderCancelledAtServer = serverTimestamp();
@@ -56440,6 +56520,27 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return { records, count:records.length, reason:String(opts.reason || 'coupon-event-cloud-read') };
   }
 
+  async function readCouponEventCloudPage(options){
+    const opts = options || {};
+    const userId = String(opts.userId || '').trim();
+    if(!userId) return { records:[], rows:[], count:0, nextCursor:null, hasMore:false };
+    const pageSize = 15;
+    await runArchiveCloudPromiseWithTimeout(firebaseReadyPromise, ORDER_ARCHIVE_CLOUD_READY_TIMEOUT_MS, 'Firebase 준비 확인 시간이 초과되었습니다.');
+    const constraints = [where('data.userId', '==', userId), where('data.payloadKind', '==', 'coupon-event'), orderBy('data.timestamp', 'desc'), orderBy(documentId(), 'desc')];
+    if(opts.cursor) constraints.push(startAfter(opts.cursor.timestamp, opts.cursor.id));
+    const q = query(combinedAppCollectionRef, ...constraints, limit(pageSize + 1));
+    const snap = await runArchiveCloudPromiseWithTimeout(opts.serverOnly === true ? getDocsFromServer(q) : getDocs(q), ORDER_ARCHIVE_CLOUD_READ_TIMEOUT_MS, '쿠폰 개별 기록 조회 시간이 초과되었습니다.');
+    const docs = snap.docs.slice(0, pageSize);
+    const records = docs.map(normalizeCouponEventCloudPayload).filter(record => record && String(record.userId || '') === userId);
+    const last = docs[docs.length - 1];
+    return {
+      records, rows:records, count:records.length, readCount:snap.size,
+      nextCursor:last ? { timestamp:last.get('data.timestamp'), id:last.id } : null,
+      hasMore:snap.docs.length > pageSize,
+      reason:String(opts.reason || 'coupon-event-cloud-page')
+    };
+  }
+
   async function readRecentCouponEventCloudRecords(options){
     const opts = options || {};
     const userId = String(opts.userId || '').trim();
@@ -56510,6 +56611,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     saveRecordsAtomic: saveCouponEventCloudRecordsAtomically,
     saveRecoveryConflict: saveCouponRecoveryConflictAtomically,
     readRecords: readCouponEventCloudRecords,
+    readPage: readCouponEventCloudPage,
     readRecentRecords: readRecentCouponEventCloudRecords,
     readRecordsByDateRange: readCouponEventCloudRecordsByDateRange
   };
