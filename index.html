@@ -33544,7 +33544,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         .catch(error => {
           console.error('order cancelled followup save failed', error);
         });
-      saveData({ reason:'order-cancelled', allowFullBackup:false });
+      saveData({ reason:'order-cancelled', allowFullBackup:false, skipLiveOrderPersistence:true });
       state.showCancelOrderModal = false;
       state.cancelOrderTargetId = null;
       state.cancelOrderReason = '';
