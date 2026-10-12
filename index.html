@@ -33630,8 +33630,6 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return index > -1 && index < 5;
     }
 
-    const ORDER_EDIT_MEMO_ONLY_MESSAGE = '현재는 주문 메모만 수정할 수 있습니다. 메뉴·수량·옵션·컵·배달 정보 변경은 쿠폰 잔액 전환과 안전검증 후 다시 제공됩니다.';
-
     function getOrderEditComparableSnapshot(editData){
       const source = editData && typeof editData === 'object' ? editData : {};
       return JSON.stringify({
@@ -33732,6 +33730,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.editOrderOperationStartedAt = '';
       state.editOrderSaveInFlight = false;
       orderEditInputIsComposing = false;
+      state.editOrderAwaitingConfirmation = false;
       deferredOrderSearchRemoteRender = false;
       clearOrderEditValidation();
     }
@@ -33781,13 +33780,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.editOrderBaseVersion = {
         editedAt:String(order.editedAt || ''),
         statusRevision:Number(order.statusRevision || 1),
-        stageRevision:Number(order.stageRevision || 1)
+        stageRevision:Number(order.stageRevision || 1),
+        productionCycle:Number(order.productionCycle || 1)
       };
       state.editOrderOperationId = '';
       state.editOrderOperationStartedAt = '';
       state.editOrderSaveInFlight = false;
       clearOrderEditValidation();
       requestOrderScrollRestore();
+      state.editOrderAwaitingConfirmation = false;
       render();
     }
 
@@ -33829,6 +33830,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
           shotCount: normalizeShotCount(item && item.shotCount, item && item.defaultShotCount),
           shotCountTouched: isOrderItemShotCountTouched(item),
           shotMenuName: String((item && item.shotMenuName) || ''),
+          couponPolicyVersion:Number((item && item.couponPolicyVersion) || 0),
+          couponMenuNameSnapshot:String((item && item.couponMenuNameSnapshot) || ''),
+          usesMilkSnapshot:!!(item && item.usesMilkSnapshot === true),
+          couponCostPerCup:Number((item && item.couponCostPerCup) || 0),
+          couponCostTotal:Number((item && item.couponCostTotal) || 0),
           groupedCupSelection: Math.max(1, Number((item && item.quantity) || 1)) > 1 || !!(item && item.groupedCupSelection),
           ...normalizeOrderTumblerAssignment(item)
         };
@@ -34399,10 +34405,19 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const normalized = message.toLowerCase();
       if(normalized.includes('order-edit-live-order-changed')) return '다른 화면에서 주문 내용이 먼저 변경되었습니다. 최신 주문을 확인한 뒤 다시 수정해주세요.';
       if(normalized.includes('order-edit-order-closed')) return '이미 완료되었거나 취소된 주문은 수정할 수 없습니다.';
+      if(normalized.includes('order-edit-completion-in-progress')) return '완료 처리가 진행 중인 주문은 수정할 수 없습니다. 서버 반영 후 다시 확인해주세요.';
       if(normalized.includes('쿠폰 잔액 버전') || normalized.includes('coupon-version')) return '저장 직전에 쿠폰 잔액이 변경되었습니다. 최신 잔액을 확인한 뒤 다시 시도해주세요.';
       if(code.includes('permission-denied') || normalized.includes('permission')) return '주문 수정 권한을 확인하지 못했습니다. 적용된 Firestore 규칙을 확인해주세요.';
-      if(code.includes('unavailable') || code.includes('deadline-exceeded') || normalized.includes('network') || normalized.includes('offline')) return '네트워크 연결 문제로 주문을 저장하지 못했습니다. 연결을 확인한 뒤 다시 시도해주세요.';
+      if(isOrderEditResultUnconfirmed(error)) return '주문 수정 결과를 아직 확인하지 못했습니다. 연결이 복구되면 원래 내용을 유지한 상태로 수정 저장을 다시 눌러 확인해주세요.';
       return '주문 수정 내용을 서버에 저장하지 못했습니다. 잠시 후 다시 시도해주세요.';
+    }
+
+    function isOrderEditResultUnconfirmed(error){
+      const code = String(error && error.code || '').toLowerCase();
+      const message = String(error && error.message || error || '').toLowerCase();
+      return code.includes('unavailable') || code.includes('deadline-exceeded')
+        || message.includes('network') || message.includes('offline')
+        || message.includes('시간이 초과');
     }
 
     async function handleSaveOrderEdit(){
@@ -34417,24 +34432,20 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const user = getUserById(order.userId);
       if(!user){ showMessage('사용자를 찾을 수 없습니다.'); return; }
-      const initialEditData = getOrderEditInitialComparableData();
-      if(!initialEditData
-        || String(state.editOrderData.deliveryType || 'PICKUP').toUpperCase() !== String(initialEditData.deliveryType || 'PICKUP').toUpperCase()
-        || String(state.editOrderData.deliveryLocation || '').trim() !== String(initialEditData.deliveryLocation || '').trim()){
-        showOrderEditValidation(ORDER_EDIT_MEMO_ONLY_MESSAGE, '', -1);
-        return;
-      }
       ensureEditOrderItemsRuntime();
       autoAssignEditOrderItemTumblers();
 
-      const unconfirmedMenuIndex = state.editOrderData.items.findIndex(item => !isOrderItemMenuSelectionValid(item));
+      const initialEditData = getOrderEditInitialComparableData();
+      const preserveOrderItems = Array.isArray(order.items) && order.items.length > 0 && initialEditData
+        && JSON.stringify(state.editOrderData.items) === JSON.stringify(initialEditData.items);
+      const unconfirmedMenuIndex = preserveOrderItems ? -1 : state.editOrderData.items.findIndex(item => !isOrderItemMenuSelectionValid(item));
       if(unconfirmedMenuIndex >= 0){
         showOrderEditValidation('검색 결과에서 판매 중인 메뉴를 선택해주세요.', 'menu', unconfirmedMenuIndex);
         return;
       }
-      const newItems = normalizeOrderItemsForStorage(state.editOrderData.items);
+      const newItems = preserveOrderItems ? safeJsonClone(order.items) : normalizeOrderItemsForStorage(state.editOrderData.items);
       const usesNewCouponPolicy = Number(order.couponPolicyVersion || 0) >= ORDER_COUPON_POLICY_VERSION;
-      if(!usesNewCouponPolicy){
+      if(!usesNewCouponPolicy && !preserveOrderItems){
         newItems.forEach(item => {
           item.couponPolicyVersion = 1;
           item.couponMenuNameSnapshot = String(item.menuName || '');
@@ -34450,7 +34461,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         showOrderEditValidation(editRentOrderIssue, 'tumbler', tumblerItemIndex);
         return;
       }
-      const unavailableMenuIndex = newItems.findIndex(item => !!findUnavailableOrderMenu(item.menuName));
+      const unavailableMenuIndex = preserveOrderItems ? -1 : newItems.findIndex(item => !!findUnavailableOrderMenu(item.menuName));
       if(unavailableMenuIndex >= 0){
         const unavailableMenu = findUnavailableOrderMenu(newItems[unavailableMenuIndex].menuName);
         showOrderEditValidation(`${unavailableMenu.name} 메뉴는 현재 ${getMenuStatusLabel(unavailableMenu.status)} 상태입니다. 다른 메뉴를 선택해주세요.`, 'menu', unavailableMenuIndex);
@@ -34483,8 +34494,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const newQty = Number(getOrderTotalQuantityFromItems(newItems) || 1);
       const oldQty = Number(getOrderTotalQuantity(order) || order.quantity || 0);
       const diffQty = newQty - oldQty;
-      const newCouponCost = usesNewCouponPolicy ? Number(getOrderCouponCostFromItems(newItems) || 1) : newQty;
       const oldCouponCost = Number(getOrderCouponCost(order) || oldQty || 0);
+      const newCouponCost = preserveOrderItems ? oldCouponCost : usesNewCouponPolicy ? Number(getOrderCouponCostFromItems(newItems) || 1) : newQty;
       const diffCouponCost = newCouponCost - oldCouponCost;
       const couponDelta = -diffCouponCost;
       const oldDeliveryType = String(order.deliveryType || 'PICKUP').toUpperCase();
@@ -34549,6 +34560,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       state.editOrderSaveInFlight = true;
       clearOrderEditValidation();
       render();
+      let confirmedEditResult = null;
       try{
         const result = await cloud.editOrder({
           orderId:String(order.id || ''),
@@ -34558,18 +34570,19 @@ body.mobile-tablet-device .pos-keyboard-btn{
           baseEditedAt:String(state.editOrderBaseVersion && state.editOrderBaseVersion.editedAt || ''),
           baseStatusRevision:Number(state.editOrderBaseVersion && state.editOrderBaseVersion.statusRevision || 1),
           baseStageRevision:Number(state.editOrderBaseVersion && state.editOrderBaseVersion.stageRevision || 1),
+          baseProductionCycle:Number(state.editOrderBaseVersion && state.editOrderBaseVersion.productionCycle || 1),
           nextOrder,
           couponDelta,
           couponRecord:preparedEditCouponRecord,
           syncDelivery:oldDeliveryType === 'DELIVERY' || String(nextOrder.deliveryType || '').toUpperCase() === 'DELIVERY'
         });
         if(!(result && result.ok && result.order)) throw new Error('order-edit-transaction-result-invalid');
+        confirmedEditResult = result;
         if(result.couponUser) applyAuthoritativeCouponUser(user, result.couponUser);
         if(result.sharedData) applyAuthoritativeSharedCouponData(result);
         if(result.couponRecord) rememberCommittedCouponHistoryRecord(result.couponRecord);
         Object.assign(order, safeJsonClone(result.order));
         if(result.deliveryRecord) setLocalDeliveryRecord(result.deliveryRecord);
-        user.updatedAt = orderEditTimestamp;
         addAuditLog('ORDER_EDITED', {
           userId:order.userId,
           orderId:order.id,
@@ -34581,7 +34594,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           diffCouponCost,
           deliveryType:order.deliveryType || 'PICKUP'
         });
-        saveData({ reason:'order-edit-transaction-confirmed', allowFullBackup:false });
+        saveData({ reason:'order-edit-transaction-confirmed', allowFullBackup:false, saveShared:false, skipLiveOrderPersistence:true });
         saveOrderEditDiagnosticRecord({
           ...orderEditDiagnosticBase,
           status:result.idempotent ? 'saved-idempotent' : 'saved',
@@ -34597,9 +34610,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
         showMessage('주문이 수정되었습니다.');
       }catch(error){
         console.error('주문 수정 원자적 저장 실패', error);
+        const resultUnconfirmed = isOrderEditResultUnconfirmed(error);
         saveOrderEditDiagnosticRecord({
           ...orderEditDiagnosticBase,
-          status:'transaction-failed',
+          status:confirmedEditResult ? 'confirmed-local-followup-failed' : (resultUnconfirmed ? 'transaction-unconfirmed' : 'transaction-failed'),
           beforeEditCoupons,
           nextEditCoupons:predictedNextCoupons,
           couponBalanceOperationId:diffCouponCost !== 0 ? orderEditOperationId : '',
@@ -34607,7 +34621,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
           errorMessage:String(error && error.message || error || '')
         });
         state.editOrderSaveInFlight = false;
-        showOrderEditValidation(getOrderEditSaveErrorMessage(error), '', -1);
+        state.editOrderAwaitingConfirmation = !!confirmedEditResult || resultUnconfirmed;
+        showOrderEditValidation(confirmedEditResult
+          ? '서버의 주문 수정은 확정됐지만 화면 반영에 문제가 있습니다. 수정 저장을 다시 눌러 같은 결과를 확인해주세요.'
+          : getOrderEditSaveErrorMessage(error), '', -1);
       }
     }
 
@@ -43325,22 +43342,22 @@ body.mobile-tablet-device .pos-keyboard-btn{
           <div class="edit-order-modal-body">
             ${state.editOrderValidation && state.editOrderValidation.message ? `<div class="edit-order-global-error" role="alert">${escapeHtml(state.editOrderValidation.message)}</div>` : ''}
             ${editingOrder ? `<div class="help-note" style="margin-bottom:12px">주문번호: ${escapeHtml(editingOrder.orderNumber || editingOrder.id)} · ${escapeHtml(editingOrder.userNameDisplay || editingOrder.userName || '')}(${escapeHtml(editingOrder.userDept || '소속없음')})</div>` : ''}
-            <fieldset style="border:0;padding:0;margin:0;min-width:0" aria-label="수정할 수 없는 주문 정보">
+            <fieldset style="border:0;padding:0;margin:0;min-width:0" aria-label="주문 수정 정보" ${state.editOrderSaveInFlight || state.editOrderAwaitingConfirmation ? 'disabled' : ''}>
               ${renderEditOrderItemsSection()}
               <div class="row">
                 <div class="field">
                   <label>수령방법</label>
                   <div class="edit-order-receive-buttons">
-                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}" disabled>픽업</button>
-                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}" disabled>배달</button>
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'PICKUP' ? 'active emerald' : ''}" data-action="edit-order-set-delivery" data-value="PICKUP" aria-pressed="${state.editOrderData.deliveryType === 'PICKUP' ? 'true' : 'false'}">픽업</button>
+                    <button type="button" class="seg-btn ${state.editOrderData.deliveryType === 'DELIVERY' ? 'active blue' : ''}" data-action="edit-order-set-delivery" data-value="DELIVERY" aria-pressed="${state.editOrderData.deliveryType === 'DELIVERY' ? 'true' : 'false'}">배달</button>
                   </div>
                   ${renderOrderEditInlineError('deliveryType', -1)}
                 </div>
-                ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}" disabled>${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
+                ${state.editOrderData.deliveryType === 'DELIVERY' ? `<div class="field"><label>배달지</label><input id="editOrderDeliveryLocation" class="input" type="text" placeholder="배달지" value="${escapeHtml(state.editOrderData.deliveryLocation)}">${renderOrderEditInlineError('deliveryLocation', -1)}</div>` : `<div class="field"><label>배달지</label><div class="input" style="background:#fff;color:#9ca3af">픽업 선택 시 사용하지 않음</div></div>`}
               </div>
               ${state.editOrderData.items.some(item => item.cupType === 'TUMBLER') ? `<div class="field"><label>공통 텀블러 정보</label><input id="editOrderTumblerInfo" class="input" type="text" placeholder="예: 개인 텀블러 또는 추가 설명" value="${escapeHtml(state.editOrderData.tumblerInfo)}"></div>` : ''}
             </fieldset>
-            <div class="field"><label>주문 전체 메모</label><input id="editOrderMemo" class="input" type="text" placeholder="주문 전체에 적용되는 요청사항" value="${escapeHtml(state.editOrderData.memo)}"></div>
+            <div class="field"><label>주문 전체 메모</label><input id="editOrderMemo" class="input" type="text" placeholder="주문 전체에 적용되는 요청사항" value="${escapeHtml(state.editOrderData.memo)}" ${state.editOrderSaveInFlight || state.editOrderAwaitingConfirmation ? 'disabled' : ''}></div>
           </div>
           <div class="modal-actions edit-order-modal-actions">
             <div class="edit-order-save-summary">${renderOrderEditSaveSummary()}</div>
@@ -52539,10 +52556,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         if(liveData.isOpen === false || currentOrder.isOpen === false || isLiveOrderDoneStatus(currentStatus) || currentStatus === 'CANCELLED'){
           throw new Error('order-edit-order-closed');
         }
+        if(currentStatus === 'PROCESSING' || liveData.completionCommitted === true) throw new Error('order-edit-completion-in-progress');
         if(String(currentOrder.userId || '') !== String(requestedOrder.userId || '')) throw new Error('order-edit-user-mismatch');
         if(String(currentOrder.editedAt || '') !== String(req.baseEditedAt || '')
           || normalizeLifecycleRevision(currentOrder.statusRevision) !== normalizeLifecycleRevision(req.baseStatusRevision)
-          || normalizeLifecycleRevision(currentOrder.stageRevision) !== normalizeLifecycleRevision(req.baseStageRevision)){
+          || normalizeLifecycleRevision(currentOrder.stageRevision) !== normalizeLifecycleRevision(req.baseStageRevision)
+          || normalizeLifecycleCycle(currentOrder.productionCycle) !== normalizeLifecycleCycle(req.baseProductionCycle)){
           throw new Error('order-edit-live-order-changed');
         }
         if(String(currentOrder.deliveryType || '').toUpperCase() === 'DELIVERY'
