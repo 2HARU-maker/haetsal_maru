@@ -61,7 +61,20 @@ def main():
             extension = ".mjs" if kind == "module" else ".js"
             path = Path(tmp) / f"inline_{index}{extension}"
             path.write_text(source, encoding="utf-8")
-            result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
+            if kind == "module":
+                command = ["node", "--check", str(path)]
+            else:
+                # A classic browser <script> uses the Script grammar goal.
+                # Node's `--check file.js` treats CommonJS as a function body
+                # and would incorrectly allow top-level `return` statements.
+                command = [
+                    "node", "-e",
+                    'const fs = require("node:fs"); const vm = require("node:vm"); '
+                    'new vm.Script(fs.readFileSync(process.argv[1], "utf8"), '
+                    '{ filename: process.argv[1] });',
+                    str(path),
+                ]
+            result = subprocess.run(command, capture_output=True, text=True)
             if result.returncode:
                 errors += 1
                 print(f"FAIL: inline script {index} ({kind}) has a syntax error")

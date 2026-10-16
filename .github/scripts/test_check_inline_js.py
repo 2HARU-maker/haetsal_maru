@@ -33,6 +33,11 @@ class InlineJavascriptGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("syntax error", result.stdout)
 
+    def test_classic_script_rejects_top_level_return(self):
+        result = self.check_html('<script>return;</script>')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("syntax error", result.stdout)
+
     def test_unterminated_last_script_fails_even_if_previous_is_valid(self):
         result = self.check_html(
             '<html><script>const ok = 1;</script>'
