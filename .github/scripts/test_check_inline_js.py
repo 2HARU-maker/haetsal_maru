@@ -33,6 +33,16 @@ class InlineJavascriptGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("syntax error", result.stdout)
 
+    def test_other_classic_javascript_mime_types_are_checked(self):
+        for mime_type in ("text/ecmascript", "application/x-javascript", "text/javascript1.5"):
+            with self.subTest(mime_type=mime_type):
+                result = self.check_html(
+                    '<script>const ok = 1;</script>'
+                    f'<script type="{mime_type}">return;</script>'
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("syntax error", result.stdout)
+
     def test_classic_script_rejects_top_level_return(self):
         result = self.check_html('<script>return;</script>')
         self.assertNotEqual(result.returncode, 0)
