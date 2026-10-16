@@ -25,5 +25,7 @@ jobs:
         run: git diff --check "$BASE_SHA" HEAD
       - name: Confirm source files exist
         run: test -s index.html && test -s AGENTS.md
+      - name: Self-test inline JavaScript gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_inline_js.py'
       - name: Check inline JavaScript syntax
         run: python3 .github/scripts/check_inline_js.py index.html

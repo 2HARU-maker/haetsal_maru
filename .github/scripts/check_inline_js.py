@@ -48,6 +48,9 @@ def main():
     parser = InlineScripts()
     parser.feed(html_file.read_text(encoding="utf-8"))
     parser.close()
+    if parser.active is not None:
+        print("FAIL: unterminated executable inline <script> tag", file=sys.stderr)
+        return 1
     if not parser.scripts:
         print("FAIL: no executable inline JavaScript found", file=sys.stderr)
         return 1
