@@ -28,27 +28,7 @@ jobs:
         run: test -s index.html && test -s AGENTS.md
       - name: Self-test inline JavaScript gate
         run: python3 -m unittest discover -s .github/scripts -p 'test_check_inline_js.py'
+      - name: Self-test official Codex review evidence
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_codex_review.py'
       - name: Check inline JavaScript syntax
         run: python3 .github/scripts/check_inline_js.py index.html
-
-  codex-review-gate:
-    name: codex-review-gate
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      issues: read
-      pull-requests: read
-    steps:
-      - name: Check out candidate
-        uses: actions/checkout@v4
-      - name: Self-test Codex review gate
-        run: python3 -m unittest discover -s .github/scripts -p 'test_check_codex_review.py'
-      - name: Wait for the official Codex review on this PR head
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GH_REVIEW_READ_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/check_codex_review.py

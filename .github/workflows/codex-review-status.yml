@@ -1,0 +1,68 @@
+name: Haetsalmaru trusted Codex review status
+
+on:
+  workflow_run:
+    workflows: ["Haetsalmaru PR static gate"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish-review-status:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      PR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check out trusted main code only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Verify source workflow and PR identity
+        id: identity
+        env:
+          RUN_PATH: ${{ github.event.workflow_run.path }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_PATH" == ".github/workflows/review-gate.yml" || "$RUN_PATH" == ".github/workflows/review-gate.yml@"* ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          CURRENT_SHA="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha')"
+          BASE_BRANCH="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+          [[ "$CURRENT_SHA" == "$PR_HEAD_SHA" && "$BASE_BRANCH" == "main" ]]
+          echo 'verified=true' >> "$GITHUB_OUTPUT"
+      - name: Publish pending review status
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$PR_HEAD_SHA" \
+            -f state=pending -f context=codex-review-gate \
+            -f description='Awaiting official Codex review for this PR head' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Verify official Codex review
+        if: github.event.workflow_run.conclusion == 'success'
+        env:
+          GH_REVIEW_READ_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check_codex_review.py
+      - name: Publish clean review status
+        if: ${{ success() && github.event.workflow_run.conclusion == 'success' }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$PR_HEAD_SHA" \
+            -f state=success -f context=codex-review-gate \
+            -f description='Official Codex review completed without findings' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Publish failed review status
+        if: ${{ always() && steps.identity.outputs.verified == 'true' && (failure() || github.event.workflow_run.conclusion != 'success') }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$PR_HEAD_SHA" \
+            -f state=failure -f context=codex-review-gate \
+            -f description='PR checks or Codex review were unsuccessful' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

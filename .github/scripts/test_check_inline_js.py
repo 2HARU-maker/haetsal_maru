@@ -135,6 +135,16 @@ class InlineJavascriptGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unterminated", result.stderr)
 
+    def test_unterminated_json_or_external_script_is_rejected(self):
+        for source in (
+            '<script type="application/json">{"partial":true}',
+            '<script src="external.js">ignored',
+        ):
+            with self.subTest(source=source):
+                result = self.check_html('<script>const ok = 1;</script>' + source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unterminated", result.stderr)
+
     def test_empty_or_non_executable_scripts_do_not_pass(self):
         result = self.check_html('<script type="application/json">{}</script>')
         self.assertNotEqual(result.returncode, 0)

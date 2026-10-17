@@ -96,6 +96,9 @@ def main():
     if parser.active is not None:
         print("FAIL: unterminated executable inline <script> tag", file=sys.stderr)
         return 1
+    if parser.sections is not None:
+        print("FAIL: unterminated non-executable HTML <script> element", file=sys.stderr)
+        return 1
     if not parser.scripts:
         print("FAIL: no executable inline JavaScript found", file=sys.stderr)
         return 1
