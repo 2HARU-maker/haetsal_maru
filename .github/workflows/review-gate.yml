@@ -1,0 +1,34 @@
+name: Haetsalmaru PR static gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-gate:
+    name: static-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check changed-line whitespace
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --check "$BASE_SHA" HEAD
+      - name: Confirm source files exist
+        run: test -s index.html && test -s AGENTS.md
+      - name: Self-test inline JavaScript gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_inline_js.py'
+      - name: Self-test official Codex review evidence
+        run: python3 -m unittest discover -s .github/scripts -p 'test_check_codex_review.py'
+      - name: Check inline JavaScript syntax
+        run: python3 .github/scripts/check_inline_js.py index.html
