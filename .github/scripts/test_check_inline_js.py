@@ -36,6 +36,7 @@ class InlineJavascriptGateTests(unittest.TestCase):
     def test_valid_html_with_script_attributes(self):
         result = self.check_html(
             '<!doctype html><html><head><title>Gate test</title></head><body>'
+            '<input type="text"/><br/>'
             '<script id="app" type="text/javascript">const a = 1;</script>'
             '</body></html>'
         )
@@ -70,6 +71,18 @@ class InlineJavascriptGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("syntax error", result.stdout)
         self.assertIn("Checked 2 inline scripts", result.stdout)
+
+    def test_self_closing_script_start_tags_fail(self):
+        for source in (
+            '<script/>return;</script>',
+            '<script/>',
+            '<script type="module"/>export const a = 1;</script>',
+            '<script src="app.js"/>',
+        ):
+            with self.subTest(source=source):
+                result = self.check_html('<script>const ok = 1;</script>' + source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("self-closing", result.stderr)
 
     def test_other_classic_javascript_mime_types_are_checked(self):
         for mime_type in ("text/ecmascript", "application/x-javascript", "text/javascript1.5"):

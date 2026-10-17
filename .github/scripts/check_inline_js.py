@@ -15,6 +15,7 @@ class InlineScripts(HTMLParser):
         super().__init__(convert_charrefs=False)
         self.active = None
         self.scripts = []
+        self.self_closing_script = False
 
     def handle_starttag(self, tag, attrs):
         if tag != "script":
@@ -41,6 +42,13 @@ class InlineScripts(HTMLParser):
         else:
             self.active = None
 
+    def handle_startendtag(self, tag, attrs):
+        if tag == "script":
+            # Browsers do not self-close this non-void HTML element.
+            self.self_closing_script = True
+        else:
+            super().handle_startendtag(tag, attrs)
+
     def handle_data(self, data):
         if self.active is not None:
             self.active[1].append(data)
@@ -60,6 +68,9 @@ def main():
     parser = InlineScripts()
     parser.feed(html_file.read_text(encoding="utf-8"))
     parser.close()
+    if parser.self_closing_script:
+        print("FAIL: self-closing <script/> start tags are not valid HTML", file=sys.stderr)
+        return 1
     if parser.active is not None:
         print("FAIL: unterminated executable inline <script> tag", file=sys.stderr)
         return 1
