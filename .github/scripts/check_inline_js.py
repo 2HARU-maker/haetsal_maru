@@ -19,7 +19,8 @@ class InlineScripts(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag != "script":
             return
-        attrs = dict(attrs)
+        # HTML keeps the first occurrence of a duplicate attribute.
+        attrs = dict(reversed(attrs))
         if attrs.get("src") is not None:
             self.active = None
             return

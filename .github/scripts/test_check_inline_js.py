@@ -33,6 +33,44 @@ class InlineJavascriptGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("syntax error", result.stdout)
 
+    def test_valid_html_with_script_attributes(self):
+        result = self.check_html(
+            '<!doctype html><html><head><title>Gate test</title></head><body>'
+            '<script id="app" type="text/javascript">const a = 1;</script>'
+            '</body></html>'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Checked 1 inline scripts", result.stdout)
+
+    def test_duplicate_type_keeps_first_javascript_type(self):
+        for kind, source in (
+            ("text/javascript", "const a = 1;"),
+            ("module", "export const a = 1;"),
+        ):
+            with self.subTest(kind=kind):
+                result = self.check_html(
+                    f'<script type="{kind}" type="application/json">{source}</script>'
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Checked 1 inline scripts", result.stdout)
+
+    def test_duplicate_type_keeps_first_non_executable_type(self):
+        result = self.check_html(
+            '<script>const ok = 1;</script>'
+            '<script TYPE="application/json" type="text/javascript">return;</script>'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Checked 1 inline scripts", result.stdout)
+
+    def test_duplicate_type_does_not_hide_javascript_syntax_error(self):
+        result = self.check_html(
+            '<script>const ok = 1;</script>'
+            '<script type="text/javascript" type="application/json">return;</script>'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("syntax error", result.stdout)
+        self.assertIn("Checked 2 inline scripts", result.stdout)
+
     def test_other_classic_javascript_mime_types_are_checked(self):
         for mime_type in ("text/ecmascript", "application/x-javascript", "text/javascript1.5"):
             with self.subTest(mime_type=mime_type):
