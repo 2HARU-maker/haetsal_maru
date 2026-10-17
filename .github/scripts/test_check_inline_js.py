@@ -84,6 +84,33 @@ class InlineJavascriptGateTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("self-closing", result.stderr)
 
+    def test_double_escaped_script_data_fails(self):
+        for source in (
+            '<script><!--<script>const ok=1;</script>\nreturn;</script>',
+            '<script><!--<ScRiPt >const ok=1;</script>\nreturn;</script>',
+            '<script type="application/json"><!--<script>{}</script>\nignored;</script>',
+            '<script src="app.js"><!--<script>ignored;</script>\nignored;</script>',
+        ):
+            with self.subTest(source=source):
+                result = self.check_html('<script>const ok = 1;</script>' + source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("double-escaped", result.stderr)
+
+    def test_safe_script_comments_and_literals_pass(self):
+        for source in (
+            '<script><!--const a=1;\n//-->\n</script>',
+            '<script><!--comment\n//-->\nconst markup="<script>";</script>',
+            '<script><!-->\nconst markup="<script>";</script>',
+            '<script><!--->\nconst markup="<script>";</script>',
+            '<script>const markup="<script><!--";</script>',
+            '<script><!--<scripture>\nconst a=1;</script>',
+            '<!-- <script>ignored;</script> --><script>const ok=1;</script>',
+        ):
+            with self.subTest(source=source):
+                result = self.check_html(source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Checked 1 inline scripts", result.stdout)
+
     def test_other_classic_javascript_mime_types_are_checked(self):
         for mime_type in ("text/ecmascript", "application/x-javascript", "text/javascript1.5"):
             with self.subTest(mime_type=mime_type):
