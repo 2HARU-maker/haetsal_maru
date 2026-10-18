@@ -21181,7 +21181,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         ...(state.archivedCompletedOrdersStatusByDate || {}),
         [targetDate]: { state:'loading', message:'보관 처리완료 내역을 불러오는 중입니다.' }
       };
-      if(opts.renderBefore !== false) render();
+      if(opts.renderBefore !== false) (isAdminUserSearchActiveForRemoteRender() ? renderAfterRemoteOrderSync('archived-completed-orders-loading') : render());
       return Promise.resolve(window.HaetsalCompletedOrderDocs.readByDate(targetDate, {
         onProgress(message){
           state.archivedCompletedOrdersStatusByDate = {
@@ -21205,7 +21205,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
             : { state:'loaded', message: rows.length ? `보관 처리완료 내역 ${rows.length}건을 불러왔습니다.` : '보관 처리완료 내역이 없습니다.', count:rows.length }
         };
         state.archivedCompletedOrdersLoadingDate = '';
-        render();
+        (isAdminUserSearchActiveForRemoteRender() ? renderAfterRemoteOrderSync('archived-completed-orders-loaded') : render());
         return rows;
       }).catch(error => {
         state.archivedCompletedOrdersByDate = { ...(state.archivedCompletedOrdersByDate || {}), [targetDate]: [] };
@@ -21214,7 +21214,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           [targetDate]: { state:'error', message:`보관 처리완료 내역을 불러오지 못했습니다: ${error && error.message ? error.message : String(error || '')}` }
         };
         state.archivedCompletedOrdersLoadingDate = '';
-        render();
+        (isAdminUserSearchActiveForRemoteRender() ? renderAfterRemoteOrderSync('archived-completed-orders-failed') : render());
         return [];
       });
     }
@@ -30906,6 +30906,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function updateAdminUsersSearchResults(){
       const wrap = app.querySelector('#adminUsersTableWrap');
       if(wrap){
+        if(dashboardTouchInteraction != null){
+          deferredOrderSearchRemoteRender = true;
+          adminUserSearchRemoteRenderPending = true;
+          dashboardTouchRenderDeferred = true;
+          return;
+        }
         wrap.innerHTML = renderAdminUsersTableContent();
       }
     }
@@ -38656,6 +38662,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let searchTermIsComposing = false;
     let orderEntryInputIsComposing = false;
     let adminUserSearchIsComposing = false;
+    let adminUserSearchRemoteRenderPending = false;
     let adminCouponRecalcSearchIsComposing = false;
     let registrationHistorySearchIsComposing = false;
     let preserveOrderScrollOnNextRender = false;
@@ -38904,6 +38911,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
     }
 
+    function isAdminUserSearchActiveForRemoteRender(){
+      const active = document.activeElement;
+      return state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
+        && (adminUserSearchIsComposing || !!(active && active.id === 'adminUserSearch' && app.contains(active)));
+    }
+
     function renderAfterRemoteOrderSync(reason, options){
       const opts = options || {};
       const editingOrderId = String(state.editingOrderId || '');
@@ -38931,6 +38944,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return;
       }
       if(orderEditUrgent) orderEditInputIsComposing = false;
+      if(isAdminUserSearchActiveForRemoteRender()){
+        deferredOrderSearchRemoteRender = true;
+        adminUserSearchRemoteRenderPending = true;
+        if(!adminUserSearchIsComposing) updateAdminUsersSearchResults();
+        return;
+      }
       if(isOrderInputFocusedForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderUserSearchSelecting){
         deferredOrderSearchRemoteRender = true;
         if(window.console && console.info){
@@ -38947,10 +38966,24 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     function flushDeferredOrderSearchRemoteRender(reason){
-      if(!deferredOrderSearchRemoteRender || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
+      if(!deferredOrderSearchRemoteRender || isAdminUserSearchActiveForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
+      const active = document.activeElement;
+      const controlFocus = adminUserSearchRemoteRenderPending && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
+        && active && app.contains(active) && active.matches('button[data-action], input[type="checkbox"]')
+        && (active.id || active.dataset.action)
+        ? { id:active.id || '', tagName:active.tagName, type:active.type || '', action:active.dataset.action || '', value:active.dataset.value || '', userId:active.dataset.userId || '' } : null;
       deferredOrderSearchRemoteRender = false;
       requestOrderScrollRestore();
       render();
+      if(controlFocus && document.activeElement === document.body){
+        const matches = Array.from(app.querySelectorAll('button[data-action], input[type="checkbox"]')).filter(control => !control.disabled
+          && (control.id || '') === controlFocus.id && control.tagName === controlFocus.tagName && (control.type || '') === controlFocus.type
+          && (control.dataset.action || '') === controlFocus.action && (control.dataset.value || '') === controlFocus.value
+          && (control.dataset.userId || '') === controlFocus.userId);
+        if(matches.length === 1){
+          try{ matches[0].focus({ preventScroll:true }); }catch(error){ try{ matches[0].focus(); }catch(innerError){} }
+        }
+      }
     }
 
     function markMobileTabletDeviceForPosKeyboard(){
@@ -39129,6 +39162,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
           lifecycleQueued:orderLifecycleRenderQueued,
           lifecycleGeneration:orderLifecycleRenderGeneration
         });
+        if(adminUserSearchRemoteRenderPending && isAdminUserSearchActiveForRemoteRender()){
+          updateAdminUsersSearchResults();
+          return;
+        }
         render();
       }, 120);
     }
@@ -39171,9 +39208,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     function startDashboardPointerInteraction(event){
-      if(event.pointerType !== 'touch' || !isDashboardView()) return;
+      const adminSearchActive = isAdminUserSearchActiveForRemoteRender();
+      const protectsAdminUserSearch = (event.pointerType === 'mouse' || event.pointerType === 'pen') && adminSearchActive;
+      if((event.pointerType !== 'touch' && !protectsAdminUserSearch) || !isDashboardView()) return;
       const dashboardBody = getDashboardScrollContainer();
-      if(!dashboardBody || !(event.target && dashboardBody.contains(event.target))) return;
+      const interactionRoot = adminSearchActive && dashboardBody ? dashboardBody.closest('.page-dashboard') : dashboardBody;
+      if(!interactionRoot || !(event.target && interactionRoot.contains(event.target))) return;
       if(dashboardTouchInteraction == null || dashboardTouchInteraction === 'scroll-settling'){
         dashboardTouchInteraction = `pointer:${Number(event.pointerId)}`;
       }
@@ -39491,6 +39531,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         requestAnimationFrame(() => {
           const target = findOrderFocusTarget(snapshot);
           if(!isOrderEditableTarget(target)) return;
+          if(snapshot.view === 'ADMIN_DASHBOARD' && snapshot.dashboardTab === 'USERS' && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
+            && document.activeElement !== document.body && document.activeElement !== target) return;
           try{ target.focus({ preventScroll:true }); }catch(error){ try{ target.focus(); }catch(innerError){} }
           if(typeof snapshot.selectionStart === 'number' && typeof snapshot.selectionEnd === 'number' && typeof target.setSelectionRange === 'function'){
             try{ target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd); }catch(error){}
@@ -39542,6 +39584,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
           ? renderDashboardView()
           : renderOrderMainView();
 
+      if(adminUserSearchRemoteRenderPending){
+        adminUserSearchRemoteRenderPending = false;
+        deferredOrderSearchRemoteRender = false;
+      }
+      adminUserSearchIsComposing = false;
       app.innerHTML = screenHtml;
       if((state.currentView === 'ADMIN_DASHBOARD' || state.currentView === 'MANAGER_DASHBOARD') && state.dashboardTab === 'ORDERS'){
         const key = String(state.completedFilterDate || getTodayString());
@@ -43920,6 +43967,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         adminUserSearchIsComposing = false;
         state.adminUserSearch = t.value;
         updateAdminUsersSearchResults();
+        window.setTimeout(() => flushDeferredOrderSearchRemoteRender('admin-user-search-composition-end'), 0);
       }
       if(t.id === 'adminCouponRecalcSearch'){
         adminCouponRecalcSearchIsComposing = false;
@@ -43941,9 +43989,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('focusout', (event) => {
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
-      if(isOrderEntryInputElement(t) || isOrderEditInputElement(t) || isDashboardDateInputElement(t)){
+      if(t.id === 'adminUserSearch' || isOrderEntryInputElement(t) || isOrderEditInputElement(t) || isDashboardDateInputElement(t)){
         window.setTimeout(() => {
-          flushDeferredOrderSearchRemoteRender(isDashboardDateInputElement(t) ? 'dashboard-date-input-blur' : (isOrderEditInputElement(t) ? 'order-edit-input-blur' : 'order-input-blur'));
+          flushDeferredOrderSearchRemoteRender(t.id === 'adminUserSearch' ? 'admin-user-search-blur' : isDashboardDateInputElement(t) ? 'dashboard-date-input-blur' : (isOrderEditInputElement(t) ? 'order-edit-input-blur' : 'order-input-blur'));
         }, 0);
       }
       if(t.id === 'milkSupportReceivedDate' || (t.dataset && (t.dataset.milkSupportField || t.dataset.milkReviewField))){
