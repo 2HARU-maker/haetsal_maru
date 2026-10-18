@@ -38968,16 +38968,18 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function flushDeferredOrderSearchRemoteRender(reason){
       if(!deferredOrderSearchRemoteRender || isAdminUserSearchActiveForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
       const active = document.activeElement;
-      const buttonFocus = adminUserSearchRemoteRenderPending && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
-        && active && active.tagName === 'BUTTON' && app.contains(active) && active.dataset.action
-        ? { action:active.dataset.action, value:active.dataset.value || '', userId:active.dataset.userId || '' } : null;
+      const controlFocus = adminUserSearchRemoteRenderPending && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
+        && active && app.contains(active) && active.matches('button[data-action], input[type="checkbox"]')
+        && (active.id || active.dataset.action)
+        ? { id:active.id || '', tagName:active.tagName, type:active.type || '', action:active.dataset.action || '', value:active.dataset.value || '', userId:active.dataset.userId || '' } : null;
       deferredOrderSearchRemoteRender = false;
       requestOrderScrollRestore();
       render();
-      if(buttonFocus && document.activeElement === document.body){
-        const matches = Array.from(app.querySelectorAll('button[data-action]')).filter(button => !button.disabled
-          && button.dataset.action === buttonFocus.action && (button.dataset.value || '') === buttonFocus.value
-          && (button.dataset.userId || '') === buttonFocus.userId);
+      if(controlFocus && document.activeElement === document.body){
+        const matches = Array.from(app.querySelectorAll('button[data-action], input[type="checkbox"]')).filter(control => !control.disabled
+          && (control.id || '') === controlFocus.id && control.tagName === controlFocus.tagName && (control.type || '') === controlFocus.type
+          && (control.dataset.action || '') === controlFocus.action && (control.dataset.value || '') === controlFocus.value
+          && (control.dataset.userId || '') === controlFocus.userId);
         if(matches.length === 1){
           try{ matches[0].focus({ preventScroll:true }); }catch(error){ try{ matches[0].focus(); }catch(innerError){} }
         }
@@ -39529,6 +39531,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         requestAnimationFrame(() => {
           const target = findOrderFocusTarget(snapshot);
           if(!isOrderEditableTarget(target)) return;
+          if(snapshot.view === 'ADMIN_DASHBOARD' && snapshot.dashboardTab === 'USERS' && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
+            && document.activeElement !== document.body && document.activeElement !== target) return;
           try{ target.focus({ preventScroll:true }); }catch(error){ try{ target.focus(); }catch(innerError){} }
           if(typeof snapshot.selectionStart === 'number' && typeof snapshot.selectionEnd === 'number' && typeof target.setSelectionRange === 'function'){
             try{ target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd); }catch(error){}
