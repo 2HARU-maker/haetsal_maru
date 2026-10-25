@@ -24516,6 +24516,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function editOrderPersonalTumblerFromSettings(index, value){
+      if(!canChangeOrderRentDraft()) return;
       ensureOrderItemsRuntime();
       const user = getUserById(state.selectedUserId);
       if(!user){ showMessage('사용자를 먼저 선택해주세요.'); return; }
@@ -24539,6 +24540,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         return;
       }
       const oldLabel = row.label;
+      orderRentDraftGeneration += 1;
       const now = new Date().toISOString();
       if(targetValue === ORDER_PERSONAL_DEFAULT_VALUE){
         user.tumblerInfo = clean;
@@ -24830,8 +24832,64 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     let orderRentAssignmentInFlight = false, orderRentReleaseInFlight = false, orderRentDraftGeneration = 0;
+    const pendingOrderRentReleaseProofs = new Map();
+
+    function readPendingOrderRentReleases(userId){
+      const key = orderRentRecoveryKey(userId) + '_pending_releases';
+      if(pendingOrderRentReleaseProofs.has(key)) return pendingOrderRentReleaseProofs.get(key);
+      try{
+        const saved = JSON.parse(sessionStorage.getItem(key) || 'null');
+        return saved && saved.clientSessionId === state.clientSessionId && saved.userId === String(userId)
+          && Array.isArray(saved.proofs) ? saved.proofs : [];
+      }catch(error){ return []; }
+    }
+
+    function savePendingOrderRentReleases(userId, proofs){
+      const key = orderRentRecoveryKey(userId) + '_pending_releases';
+      pendingOrderRentReleaseProofs.set(key, proofs);
+      try{
+        if(proofs.length) sessionStorage.setItem(key, JSON.stringify({clientSessionId:state.clientSessionId,userId:String(userId),proofs}));
+        else sessionStorage.removeItem(key);
+        return true;
+      }catch(error){
+        console.warn('임시 대여 취소 증빙 보관 확인 필요',error);
+        showMessage('임시 대여 취소 증빙을 저장하지 못했습니다. 화면을 닫지 말고 취소 결과를 다시 확인해주세요.');
+        return false;
+      }
+    }
+
+    async function retryPendingOrderRentReleases(userId){
+      const proofs = readPendingOrderRentReleases(userId).slice();
+      if(!proofs.length) return true;
+      if(orderRentReleaseInFlight || !proofs.every(row => row.id && row.reservationSessionId)
+        || !(window.TumblerModule && typeof window.TumblerModule.releaseReservedRentOrder === 'function')) return false;
+      orderRentReleaseInFlight = true;
+      try{
+        const result = await window.TumblerModule.releaseReservedRentOrder(proofs.map(row => ({...row})), String(userId), true);
+        if(!result || !result.ok) return false;
+        const proofKey = row => JSON.stringify([row.id,row.reservationSessionId,row.draftGeneration]);
+        const confirmed = new Set(proofs.map(proofKey)), current = readPendingOrderRentReleases(userId);
+        if(!savePendingOrderRentReleases(userId, current.filter(row => !confirmed.has(proofKey(row))))){
+          pendingOrderRentReleaseProofs.set(orderRentRecoveryKey(userId) + '_pending_releases', current);
+          return false;
+        }
+        return true;
+      }catch(error){
+        console.warn('이전 임시 대여 취소 결과 재확인 필요',error);
+        return false;
+      }finally{ orderRentReleaseInFlight = false; }
+    }
+
+    async function releaseStaleOrderRentReservation(userId, item, generation, orderId){
+      const proofs = readPendingOrderRentReleases(userId).slice();
+      if(!proofs.some(row => String(row.id) === String(item.id) && row.reservationSessionId === item.reservationSessionId
+        && row.draftGeneration === generation)) proofs.push({...item,draftGeneration:generation,orderId:String(orderId || '')});
+      savePendingOrderRentReleases(userId, proofs);
+      return retryPendingOrderRentReleases(userId);
+    }
+
     async function assignNewRentTumblerForOrderItem(index){
-      if(orderRentAssignmentInFlight) return false;
+      if(orderRentAssignmentInFlight || orderRentReleaseInFlight) return false;
       orderRentAssignmentInFlight=true;
       try{
       ensureOrderItemsRuntime();
@@ -24844,6 +24902,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 대여는 교직원만 가능합니다.\n필요한 경우 주문담당 학생 및 카페 담당 교사에게 문의해 주세요.');
         return false;
       }
+      const recoveryGeneration = orderRentDraftGeneration;
+      if(!(await retryPendingOrderRentReleases(user.id)) || recoveryGeneration !== orderRentDraftGeneration
+        || String(state.selectedUserId || '') !== String(user.id)) return false;
       if(!(await releaseOrderItemAutoRentTumbler(index, true)).ok) return false;
       if(state.orderItems[index].cupType !== 'TUMBLER') state.orderItems[index].cupType = 'TUMBLER';
       let item = state.orderItems[index];
@@ -24858,6 +24919,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
       const draft=JSON.stringify([state.selectedUserId,item.menuName,item.temp,item.quantity]);
       const requestGeneration=orderRentDraftGeneration;
+      const requestOrderId=String(state.pendingRentOrderId || '');
       const result = await window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기', {assignedTumblers:state.pendingOrderTumblers,quantity:getOrderTotalQuantityFromItems(state.orderItems)});
       if(!result || !result.ok || !result.item){
         showMessage((result && result.message) || `대여 가능한 ${tumblerType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.`);
@@ -24866,7 +24928,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
       const current=state.orderItems[index];
       if(requestGeneration !== orderRentDraftGeneration || !current || draft !== JSON.stringify([state.selectedUserId,current.menuName,current.temp,current.quantity])){
-        await window.TumblerModule.releaseReservedRentOrder([result.item],user.id,true);return false;
+        await releaseStaleOrderRentReservation(user.id,result.item,requestGeneration,requestOrderId);return false;
       }
       item=current;
 
@@ -24900,7 +24962,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     async function assignNewRentTumblerForOrderUnit(index, unitIndex){
-      if(orderRentAssignmentInFlight) return false;
+      if(orderRentAssignmentInFlight || orderRentReleaseInFlight) return false;
       orderRentAssignmentInFlight=true;
       try{
       ensureOrderItemsRuntime();
@@ -24916,6 +24978,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 대여는 교직원만 가능합니다.\n필요한 경우 주문담당 학생 및 카페 담당 교사에게 문의해 주세요.');
         return false;
       }
+      const recoveryGeneration = orderRentDraftGeneration;
+      if(!(await retryPendingOrderRentReleases(user.id)) || recoveryGeneration !== orderRentDraftGeneration
+        || String(state.selectedUserId || '') !== String(user.id)) return false;
       if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
       item = state.orderItems[index];
       unit = ensureOrderItemUnitChoices(index)[unitIndex];
@@ -24927,6 +24992,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
       const draft=JSON.stringify([state.selectedUserId,item.menuName,item.temp,item.quantity]);
       const requestGeneration=orderRentDraftGeneration;
+      const requestOrderId=String(state.pendingRentOrderId || '');
       const result = await window.TumblerModule.reserveSingleRentOrderTumbler(user.id, tumblerType, '주문 중 새로 대여하기', {assignedTumblers:state.pendingOrderTumblers,quantity:getOrderTotalQuantityFromItems(state.orderItems)});
       if(!result || !result.ok || !result.item){
         showMessage((result && result.message) || `대여 가능한 ${tumblerType === 'hot' ? '핫' : '아이스'} 텀블러가 없습니다.`);
@@ -24936,7 +25002,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
       const current=state.orderItems[index];
       if(requestGeneration !== orderRentDraftGeneration || !current || draft !== JSON.stringify([state.selectedUserId,current.menuName,current.temp,current.quantity]) || unitIndex >= Number(current.quantity)){
-        await window.TumblerModule.releaseReservedRentOrder([result.item],user.id,true);return false;
+        await releaseStaleOrderRentReservation(user.id,result.item,requestGeneration,requestOrderId);return false;
       }
       item=current;
       unit=ensureOrderItemUnitChoices(index)[unitIndex];
@@ -31554,6 +31620,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     async function handleFinalOrder(userId, qty, memoText, proxyMode=false){
       if(orderRentReleaseInFlight){ showMessage('임시 대여 취소 결과를 먼저 확인해주세요.'); return false; }
+      if(readPendingOrderRentReleases(userId).length){
+        const generation = orderRentDraftGeneration, selectedUserId = state.selectedUserId;
+        if(!(await retryPendingOrderRentReleases(userId)) || generation !== orderRentDraftGeneration
+          || selectedUserId !== state.selectedUserId){
+          showMessage('이전 임시 대여 취소 결과를 먼저 확인해주세요.');
+          return false;
+        }
+      }
       if(state.isSubmittingOrder){
         showMessage('주문을 접수하는 중입니다. 잠시만 기다려주세요.');
         return;
