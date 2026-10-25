@@ -11160,8 +11160,38 @@ body.order-keyboard-submit-active{
   }
 }
 </style>
+<style>
+#view-restore-screen{display:none}
+.view-restore-pending .route-screen{display:none!important}
+.view-restore-pending #view-restore-screen{display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:16px;max-width:640px;min-height:100vh;margin:auto;padding:24px;box-sizing:border-box}
+#view-restore-screen h1,#view-restore-screen p{margin:0;overflow-wrap:break-word}
+#view-restore-screen .view-restore-actions:not([hidden]){display:flex;flex-wrap:wrap;gap:12px}
+</style>
+<script>
+window.HaetsalViewRestore = (function(){
+  let intent = null;
+  try{
+    const snapshot = JSON.parse(sessionStorage.getItem('haetsal_last_view_snapshot_v1') || 'null');
+    const order = snapshot && snapshot.order;
+    if(snapshot && snapshot.route === 'order' && order && order.dashboardTab === 'ORDERS'
+      && (order.appRole === 'ADMIN' || order.appRole === 'MANAGER')
+      && order.currentView === order.appRole + '_DASHBOARD'
+      && ['ALL','MEASURE','DELIVERY'].includes(order.orderQueueFilter)) intent = order;
+  }catch(error){}
+  if(intent) document.documentElement.classList.add('view-restore-pending');
+  return { intent:intent, pending:!!intent };
+})();
+</script>
 </head>
 <body>
+<section id="view-restore-screen" aria-labelledby="view-restore-title">
+  <h1 id="view-restore-title">이전 작업 화면 연결 중</h1>
+  <p id="view-restore-status" role="status">현재 권한과 주문 목록을 확인하고 있습니다.</p>
+  <div class="view-restore-actions" hidden>
+    <button type="button" class="btn btn-primary" data-view-restore="retry">다시 연결</button>
+    <button type="button" class="btn btn-outline" data-view-restore="login">로그인 화면으로</button>
+  </div>
+</section>
 <div class="route-screen active" id="main-screen">
 <div class="main-shell">
 <div class="header">
@@ -11194,7 +11224,7 @@ window.HaetsalCombinedApp = (function(){
     Object.keys(screens).forEach(key => {
       screens[key].classList.toggle('active', key === name);
     });
-    window.scrollTo(0, 0);
+    if(!(window.HaetsalViewRestore && window.HaetsalViewRestore.pending)) window.scrollTo(0, 0);
     if(name === 'order' && window.OrderModule){
       if(window.OrderModule.refreshFromShared) window.OrderModule.refreshFromShared();
       if(window.OrderModule.render) window.OrderModule.render();
@@ -11230,8 +11260,9 @@ window.HaetsalCombinedApp = (function(){
 window.HaetsalFullscreen = (function(){
   const PREF_KEY = 'haetsalFullscreenPreferred';
   const PROMPT_ID = 'fullscreenRestorePrompt';
-  let restoreGestureArmed = false;
-  let silentRestoreTried = false;
+  let requestInFlight = false;
+  let entryCancelled = false;
+  let restoreMessage = '';
 
   function getFullscreenElement(){
     return document.fullscreenElement ||
@@ -11267,69 +11298,38 @@ window.HaetsalFullscreen = (function(){
     return getPreferred() && !getFullscreenElement();
   }
 
-  function isTextInputOrLoginModalActive(event){
-    const active = document.activeElement;
-    const target = event && event.target;
-    const isEditable = function(element){
-      return !!(element && element.closest && element.closest('input, textarea, select, [contenteditable="true"]'));
-    };
-
-    if(document.getElementById('loginPw')) return true;
-    if(isEditable(active)) return true;
-    if(isEditable(target)) return true;
-    if(target && target.closest && target.closest('.modal, .modal-backdrop')) return true;
-    return false;
-  }
-
   function showRestorePromptIfNeeded(){
     if(!document.body) return;
     if(!shouldRestoreFullscreen()){
       removeRestorePrompt();
       return;
     }
-    if(document.getElementById(PROMPT_ID)) return;
-
-    const prompt = document.createElement('div');
-    prompt.id = PROMPT_ID;
-    prompt.className = 'fullscreen-restore-prompt';
-    prompt.innerHTML = '<div class="restore-text">전체화면 사용 설정이 저장되어 있습니다.<br>화면을 한 번 터치하거나 버튼을 누르면 전체화면으로 돌아갑니다.</div><div class="restore-actions"><button type="button" class="restore-go" data-action="restore-fullscreen-after-refresh">⛶ 전체화면 복귀</button><button type="button" class="restore-close" data-action="dismiss-fullscreen-restore">해제</button></div>';
-    document.body.appendChild(prompt);
+    let prompt = document.getElementById(PROMPT_ID);
+    if(!prompt){
+      prompt = document.createElement('div');
+      prompt.id = PROMPT_ID;
+      prompt.className = 'fullscreen-restore-prompt';
+      prompt.innerHTML = '<div class="restore-text" role="status"></div><div class="restore-actions"><button type="button" class="restore-go" data-action="restore-fullscreen-after-refresh">⛶ 전체화면 복귀</button><button type="button" class="restore-close" data-action="dismiss-fullscreen-restore">해제</button></div>';
+      document.body.appendChild(prompt);
+    }
+    const message = restoreMessage || '전체화면 사용 설정이 저장되어 있습니다. 전체화면 복귀 버튼을 누르면 다시 요청합니다. 새로고침이나 브라우저 조작으로 전체화면이 해제될 수 있습니다.';
+    const text = prompt.querySelector('.restore-text');
+    if(text.textContent !== message) text.textContent = message;
+    prompt.querySelector('.restore-go').disabled = requestInFlight;
   }
 
-  function requestAppFullscreen(options){
-    const opts = options || {};
-    const silent = !!opts.silent;
+  function requestAppFullscreen(){
     const target = document.documentElement;
-
     if(target.requestFullscreen){
       try{
-        const result = target.requestFullscreen({ navigationUI:'hide' });
-        if(result && typeof result.catch === 'function'){
-          return result.catch(function(error){
-            return target.requestFullscreen();
-          });
-        }
-        return result;
+        return target.requestFullscreen({ navigationUI:'hide' });
       }catch(error){
-        try{
-          return target.requestFullscreen();
-        }catch(secondError){
-          if(!silent) alert('이 브라우저에서는 전체화면 기능을 실행할 수 없습니다.');
-          return null;
-        }
+        return target.requestFullscreen();
       }
     }
-
-    if(target.webkitRequestFullscreen){
-      return target.webkitRequestFullscreen();
-    }
-
-    if(target.msRequestFullscreen){
-      return target.msRequestFullscreen();
-    }
-
-    if(!silent) alert('이 브라우저에서는 전체화면 기능을 지원하지 않습니다.');
-    return null;
+    if(target.webkitRequestFullscreen) return target.webkitRequestFullscreen();
+    if(target.msRequestFullscreen) return target.msRequestFullscreen();
+    throw new Error('FULLSCREEN_UNSUPPORTED');
   }
 
   function exitAppFullscreen(){
@@ -11363,33 +11363,37 @@ window.HaetsalFullscreen = (function(){
     }
   }
 
-  function enterFullscreen(options){
-    const opts = options || {};
+  function enterFullscreen(){
+    if(requestInFlight) return;
+    entryCancelled = false;
     setPreferred(true);
-    const result = requestAppFullscreen({ silent: !!opts.silent });
-    if(result && typeof result.then === 'function'){
-      result.then(function(){
-        removeRestorePrompt();
+    requestInFlight = true;
+    restoreMessage = '전체화면으로 전환 중입니다.';
+    let result;
+    try{ result = requestAppFullscreen(); }catch(error){ result = Promise.reject(error); }
+    Promise.resolve(result && typeof result.then === 'function' ? result : new Promise(resolve => setTimeout(resolve, 50)))
+      .then(function(){
+        if(entryCancelled && getFullscreenElement()) return exitAppFullscreen();
+        restoreMessage = getFullscreenElement() ? '' : '전체화면 진입을 확인하지 못했습니다. 복귀 버튼으로 다시 요청할 수 있습니다.';
       }).catch(function(){
-        showRestorePromptIfNeeded();
-        armRestoreOnNextGesture();
+        restoreMessage = '브라우저가 전체화면 요청을 허용하지 않았습니다. 복귀 버튼으로 다시 요청하거나 브라우저 설정을 확인하세요.';
       }).finally(function(){
+        requestInFlight = false;
         syncButtons();
       });
-    }else{
-      setTimeout(syncButtons, 50);
-    }
+    syncButtons();
   }
 
   function leaveFullscreen(){
+    entryCancelled = true;
     setPreferred(false);
+    restoreMessage = '';
     removeRestorePrompt();
-    const result = exitAppFullscreen();
-    if(result && typeof result.finally === 'function'){
-      result.finally(syncButtons);
-    }else{
-      setTimeout(syncButtons, 50);
-    }
+    let result;
+    try{ if(getFullscreenElement()) result = exitAppFullscreen(); }catch(error){ result = Promise.reject(error); }
+    Promise.resolve(result).catch(function(){
+      alert('브라우저에서 전체화면 나가기를 완료하지 못했습니다. 브라우저의 전체화면 해제 기능을 사용하세요.');
+    }).finally(syncButtons);
   }
 
   function toggle(){
@@ -11400,74 +11404,15 @@ window.HaetsalFullscreen = (function(){
     }
   }
 
-  function shouldIgnoreRestoreGesture(event){
-    const target = event && event.target;
-    if(isTextInputOrLoginModalActive(event)) return true;
-    if(!target || !target.closest) return false;
-    if(target.closest('[data-action="toggle-fullscreen"], [data-t-action="toggle-fullscreen"], [data-action="dismiss-fullscreen-restore"], [data-action="restore-fullscreen-after-refresh"]')) return true;
-    return false;
-  }
-
-  function armRestoreOnNextGesture(){
-    if(restoreGestureArmed || !shouldRestoreFullscreen()) return;
-    restoreGestureArmed = true;
-
-    function cleanup(){
-      restoreGestureArmed = false;
-      document.removeEventListener('pointerup', handleGesture, true);
-      document.removeEventListener('touchend', handleGesture, true);
-      document.removeEventListener('keydown', handleGesture, true);
-    }
-
-    function handleGesture(event){
-      if(!shouldRestoreFullscreen()){
-        cleanup();
-        return;
-      }
-      if(shouldIgnoreRestoreGesture(event)) return;
-      cleanup();
-      enterFullscreen({ silent:true });
-    }
-
-    document.addEventListener('pointerup', handleGesture, true);
-    document.addEventListener('touchend', handleGesture, true);
-    document.addEventListener('keydown', handleGesture, true);
-  }
-
   function tryRestoreAfterRefresh(){
-    if(!shouldRestoreFullscreen()) return;
-    if(isTextInputOrLoginModalActive(null)){
-      showRestorePromptIfNeeded();
-      return;
-    }
     showRestorePromptIfNeeded();
-    armRestoreOnNextGesture();
-
-    if(silentRestoreTried) return;
-    silentRestoreTried = true;
-    setTimeout(function(){
-      if(!shouldRestoreFullscreen()) return;
-      const result = requestAppFullscreen({ silent:true });
-      if(result && typeof result.then === 'function'){
-        result.then(function(){
-          removeRestorePrompt();
-        }).catch(function(){
-          showRestorePromptIfNeeded();
-          armRestoreOnNextGesture();
-        }).finally(syncButtons);
-      }else{
-        syncButtons();
-      }
-    }, 80);
   }
 
   document.addEventListener('click', function(event){
     const dismissBtn = event.target.closest('[data-action="dismiss-fullscreen-restore"]');
     if(dismissBtn){
       event.preventDefault();
-      setPreferred(false);
-      removeRestorePrompt();
-      syncButtons();
+      leaveFullscreen();
       return;
     }
 
@@ -11487,6 +11432,9 @@ window.HaetsalFullscreen = (function(){
   document.addEventListener('fullscreenchange', syncButtons);
   document.addEventListener('webkitfullscreenchange', syncButtons);
   document.addEventListener('msfullscreenchange', syncButtons);
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'visible') syncButtons();
+  });
   document.addEventListener('DOMContentLoaded', function(){
     syncButtons();
     tryRestoreAfterRefresh();
@@ -11502,7 +11450,6 @@ window.HaetsalFullscreen = (function(){
   if(window.MutationObserver){
     const observer = new MutationObserver(function(){
       syncButtons();
-      if(shouldRestoreFullscreen() && !isTextInputOrLoginModalActive(null)) armRestoreOnNextGesture();
     });
     document.addEventListener('DOMContentLoaded', function(){
       if(document.body){
@@ -11523,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202610251640;
-  const APP_BUILD_LABEL = '20261025_1640';
+  const APP_BUILD_NUMBER = 202610252355;
+  const APP_BUILD_LABEL = '20261025_2355';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -21589,6 +21536,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
           orderEditUrgentIds:Array.isArray(result.remoteLifecycleOrderIds) ? result.remoteLifecycleOrderIds : []
         });
+      }
+      if(opts.remoteSnapshot === true && opts.fromCache === false && opts.hasPendingWrites === false
+        && window.HaetsalViewRestore && typeof window.HaetsalViewRestore.onLiveSnapshot === 'function'){
+        window.HaetsalViewRestore.onLiveSnapshot();
       }
       return { ...result, authorityChanged:opts.authorityChanged === true, renderRequested:shouldRender };
     }
@@ -51117,9 +51068,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   let tracking = false;
   let refreshing = false;
   let indicator = null;
+  let lastSavedView = '';
+  let restoringWorkQueue = false;
 
   function safeSessionSet(key, value){
-    try{ sessionStorage.setItem(key, value); }catch(error){ console.warn(error); }
+    try{ sessionStorage.setItem(key, value); return true; }catch(error){ console.warn(error); return false; }
   }
 
   function safeSessionGet(key){
@@ -51135,9 +51088,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   }
 
   function saveLastViewSnapshot(){
+    if(window.HaetsalViewRestore && window.HaetsalViewRestore.pending) return;
     const snapshot = {
       route: getActiveRoute(),
-      savedAt: new Date().toISOString(),
       order: null,
       tumbler: null
     };
@@ -51162,7 +51115,78 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       };
     }
 
-    safeSessionSet(SNAPSHOT_KEY, JSON.stringify(snapshot));
+    const view = JSON.stringify(snapshot);
+    if(view === lastSavedView) return;
+    snapshot.savedAt = new Date().toISOString();
+    if(safeSessionSet(SNAPSHOT_KEY, JSON.stringify(snapshot))) lastSavedView = view;
+  }
+
+  function waitForWorkQueueStep(promise){
+    let timer;
+    return Promise.race([promise, new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('VIEW_RESTORE_TIMEOUT')), 10000);
+    })]).finally(() => clearTimeout(timer));
+  }
+
+  function openRestoreLogin(){
+    const restore = window.HaetsalViewRestore;
+    if(!restore || !restore.pending || !window.OrderModule) return;
+    restoringWorkQueue = false;
+    delete restore.onLiveSnapshot;
+    const state = window.OrderModule.state;
+    if(window.HaetsalOperatorSession) window.HaetsalOperatorSession.clear();
+    state.appRole = 'GUEST';
+    state.currentView = 'ORDER_MAIN';
+    state.showLoginModal = true;
+    state.loginRole = restore.intent.appRole;
+    state.loginEmail = '';
+    state.loginPw = '';
+    window.HaetsalCombinedApp.showRoute('order');
+    restore.pending = false;
+    document.documentElement.classList.remove('view-restore-pending');
+    saveLastViewSnapshot();
+  }
+
+  async function restoreWorkQueue(){
+    const restore = window.HaetsalViewRestore;
+    const intent = restore.intent;
+    restoringWorkQueue = true;
+    try{
+      const verified = await waitForWorkQueueStep((async function(){
+        const key = intent.appRole === 'ADMIN' ? 'HaetsalAdminAuth' : 'HaetsalManagerAuth';
+        while(!(window[key] && typeof window[key].verifyCurrent === 'function')){
+          if(!restoringWorkQueue) return false;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        if(window.firebaseReadyPromise) await window.firebaseReadyPromise;
+        if(!restoringWorkQueue) return false;
+        const result = await window[key].verifyCurrent();
+        return !!(result && result.verified === true && window[key].isVerified());
+      })());
+      if(!verified){ openRestoreLogin(); return; }
+      document.getElementById('view-restore-status').textContent = '권한을 확인했습니다. 서버의 현재 주문 목록을 연결하고 있습니다.';
+      const queueReady = new Promise(resolve => {
+        restore.onLiveSnapshot = function(){ if(restoringWorkQueue) resolve(); };
+      });
+      window.OrderModule.state.orderQueueFilter = intent.orderQueueFilter;
+      if(window.OrderModule.openDashboard(intent.appRole, 'ORDERS') === false){ openRestoreLogin(); return; }
+      window.HaetsalCombinedApp.showRoute('order');
+      await waitForWorkQueueStep(queueReady);
+      const auth = intent.appRole === 'ADMIN' ? window.HaetsalAdminAuth : window.HaetsalManagerAuth;
+      const current = await waitForWorkQueueStep(auth.verifyCurrent());
+      if(!(current && current.verified === true && auth.isVerified()) || window.OrderModule.state.appRole !== intent.appRole){ openRestoreLogin(); return; }
+      restoringWorkQueue = false;
+      delete restore.onLiveSnapshot;
+      restore.pending = false;
+      document.documentElement.classList.remove('view-restore-pending');
+      saveLastViewSnapshot();
+    }catch(error){
+      restoringWorkQueue = false;
+      delete restore.onLiveSnapshot;
+      document.getElementById('view-restore-status').textContent = '연결 또는 권한 확인을 완료하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. 다시 연결하거나 로그인 화면으로 이동하세요.';
+      document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
+      console.error('이전 작업 화면 연결 실패', error);
+    }
   }
 
   async function waitForRestoredAdminVerification(){
@@ -51198,6 +51222,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   }
 
   function restoreLastViewSnapshot(){
+    if(window.HaetsalViewRestore && window.HaetsalViewRestore.pending){
+      restoreWorkQueue();
+      return;
+    }
     const raw = safeSessionGet(SNAPSHOT_KEY);
     if(!raw) return;
 
@@ -51399,6 +51427,19 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   }, { passive:true });
 
   window.addEventListener('beforeunload', saveLastViewSnapshot);
+  window.addEventListener('pagehide', saveLastViewSnapshot);
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'hidden') saveLastViewSnapshot();
+  });
+  document.addEventListener('click', function(event){
+    const button = event.target.closest('[data-view-restore]');
+    if(button){
+      if(button.dataset.viewRestore === 'retry') location.reload();
+      if(button.dataset.viewRestore === 'login') openRestoreLogin();
+      return;
+    }
+    Promise.resolve().then(saveLastViewSnapshot);
+  });
   restoreLastViewSnapshot();
 })();
 </script>
