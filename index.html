@@ -19979,7 +19979,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         }
         const boundId = orderId || (previous && tumblers.some(item => (previous.tumblers || []).some(saved => String(saved.id) === String(item.id) && String(saved.reservationSessionId) === String(item.reservationSessionId))) ? previous.orderId : '') || '';
         const confirmationState = boundId ? (orderId ? 'pending' : (previous && previous.confirmationState || 'unknown')) : '';
-        const saved = {clientSessionId:state.clientSessionId,userId,orderId:boundId,confirmationState,tumblers,
+        const saved = {clientSessionId:state.clientSessionId,userId,draftGeneration:orderRentDraftGeneration,orderId:boundId,confirmationState,tumblers,
           orderItems:state.orderItems,deliveryType:state.deliveryType,tempLocation:state.tempLocation,
           tempTumblerInfo:state.tempTumblerInfo};
         const serialized = JSON.stringify(saved);
@@ -24422,10 +24422,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       state.isTumblerPermanent = false;
     }
 
-    function addPersonalTumblerForOrderItem(index){
+    async function addPersonalTumblerForOrderItem(index){
       const input = window.prompt('추가할 개인텀블러 정보를 입력해주세요.\n예: 베이지색, 이름 스티커, 아이스 2번 등', '');
       if(input === null) return;
-      const result = addOrSelectPersonalTumblerForOrderItem(index, input);
+      const result = await addOrSelectPersonalTumblerForOrderItem(index, input);
       if(!result.ok){
         showMessage(result.message || '개인텀블러 정보를 추가할 수 없습니다.');
         return;
@@ -24434,12 +24434,15 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       if(result.added) showMessage('개인텀블러 정보가 추가되었습니다.');
     }
 
-    function addOrSelectPersonalTumblerForOrderItem(index, label){
+    async function addOrSelectPersonalTumblerForOrderItem(index, label){
       ensureOrderItemsRuntime();
-      const user = getUserById(state.selectedUserId);
+      let user = getUserById(state.selectedUserId);
       if(!user) return { ok:false, message:'사용자를 먼저 선택해주세요.' };
       const clean = String(label || '').trim();
       if(!clean) return { ok:false, message:'개인텀블러 정보를 입력해주세요.' };
+      if(!(await releaseOrderItemAutoRentTumbler(index, true)).ok) return {ok:false,message:'임시 대여 취소 결과를 먼저 확인해주세요.'};
+      user = getUserById(state.selectedUserId);
+      if(!user) return {ok:false,message:'사용자를 먼저 선택해주세요.'};
       const now = new Date().toISOString();
       const baseInfo = getOrderUserBaseTumblerInfo(user.id);
       const list = normalizeOrderPersonalTumblers(user.personalTumblers);
@@ -24456,7 +24459,6 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         user.personalTumblers = list;
       }
       if(state.orderItems[index]){
-        if(state.orderItems[index].assignedTumblerAutoRent) releaseOrderItemAutoRentTumbler(index, true);
         state.orderItems[index].cupType = 'TUMBLER';
       }
       const options = getOrderTumblerOptions(user.id);
@@ -24500,13 +24502,13 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       state.orderPersonalTumblerSettingsValue = '';
     }
 
-    function selectOrderPersonalTumblerFromSettings(index, value){
+    async function selectOrderPersonalTumblerFromSettings(index, value){
       ensureOrderItemsRuntime();
       if(!state.orderItems[index]){
         showMessage('주문 항목을 찾을 수 없습니다.');
         return;
       }
-      if(state.orderItems[index].assignedTumblerAutoRent) releaseOrderItemAutoRentTumbler(index, true);
+      if(state.orderItems[index].assignedTumblerAutoRent) if(!(await releaseOrderItemAutoRentTumbler(index, true)).ok) return false;
       applyOrderItemTumblerAssignment(index, value);
       if(state.orderItems[index]) state.orderItems[index].showPersonalTumblerEdit = false;
       closeOrderPersonalTumblerSettings();
@@ -24567,10 +24569,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       showMessage('개인텀블러 정보가 수정되었습니다.');
     }
 
-    function addOrderPersonalTumblerFromSettings(index){
+    async function addOrderPersonalTumblerFromSettings(index){
       const inputEl = document.getElementById('orderPersonalTumblerNewInput');
       const clean = String((inputEl && inputEl.value) || '').trim();
-      const result = addOrSelectPersonalTumblerForOrderItem(index, clean);
+      const result = await addOrSelectPersonalTumblerForOrderItem(index, clean);
       if(!result.ok){ showMessage(result.message || '개인텀블러 정보를 추가할 수 없습니다.'); return; }
       state.orderPersonalTumblerSettingsValue = '';
       render();
@@ -24671,6 +24673,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function canChangeOrderRentDraft(silent=false){
+      if(orderRentReleaseInFlight){
+        if(!silent) showMessage('임시 대여 취소 결과를 확인하고 있습니다. 잠시만 기다려주세요.');
+        return false;
+      }
       if(state.currentView !== 'ORDER_MAIN') return true;
       if(state.isSubmittingOrder && state.submittingOrderUserId === String(state.selectedUserId || '')){
         if(!silent) showMessage('주문을 접수하는 중입니다. 잠시만 기다려주세요.');
@@ -24696,43 +24702,70 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function releaseAutoRentTumblerTarget(target, silent=true){
+    async function releaseAutoRentTumblerTarget(target, silent=true){
       if(!target || !target.assignedTumblerId) return { ok:true, released:0 };
       if(!canChangeOrderRentDraft(silent)) return {ok:false,released:0};
       const targetId = String(target.assignedTumblerId || '');
-      const reservation = (Array.isArray(state.pendingOrderTumblers) ? state.pendingOrderTumblers : []).find(row => String(row.id) === targetId);
-      if(!reservation || !reservation.reservationSessionId) return {ok:true,released:0};
-      let result = { ok:true, released:0 };
-      if(window.TumblerModule && typeof window.TumblerModule.releaseReservedRentOrder === 'function'){
-        result = window.TumblerModule.releaseReservedRentOrder([reservation], state.selectedUserId || '', true) || result;
-      }
-      for(const item of state.orderItems){
-        for(const choice of [item, ...(Array.isArray(item.unitChoices) ? item.unitChoices : [])]){
-          if(String(choice.assignedTumblerId || '') === targetId
-            && String(choice.assignedTumblerReservationSessionId || '') === String(reservation.reservationSessionId)){
-            clearOrderItemTumblerAssignment(choice);
+      const sessionId = String(target.assignedTumblerReservationSessionId || '');
+      const reservation = (Array.isArray(state.pendingOrderTumblers) ? state.pendingOrderTumblers : [])
+        .find(row => String(row.id) === targetId && String(row.reservationSessionId || '') === sessionId);
+      if(!reservation || !sessionId) return {ok:!target.assignedTumblerAutoRent,released:0};
+      if(!(window.TumblerModule && typeof window.TumblerModule.releaseReservedRentOrder === 'function')) return {ok:false,released:0};
+      const userId = String(state.selectedUserId || ''), generation = orderRentDraftGeneration;
+      if(!userId || !saveOrderRentRecovery()) return {ok:false,released:0};
+      const matchesProof = row => String(row.id || '') === targetId && String(row.reservationSessionId || '') === sessionId;
+      const matchesChoice = choice => String(choice.assignedTumblerId || '') === targetId
+        && String(choice.assignedTumblerReservationSessionId || '') === sessionId;
+      const clearMatching = items => {
+        for(const item of items){
+          for(const choice of [item, ...(Array.isArray(item.unitChoices) ? item.unitChoices : [])]){
+            if(matchesChoice(choice)) clearOrderItemTumblerAssignment(choice);
           }
         }
-      }
-      removePendingOrderTumblerById(targetId);
-      clearOrderItemTumblerAssignment(target);
-      syncPendingOrderTumblerRuntime();
-      return result;
+      };
+      orderRentReleaseInFlight = true;
+      try{
+        const result = await window.TumblerModule.releaseReservedRentOrder([{...reservation}], userId, true);
+        if(!result || !result.ok) return result || {ok:false,released:0};
+        const saved = readOrderRentRecovery(userId);
+        if(saved){
+          if(saved.draftGeneration !== generation || (saved.orderId && saved.confirmationState !== 'rejected')) return {ok:false,reason:'draft-changed'};
+          saved.tumblers = (saved.tumblers || []).filter(row => !matchesProof(row));
+          clearMatching(saved.orderItems || []);
+          saved.tempTumblerInfo = getOrderTumblerInfoSummary(saved.orderItems) || saved.tumblers.map(row => row.label || '').filter(Boolean).join(', ');
+          if(saved.tumblers.length) sessionStorage.setItem(orderRentRecoveryKey(userId), JSON.stringify(saved));
+          else sessionStorage.removeItem(orderRentRecoveryKey(userId));
+        }
+        if(String(state.selectedUserId || '') !== userId || orderRentDraftGeneration !== generation) return {ok:false,reason:'draft-changed'};
+        clearMatching(state.orderItems);
+        if(matchesChoice(target)) clearOrderItemTumblerAssignment(target);
+        state.pendingOrderTumblers = state.pendingOrderTumblers.filter(row => !matchesProof(row));
+        syncPendingOrderTumblerRuntime();
+        return result;
+      }catch(error){
+        console.warn('임시 대여 취소 결과 재확인 필요',error);
+        showMessage('임시 대여 취소 결과를 확인하지 못했습니다. 같은 주문에서 다시 확인해주세요.');
+        return {ok:false,reason:'release-unconfirmed'};
+      }finally{ orderRentReleaseInFlight = false; }
     }
 
-    function releaseOrderItemAutoRentTumbler(index, silent=true){
+    async function releaseOrderItemAutoRentTumbler(index, silent=true){
       ensureOrderItemsRuntime();
       const item = state.orderItems[index];
       if(!item) return { ok:true, released:0 };
-      let result = releaseAutoRentTumblerTarget(item, silent);
-      if(Array.isArray(item.unitChoices)){
-        item.unitChoices.forEach(unit => {
-          const unitResult = releaseAutoRentTumblerTarget(unit, silent);
-          if(unitResult && unitResult.released) result = unitResult;
-        });
+      const generation = orderRentDraftGeneration, userId = state.selectedUserId;
+      const seen = new Set();
+      let released = 0;
+      for(const target of [item, ...(Array.isArray(item.unitChoices) ? item.unitChoices : [])]){
+        const key = String(target.assignedTumblerId || '') + ':' + String(target.assignedTumblerReservationSessionId || '');
+        if(seen.has(key)) continue;
+        seen.add(key);
+        const result = await releaseAutoRentTumblerTarget(target, silent);
+        if(!result.ok || generation !== orderRentDraftGeneration || userId !== state.selectedUserId) return {ok:false};
+        released += Number(result.released || 0);
       }
       syncPendingOrderTumblerRuntime();
-      return result;
+      return {ok:true,released};
     }
 
     async function cancelPendingOrderRentTumbler(index, tumblerId){
@@ -24796,7 +24829,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    let orderRentAssignmentInFlight = false, orderRentDraftGeneration = 0;
+    let orderRentAssignmentInFlight = false, orderRentReleaseInFlight = false, orderRentDraftGeneration = 0;
     async function assignNewRentTumblerForOrderItem(index){
       if(orderRentAssignmentInFlight) return false;
       orderRentAssignmentInFlight=true;
@@ -24811,8 +24844,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 대여는 교직원만 가능합니다.\n필요한 경우 주문담당 학생 및 카페 담당 교사에게 문의해 주세요.');
         return false;
       }
+      if(!(await releaseOrderItemAutoRentTumbler(index, true)).ok) return false;
       if(state.orderItems[index].cupType !== 'TUMBLER') state.orderItems[index].cupType = 'TUMBLER';
-      releaseOrderItemAutoRentTumbler(index, true);
       let item = state.orderItems[index];
       if(!item){
         showMessage('주문 항목을 찾을 수 없습니다.');
@@ -24883,8 +24916,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('텀블러 대여는 교직원만 가능합니다.\n필요한 경우 주문담당 학생 및 카페 담당 교사에게 문의해 주세요.');
         return false;
       }
+      if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
+      item = state.orderItems[index];
+      unit = ensureOrderItemUnitChoices(index)[unitIndex];
       unit.cupType = 'TUMBLER';
-      releaseAutoRentTumblerTarget(unit, true);
       const tumblerType = String(item.temp || 'ICE').toUpperCase() === 'HOT' ? 'hot' : 'ice';
       if(!(window.TumblerModule && typeof window.TumblerModule.reserveSingleRentOrderTumbler === 'function')){
         showMessage('텀블러 자동 배정 기능을 찾을 수 없습니다. 화면을 새로고침한 뒤 다시 시도해주세요.');
@@ -25729,14 +25764,14 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       syncPendingOrderTumblerRuntime();
     }
 
-    function adjustOrderGroupCupCount(index, cupType, delta){
+    async function adjustOrderGroupCupCount(index, cupType, delta){
       ensureOrderItemsRuntime();
-      const item = state.orderItems[index];
+      let item = state.orderItems[index];
       if(!item) return false;
       item.groupedCupSelection = true;
       const normalizedCupType = getValidOrderCupType(cupType, 'STORE_CUP');
       if(!['STORE_CUP','DISPOSABLE'].includes(normalizedCupType)) return false;
-      const units = ensureOrderItemUnitChoices(index);
+      let units = ensureOrderItemUnitChoices(index);
       const step = Number(delta || 0) > 0 ? 1 : -1;
       if(step > 0){
         const summary = getGroupedOrderCupSelectionSummary(item);
@@ -25749,13 +25784,17 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           showMessage('선택 가능한 잔이 없습니다. 다른 컵을 줄인 뒤 다시 선택해주세요.');
           return false;
         }
-        releaseAutoRentTumblerTarget(units[unitIndex], true);
+        if(!(await releaseAutoRentTumblerTarget(units[unitIndex], true)).ok) return false;
+        item = state.orderItems[index];
+        units = ensureOrderItemUnitChoices(index);
         clearOrderItemTumblerAssignment(units[unitIndex]);
         units[unitIndex].cupType = normalizedCupType;
       }else{
         const unitIndex = units.map(unit => getValidOrderCupType(unit.cupType, 'TUMBLER')).lastIndexOf(normalizedCupType);
         if(unitIndex < 0) return false;
-        releaseAutoRentTumblerTarget(units[unitIndex], true);
+        if(!(await releaseAutoRentTumblerTarget(units[unitIndex], true)).ok) return false;
+        item = state.orderItems[index];
+        units = ensureOrderItemUnitChoices(index);
         units[unitIndex] = createEmptyOrderTumblerUnitChoice();
       }
       if(orderHasStoreCupItem() && state.deliveryType === 'DELIVERY') state.deliveryType = 'PICKUP';
@@ -25763,19 +25802,21 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function toggleOrderGroupTumblerSelection(index, selectedId){
+    async function toggleOrderGroupTumblerSelection(index, selectedId){
       ensureOrderItemsRuntime();
-      const item = state.orderItems[index];
+      let item = state.orderItems[index];
       if(!item) return false;
       item.groupedCupSelection = true;
       const value = String(selectedId || '');
       if(!value) return false;
-      const units = ensureOrderItemUnitChoices(index);
+      let units = ensureOrderItemUnitChoices(index);
       const options = getOrderTumblerOptions(state.selectedUserId);
       const baseInfo = getOrderUserBaseTumblerInfo(state.selectedUserId);
       const activeIndex = units.findIndex(unit => getValidOrderCupType(unit.cupType, 'TUMBLER') === 'TUMBLER' && getTumblerSelectedButtonValue(unit, options, baseInfo) === value);
       if(activeIndex >= 0){
-        releaseAutoRentTumblerTarget(units[activeIndex], true);
+        if(!(await releaseAutoRentTumblerTarget(units[activeIndex], true)).ok) return false;
+        item = state.orderItems[index];
+        units = ensureOrderItemUnitChoices(index);
         clearOrderItemTumblerAssignment(units[activeIndex]);
         units[activeIndex].cupType = 'TUMBLER';
         syncGroupedCupItemPrimary(index);
@@ -25791,7 +25832,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('선택 가능한 잔이 없습니다. 다른 컵을 줄인 뒤 다시 선택해주세요.');
         return false;
       }
-      releaseAutoRentTumblerTarget(units[unitIndex], true);
+      if(!(await releaseAutoRentTumblerTarget(units[unitIndex], true)).ok) return false;
+        item = state.orderItems[index];
+        units = ensureOrderItemUnitChoices(index);
       units[unitIndex].cupType = 'TUMBLER';
       applyTumblerSelectionToItem(units[unitIndex], value, options, baseInfo);
       if(value !== ORDER_DIRECT_INPUT_VALUE) state.isTumblerPermanent = false;
@@ -25799,9 +25842,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function addOrderGroupDirectTumbler(index){
+    async function addOrderGroupDirectTumbler(index){
       ensureOrderItemsRuntime();
-      const item = state.orderItems[index];
+      let item = state.orderItems[index];
       if(!item) return false;
       item.groupedCupSelection = true;
       const summary = getGroupedOrderCupSelectionSummary(item);
@@ -25809,13 +25852,15 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         showMessage('이미 주문 수량만큼 컵 선택이 완료되었습니다. 다른 컵을 줄인 뒤 다시 선택해주세요.');
         return false;
       }
-      const units = ensureOrderItemUnitChoices(index);
+      let units = ensureOrderItemUnitChoices(index);
       const unitIndex = findOrderGroupAvailableUnitIndex(index, units);
       if(unitIndex < 0 || !units[unitIndex]){
         showMessage('선택 가능한 잔이 없습니다. 다른 컵을 줄인 뒤 다시 선택해주세요.');
         return false;
       }
-      releaseAutoRentTumblerTarget(units[unitIndex], true);
+      if(!(await releaseAutoRentTumblerTarget(units[unitIndex], true)).ok) return false;
+        item = state.orderItems[index];
+        units = ensureOrderItemUnitChoices(index);
       units[unitIndex].cupType = 'TUMBLER';
       units[unitIndex].assignedTumblerId = '';
       units[unitIndex].assignedTumblerLabel = '';
@@ -25831,11 +25876,12 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return true;
     }
 
-    function removeOrderGroupDirectTumbler(index, unitIndex){
-      const units = ensureOrderItemUnitChoices(index);
+    async function removeOrderGroupDirectTumbler(index, unitIndex){
+      let units = ensureOrderItemUnitChoices(index);
       const unit = units[unitIndex];
       if(!unit) return false;
-      releaseAutoRentTumblerTarget(unit, true);
+      if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
+      units = ensureOrderItemUnitChoices(index);
       units[unitIndex] = createEmptyOrderTumblerUnitChoice();
       const item = state.orderItems[index];
       if(item) item.unitChoices = units;
@@ -26247,6 +26293,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function resetOrderInputs(){
+      orderRentDraftGeneration += 1;
       releasePendingOrderTumblerReservations();
       state.selectedUserId = null;
       state.searchTerm = '';
@@ -31506,6 +31553,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     async function handleFinalOrder(userId, qty, memoText, proxyMode=false){
+      if(orderRentReleaseInFlight){ showMessage('임시 대여 취소 결과를 먼저 확인해주세요.'); return false; }
       if(state.isSubmittingOrder){
         showMessage('주문을 접수하는 중입니다. 잠시만 기다려주세요.');
         return;
@@ -44577,29 +44625,31 @@ body.mobile-tablet-device .pos-keyboard-btn{
       ].join('|');
     }
 
-    function runOrderGroupCupButton(btn){
+    async function runOrderGroupCupButton(btn){
       if(!btn) return false;
       const action = btn.dataset.action;
       if(!ORDER_GROUP_CUP_ACTIONS.has(action)) return false;
       const index = Number(btn.dataset.index || 0);
+      const generation = orderRentDraftGeneration, userId = state.selectedUserId;
       let changed = false;
       if(action === 'adjust-order-group-cup-count'){
-        changed = adjustOrderGroupCupCount(index, btn.dataset.cupType || '', Number(btn.dataset.delta || 0));
+        changed = await adjustOrderGroupCupCount(index, btn.dataset.cupType || '', Number(btn.dataset.delta || 0));
       }else if(action === 'toggle-order-group-tumbler'){
-        changed = toggleOrderGroupTumblerSelection(index, btn.dataset.value || '');
+        changed = await toggleOrderGroupTumblerSelection(index, btn.dataset.value || '');
       }else if(action === 'add-order-group-direct-tumbler'){
-        changed = addOrderGroupDirectTumbler(index);
+        changed = await addOrderGroupDirectTumbler(index);
       }else if(action === 'remove-order-group-direct-tumbler'){
-        changed = removeOrderGroupDirectTumbler(index, Number(btn.dataset.unitIndex || 0));
+        changed = await removeOrderGroupDirectTumbler(index, Number(btn.dataset.unitIndex || 0));
       }else if(action === 'new-order-group-rent-tumbler'){
-        changed = addOrderGroupRentTumbler(index);
+        changed = await addOrderGroupRentTumbler(index);
       }
+      if(!changed || generation !== orderRentDraftGeneration || userId !== state.selectedUserId) return false;
       syncGroupedCupItemPrimary(index);
       render();
       return changed;
     }
 
-    function handleOrderGroupCupButtonEvent(event){
+    async function handleOrderGroupCupButtonEvent(event){
       const btn = getOrderGroupCupButton(event);
       if(!btn) return;
       const key = makeOrderGroupCupActionKey(btn);
@@ -44615,7 +44665,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       lastOrderGroupCupAction = { key, time:now };
       requestOrderScrollRestore();
       keepElementVisibleAfterRender(btn);
-      runOrderGroupCupButton(btn);
+      await runOrderGroupCupButton(btn);
     }
 
     document.addEventListener('pointerup', handleOrderGroupCupButtonEvent, true);
@@ -45389,7 +45439,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const autoRentUnitIndexes = beforeItem && Array.isArray(beforeItem.unitChoices)
           ? beforeItem.unitChoices.map((unit,index) => unit && unit.assignedTumblerAutoRent ? index : -1).filter(index => index >= 0) : [];
         const hadAutoRent = !!(beforeItem && beforeItem.assignedTumblerAutoRent) || autoRentUnitIndexes.length > 0;
-        if(hadAutoRent) releaseOrderItemAutoRentTumbler(idx, true);
+        if(hadAutoRent) if(!(await releaseOrderItemAutoRentTumbler(idx, true)).ok) return false;
         const item = state.orderItems[idx];
         if(item) {
           item.temp = btn.dataset.value === 'HOT' ? 'HOT' : 'ICE';
@@ -45419,13 +45469,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const idx = Number(btn.dataset.index || 0);
         ensureOrderItemsRuntime();
         if(state.orderItems[idx]) {
-          releaseOrderItemAutoRentTumbler(idx, true);
+          if(!(await releaseOrderItemAutoRentTumbler(idx, true)).ok) return false;
           const item = state.orderItems[idx];
           if(item){
             item.cupType = getValidOrderCupType(btn.dataset.value, 'TUMBLER');
             item.groupedCupSelection = Number(item.quantity || 1) > 1;
             item.unitChoices = normalizeOrderUnitChoicesForItem(item).map(unit => {
-              if(unit.assignedTumblerAutoRent) releaseAutoRentTumblerTarget(unit, true);
               const nextUnit = { ...unit, cupType:item.cupType };
               if(item.cupType !== 'TUMBLER') clearOrderItemTumblerAssignment(nextUnit);
               return nextUnit;
@@ -45440,22 +45489,22 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       else if(action === 'adjust-order-group-cup-count'){
         event.preventDefault();
-        adjustOrderGroupCupCount(Number(btn.dataset.index || 0), btn.dataset.cupType || '', Number(btn.dataset.delta || 0));
+        await adjustOrderGroupCupCount(Number(btn.dataset.index || 0), btn.dataset.cupType || '', Number(btn.dataset.delta || 0));
         render();
       }
       else if(action === 'toggle-order-group-tumbler'){
         event.preventDefault();
-        toggleOrderGroupTumblerSelection(Number(btn.dataset.index || 0), btn.dataset.value || '');
+        await toggleOrderGroupTumblerSelection(Number(btn.dataset.index || 0), btn.dataset.value || '');
         render();
       }
       else if(action === 'add-order-group-direct-tumbler'){
         event.preventDefault();
-        addOrderGroupDirectTumbler(Number(btn.dataset.index || 0));
+        await addOrderGroupDirectTumbler(Number(btn.dataset.index || 0));
         render();
       }
       else if(action === 'remove-order-group-direct-tumbler'){
         event.preventDefault();
-        removeOrderGroupDirectTumbler(Number(btn.dataset.index || 0), Number(btn.dataset.unitIndex || 0));
+        await removeOrderGroupDirectTumbler(Number(btn.dataset.index || 0), Number(btn.dataset.unitIndex || 0));
         render();
       }
       else if(action === 'new-order-group-rent-tumbler'){
@@ -45467,9 +45516,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const idx = Number(btn.dataset.index || 0);
         const unitIndex = Number(btn.dataset.unitIndex || 0);
         const units = ensureOrderItemUnitChoices(idx);
-        const unit = units[unitIndex];
+        let unit = units[unitIndex];
         if(unit){
-          releaseAutoRentTumblerTarget(unit, true);
+          if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
+          unit = ensureOrderItemUnitChoices(idx)[unitIndex];
           unit.cupType = getValidOrderCupType(btn.dataset.value, 'TUMBLER');
           if(unit.cupType !== 'TUMBLER') clearOrderItemTumblerAssignment(unit);
         }
@@ -45484,7 +45534,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const unit = units[unitIndex];
         const nextValue = String(btn.dataset.value || '');
         if(unit && unit.assignedTumblerAutoRent && nextValue !== String(unit.assignedTumblerId || '')){
-          releaseAutoRentTumblerTarget(unit, true);
+          if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
         }
         applyOrderUnitTumblerAssignment(idx, unitIndex, nextValue);
         render();
@@ -45497,10 +45547,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const idx = Number(btn.dataset.index || 0);
         const unitIndex = Number(btn.dataset.unitIndex || 0);
         const units = ensureOrderItemUnitChoices(idx);
-        const unit = units[unitIndex];
+        let unit = units[unitIndex];
         const targetId = String(btn.dataset.value || '').trim();
         if(unit && targetId && String(unit.assignedTumblerId || '') === targetId){
-          releaseAutoRentTumblerTarget(unit, true);
+          if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return false;
+          unit = ensureOrderItemUnitChoices(idx)[unitIndex];
           unit.cupType = 'TUMBLER';
         }
         syncPendingOrderTumblerRuntime();
@@ -45512,7 +45563,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const item = state.orderItems[idx];
         const nextValue = String(btn.dataset.value || '');
         if(item && item.assignedTumblerAutoRent && nextValue !== String(item.assignedTumblerId || '')){
-          releaseOrderItemAutoRentTumbler(idx, true);
+          if(!(await releaseOrderItemAutoRentTumbler(idx, true)).ok) return false;
         }
         applyOrderItemTumblerAssignment(idx, nextValue);
         if(state.orderItems[idx]) state.orderItems[idx].showPersonalTumblerEdit = false;
@@ -45526,13 +45577,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
         render();
       }
       else if(action === 'select-order-personal-tumbler-from-settings'){
-        selectOrderPersonalTumblerFromSettings(Number(btn.dataset.index || 0), btn.dataset.value || '');
+        await selectOrderPersonalTumblerFromSettings(Number(btn.dataset.index || 0), btn.dataset.value || '');
       }
       else if(action === 'edit-order-personal-tumbler-from-settings'){
         editOrderPersonalTumblerFromSettings(Number(btn.dataset.index || 0), btn.dataset.value || '');
       }
       else if(action === 'add-order-personal-tumbler-from-settings'){
-        addOrderPersonalTumblerFromSettings(Number(btn.dataset.index || 0));
+        await addOrderPersonalTumblerFromSettings(Number(btn.dataset.index || 0));
       }
       else if(action === 'edit-order-item-personal-tumbler'){
         const idx = Number(btn.dataset.index || 0);
@@ -45540,7 +45591,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const beforeItem = state.orderItems[idx];
         const baseInfo = getOrderUserBaseTumblerInfo(state.selectedUserId);
         const currentInfo = String((beforeItem && beforeItem.assignedTumblerLabel) || baseInfo || '').trim();
-        if(beforeItem && beforeItem.assignedTumblerAutoRent) releaseOrderItemAutoRentTumbler(idx, true);
+        if(beforeItem && beforeItem.assignedTumblerAutoRent) if(!(await releaseOrderItemAutoRentTumbler(idx, true)).ok) return false;
         const item = state.orderItems[idx];
         if(item){
           item.showPersonalTumblerEdit = true;
@@ -45557,7 +45608,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         render();
       }
       else if(action === 'add-order-item-personal-tumbler'){
-        addPersonalTumblerForOrderItem(Number(btn.dataset.index || 0));
+        await addPersonalTumblerForOrderItem(Number(btn.dataset.index || 0));
       }
       else if(action === 'new-order-item-rent-tumbler'){
         await assignNewRentTumblerForOrderItem(Number(btn.dataset.index || 0));
@@ -45570,12 +45621,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
       else if(action === 'decrease-order-item-qty'){
         const idx = Number(btn.dataset.index || 0);
         ensureOrderItemsRuntime();
-        const item = state.orderItems[idx];
+        let item = state.orderItems[idx];
         if(item){
           const beforeQty = Math.max(1, Number(item.quantity || 1));
           if(beforeQty > 1) orderRentDraftGeneration += 1;
           if(beforeQty > 1 && Array.isArray(item.unitChoices) && item.unitChoices.length >= beforeQty){
-            item.unitChoices.slice(beforeQty - 1).forEach(unit => releaseAutoRentTumblerTarget(unit, true));
+            for(const unit of item.unitChoices.slice(beforeQty - 1)){
+              if(!(await releaseAutoRentTumblerTarget(unit, true)).ok) return;
+            }
+            item = state.orderItems[idx];
           }
           item.quantity = Math.max(1, beforeQty - 1);
           item.groupedCupSelection = item.quantity > 1;
@@ -45619,7 +45673,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const idx = Number(btn.dataset.index || 0);
         const scrollSnapshot = captureOrderScrollPosition();
         ensureOrderItemsRuntime();
-        releaseOrderItemAutoRentTumbler(idx, true);
+        if(!(await releaseOrderItemAutoRentTumbler(idx, true)).ok) return false;
         if(state.orderItems.length > 1) state.orderItems = state.orderItems.filter((_, itemIndex) => itemIndex !== idx);
         if(Number(state.expandedOrderItemIndex) === idx){
           state.expandedOrderItemIndex = Math.min(idx, state.orderItems.length - 1);
