@@ -11523,8 +11523,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202610242246;
-  const APP_BUILD_LABEL = '20261024_2246';
+  const APP_BUILD_NUMBER = 202610251640;
+  const APP_BUILD_LABEL = '20261025_1640';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -26268,7 +26268,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     function updateOrderSubmitButtonView(){
       const summary = app.querySelector('#orderSubmitSummary');
       if(!summary) return;
-      summary.textContent = `총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감`;
+      const couponCost = Number(calculateOrderCouponCostFromItems(state.orderItems) || 1);
+      summary.dataset.couponCost = String(couponCost);
+      summary.textContent = `총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${couponCost}장 차감`;
     }
 
     function updateOrderReceiveSectionView(){
@@ -31619,6 +31621,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     async function handleFinalOrder(userId, qty, memoText, proxyMode=false){
+      const displayedSummary = !proxyMode && state.currentView === 'ORDER_MAIN' && String(state.selectedUserId || '') === String(userId || '')
+        ? app.querySelector('#orderSubmitSummary') : null;
+      const displayedCouponCost = displayedSummary ? Number(displayedSummary.dataset.couponCost) : null;
       if(orderRentReleaseInFlight){ showMessage('임시 대여 취소 결과를 먼저 확인해주세요.'); return false; }
       if(readPendingOrderRentReleases(userId).length){
         const generation = orderRentDraftGeneration, selectedUserId = state.selectedUserId;
@@ -31660,6 +31665,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       autoAssignOrderItemTumblers();
       const orderItems = normalizeOrderItemsForStorage(state.orderItems);
+      if(displayedCouponCost !== null && displayedCouponCost !== getOrderCouponCostFromItems(orderItems)){
+        requestOrderScrollRestore();
+        render();
+        showMessage('메뉴의 쿠폰 사용량이 변경되었습니다. 변경된 사용량을 확인한 뒤 다시 주문 접수해 주세요.');
+        return;
+      }
       const permanentTumblerInfoCandidate = getOrderPermanentTumblerInfoCandidate(orderItems, user);
       const rentOrderCount = state.pendingOrderSource === 'TUMBLER_RENT_ORDER'
         ? (Array.isArray(state.pendingOrderTumblers) ? state.pendingOrderTumblers.length : 0)
@@ -38993,6 +39004,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let preserveOrderEditModalScrollOnNextRender = false;
     let orderEditModalScrollSnapshot = null;
     let deferredOrderSearchRemoteRender = false;
+    let orderSubmitPointer = null;
     let orderUserSearchSelecting = false;
     let orderEditInputIsComposing = false;
 
@@ -39232,6 +39244,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
         && (adminUserSearchIsComposing || !!(active && active.id === 'adminUserSearch' && app.contains(active)));
     }
 
+    function isOrderSubmitInteractionActiveForRemoteRender(){
+      const active = document.activeElement;
+      return state.currentView === 'ORDER_MAIN' && (!!orderSubmitPointer || !!(active && app.contains(active) && active.matches('button[data-action]')));
+    }
+
     function renderAfterRemoteOrderSync(reason, options){
       const opts = options || {};
       const editingOrderId = String(state.editingOrderId || '');
@@ -39265,7 +39282,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(!adminUserSearchIsComposing) updateAdminUsersSearchResults();
         return;
       }
-      if(isOrderInputFocusedForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderUserSearchSelecting){
+      if(isOrderInputFocusedForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderUserSearchSelecting || isOrderSubmitInteractionActiveForRemoteRender()){
         deferredOrderSearchRemoteRender = true;
         if(window.console && console.info){
           console.info('주문 화면 입력 중이라 동기화 화면 갱신을 보류합니다.', reason || 'remote-sync');
@@ -39281,7 +39298,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     function flushDeferredOrderSearchRemoteRender(reason){
-      if(!deferredOrderSearchRemoteRender || isAdminUserSearchActiveForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender()) return;
+      if(!deferredOrderSearchRemoteRender || isAdminUserSearchActiveForRemoteRender() || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing || orderUserSearchSelecting || isOrderInputFocusedForRemoteRender() || isOrderEditInputFocusedForRemoteRender() || isDashboardDateInputFocusedForRemoteRender() || isLoginModalInputActiveForRemoteRender() || isOrderSubmitInteractionActiveForRemoteRender()) return;
       const active = document.activeElement;
       const controlFocus = adminUserSearchRemoteRenderPending && state.appRole === 'ADMIN' && isDashboardView() && state.dashboardTab === 'USERS'
         && active && app.contains(active) && active.matches('button[data-action], input[type="checkbox"]')
@@ -40135,7 +40152,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
 
                     <div class="order-submit-actions">
-                      <div id="orderSubmitSummary" class="order-submit-summary" aria-live="polite" aria-atomic="true">총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감</div>
+                      <div id="orderSubmitSummary" class="order-submit-summary" data-coupon-cost="${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}" aria-live="polite" aria-atomic="true">총 ${Number(getOrderTotalQuantityFromItems(state.orderItems) || 1)}잔 · 쿠폰 ${Number(calculateOrderCouponCostFromItems(state.orderItems) || 1)}장 차감</div>
                       <button class="btn btn-gray order-cancel-btn" data-action="cancel-selected-user">접수 취소</button>
                       <button class="btn btn-amber order-submit-btn" data-action="submit-order" aria-describedby="orderSubmitSummary">주문 접수</button>
                     </div>
@@ -44343,7 +44360,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     document.addEventListener('focusout', (event) => {
       const t = event.target;
       if(!(app.contains(t) || modalRoot.contains(t))) return;
-      if(t.id === 'adminUserSearch' || isOrderEntryInputElement(t) || isOrderEditInputElement(t) || isDashboardDateInputElement(t)){
+      if(t.id === 'adminUserSearch' || isOrderEntryInputElement(t) || isOrderEditInputElement(t) || isDashboardDateInputElement(t) || (state.currentView === 'ORDER_MAIN' && app.contains(t) && t.matches('button[data-action]'))){
         window.setTimeout(() => {
           flushDeferredOrderSearchRemoteRender(t.id === 'adminUserSearch' ? 'admin-user-search-blur' : isDashboardDateInputElement(t) ? 'dashboard-date-input-blur' : (isOrderEditInputElement(t) ? 'order-edit-input-blur' : 'order-input-blur'));
         }, 0);
@@ -44351,6 +44368,30 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(t.id === 'milkSupportReceivedDate' || (t.dataset && (t.dataset.milkSupportField || t.dataset.milkReviewField))){
         window.setTimeout(() => render(), 0);
       }
+    });
+
+    function releaseOrderSubmitPointer(){
+      const pending = orderSubmitPointer;
+      if(!pending) return;
+      // Keep the pressed button connected through the native click after pointerup.
+      window.setTimeout(() => {
+        if(orderSubmitPointer !== pending) return;
+        orderSubmitPointer = null;
+        flushDeferredOrderSearchRemoteRender('order-submit-pointer-end');
+      }, 0);
+    }
+    document.addEventListener('pointerdown', (event) => {
+      const button = event.target.closest && event.target.closest('button[data-action]');
+      if(state.currentView === 'ORDER_MAIN' && event.isPrimary !== false && event.button === 0 && button && app.contains(button) && !button.disabled){
+        orderSubmitPointer = { pointerId:event.pointerId };
+      }
+    }, true);
+    ['pointerup', 'pointercancel'].forEach(type => document.addEventListener(type, (event) => {
+      if(orderSubmitPointer && orderSubmitPointer.pointerId === event.pointerId) releaseOrderSubmitPointer();
+    }, true));
+    window.addEventListener('blur', releaseOrderSubmitPointer);
+    document.addEventListener('visibilitychange', () => {
+      if(document.visibilityState === 'hidden') releaseOrderSubmitPointer();
     });
 
     document.addEventListener('toggle', (event) => {
