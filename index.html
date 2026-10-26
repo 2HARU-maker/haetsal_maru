@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202610252355;
-  const APP_BUILD_LABEL = '20261025_2355';
+  const APP_BUILD_NUMBER = 202610261915;
+  const APP_BUILD_LABEL = '20261026_1915';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -11711,6 +11711,7 @@ window.HaetsalCloudStore = (function(){
   };
   const blockedKeys = new Set();
   const pendingWrites = {};
+  const writeAttempts = {};
   const remoteGuardProtectionPending = { shared:false, order:false, tumbler:false };
   const REMOTE_DATA_GUARD_FIELD = '__haetsalDataGuard';
   const REMOTE_DATA_GUARD_VERSION = 1;
@@ -11846,8 +11847,9 @@ window.HaetsalCloudStore = (function(){
     return { value:safeValue, protected:true };
   }
 
-  function setSyncStatus(key, phase, text){
+  function setSyncStatus(key, phase, text, details){
     syncStatuses[key] = {
+      ...(details || {}),
       phase: phase || 'idle',
       text: text || '저장 준비',
       updatedAt: new Date().toISOString()
@@ -11895,49 +11897,86 @@ window.HaetsalCloudStore = (function(){
     };
   }
 
+  function isUncertainWriteError(error){
+    return /^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(String(error && error.code || '')) || error && error.resultUnknown === true;
+  }
+
+  function publishWriteResult(key, attempt, result){
+    if(writeAttempts[key] !== attempt) return;
+    if(result && result.resultUnknown){
+      attempt.state = 'unknown';
+      setSyncStatus(key, 'unknown', '저장 결과 미확정 · 다시 연결하여 원래 요청을 확인하세요', { source:'write', ...attempt.options });
+    }else if(result && result.skipped){
+      attempt.state = 'pending';
+      setSyncStatus(key, 'pending', '저장 보류', { source:'write', ...attempt.options });
+    }else if(key !== 'order' || result && result.actualAggregateWriteCompleted === true){
+      attempt.state = 'synced';
+      setSyncStatus(key, 'synced', '저장 완료 ' + formatStatusTime(new Date()), { source:'write', ...attempt.options, ...(result && result.writeProof || {}) });
+    }else{
+      attempt.state = 'pending';
+      setSyncStatus(key, 'pending', '저장 확인 대기', { source:'write', ...attempt.options });
+    }
+  }
+
   function save(key, value, options){
     const opts = options || {};
     const returnResult = opts.returnResult === true;
     if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('cloud-store-save-' + String(key || ''))){
       blockedKeys.add(key);
       setSyncStatus(key, 'error', '장시간 미사용으로 저장 정지');
-      const blockedValue = clone(caches[key] == null ? value : caches[key]);
-      return returnResult
-        ? Promise.resolve({ key, skipped:true, reason:'runtime-stopped', actualAggregateWriteCompleted:false })
-        : blockedValue;
+      return returnResult ? Promise.resolve({ skipped:true, actualAggregateWriteCompleted:false }) : clone(caches[key]);
+    }
+    const previous = writeAttempts[key];
+    if(key === 'order' && previous && (previous.state === 'saving' || previous.state === 'unknown')){
+      return returnResult ? Promise.resolve({ skipped:true, reason:'original-write-unconfirmed', actualAggregateWriteCompleted:false }) : clone(caches[key]);
     }
     const nextValue = setCache(key, value, true);
-    if(saveHandler){
-      blockedKeys.delete(key);
-      setSyncStatus(key, 'saving', `저장 중 ${formatStatusTime(new Date())}`);
-      const savePromise = Promise.resolve(saveHandler(key, clone(nextValue))).then(result => {
-        if(result && result.skipped === true){
-          setSyncStatus(key, 'pending', `저장 보류 ${formatStatusTime(new Date())}`);
-        }else{
-          setSyncStatus(key, 'synced', `동기화 완료 ${formatStatusTime(new Date())}`);
-        }
-        return result;
-      }).catch(error => {
-        if(window.HaetsalFirestoreQuotaGuard && typeof window.HaetsalFirestoreQuotaGuard.mark === 'function'){
-          window.HaetsalFirestoreQuotaGuard.mark(error, 'cloud-store-save-' + String(key || ''));
-        }
-        console.error('Firestore 저장 실패', key, error);
-        setSyncStatus(key, 'error', formatCloudStoreError(error));
-        if(returnResult) throw error;
-      });
-      if(returnResult) return savePromise;
-    }else{
-      pendingWrites[key] = clone(nextValue);
-      if(blockedKeys.has(key)){
-        setSyncStatus(key, 'error', getSyncStatus(key).text || '클라우드 연결 실패');
-      }else{
-        setSyncStatus(key, 'pending', `연결 대기 중 ${formatStatusTime(new Date())}`);
-      }
-      if(returnResult){
-        return Promise.resolve({ key, skipped:true, reason:'save-handler-pending', actualAggregateWriteCompleted:false });
-      }
+    if(!saveHandler){
+      pendingWrites[key] = { value:clone(nextValue), options:opts };
+      setSyncStatus(key, 'pending', blockedKeys.has(key) ? '클라우드 연결 실패' : '연결 대기 중');
+      return returnResult ? Promise.resolve({ skipped:true, actualAggregateWriteCompleted:false }) : clone(nextValue);
     }
-    return clone(nextValue);
+    blockedKeys.delete(key);
+    const attempt = { options:{ attemptId:opts.attemptId || '', queueIdentity:opts.queueIdentity || '' }, state:'saving' };
+    writeAttempts[key] = attempt;
+    setSyncStatus(key, 'saving', '저장 중 ' + formatStatusTime(new Date()), { source:'write', ...attempt.options });
+    const task = Promise.resolve().then(() => saveHandler(key, clone(nextValue), attempt.options)).then(result => {
+      publishWriteResult(key, attempt, result);
+      return result;
+    }).catch(error => {
+      if(window.HaetsalFirestoreQuotaGuard) window.HaetsalFirestoreQuotaGuard.mark(error, 'cloud-store-save-' + key);
+      console.error('Firestore 저장 실패', key, error);
+      if(writeAttempts[key] === attempt){
+        attempt.state = key === 'order' && isUncertainWriteError(error) ? 'unknown' : 'error';
+        setSyncStatus(key, attempt.state, attempt.state === 'unknown' ? '저장 결과 미확정 · 원래 요청 확인 필요' : formatCloudStoreError(error), { source:'write', ...attempt.options });
+      }
+      if(returnResult) throw error;
+    });
+    attempt.promise = task;
+    return returnResult ? task : clone(nextValue);
+  }
+
+  function reconcileOrderSave(){
+    if(!saveHandler || (window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+      || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())) return Promise.resolve(false);
+    let attempt = writeAttempts.order;
+    if(attempt && (attempt.state === 'saving' || attempt.verifying)) return attempt.promise || Promise.resolve(false);
+    if(!attempt){ attempt = { options:{}, state:'unknown' }; writeAttempts.order = attempt; }
+    attempt.verifying = true;
+    attempt.promise = Promise.resolve().then(() => saveHandler('order', null, { verifyOnly:true })).then(result => {
+      if(result && result.reason === 'no-pending-write'){
+        if(writeAttempts.order === attempt) delete writeAttempts.order;
+        return false;
+      }
+      publishWriteResult('order', attempt, result);
+      return !!(result && result.actualAggregateWriteCompleted);
+    }).catch(error => {
+      if(writeAttempts.order !== attempt) return false;
+      attempt.state = 'unknown';
+      setSyncStatus('order', 'unknown', '저장 결과 미확정 · 원래 요청 확인 필요', { source:'write', ...attempt.options });
+      return false;
+    }).finally(() => { attempt.verifying = false; flushPendingWrites(); });
+    return attempt.promise;
   }
 
   function applyRemote(key, value){
@@ -11950,42 +11989,37 @@ window.HaetsalCloudStore = (function(){
       console.warn('legacy remote overwrite candidate blocked', key);
     }
     const applied = setCache(key, protectedRemote.value, true);
-    setSyncStatus(key, 'synced', `동기화 완료 ${formatStatusTime(new Date())}`);
+    const attempt = writeAttempts[key];
+    if(key !== 'order' || !attempt) setSyncStatus(key, 'received', '서버 수신 완료 · 백업 저장과 별도', { source:'receive' });
     return applied;
+  }
+
+  function flushPendingWrites(){
+    if(!saveHandler || (window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+      || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())) return;
+    Object.keys(pendingWrites).forEach(key => {
+        const pending = pendingWrites[key];
+        if(key === 'order' && writeAttempts.order && ['unknown','saving'].includes(writeAttempts.order.state)) return;
+        delete pendingWrites[key];
+        save(key, pending.value, { ...pending.options, returnResult:false });
+    });
   }
 
   function registerSaveHandler(handler){
     saveHandler = handler;
     blockedKeys.clear();
-    if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('cloud-store-register-save-handler')){
-      DATA_KEYS.forEach(key => setSyncStatus(key, 'error', '장시간 미사용으로 저장 정지'));
-      return;
-    }
-    Object.keys(pendingWrites).forEach(key => {
-      const value = clone(pendingWrites[key]);
-      delete pendingWrites[key];
-      setSyncStatus(key, 'saving', `저장 중 ${formatStatusTime(new Date())}`);
-      Promise.resolve(saveHandler(key, value)).then(() => {
-        setSyncStatus(key, 'synced', `동기화 완료 ${formatStatusTime(new Date())}`);
-      }).catch(error => {
-        if(window.HaetsalFirestoreQuotaGuard && typeof window.HaetsalFirestoreQuotaGuard.mark === 'function'){
-          window.HaetsalFirestoreQuotaGuard.mark(error, 'cloud-store-pending-save-' + String(key || ''));
-        }
-        console.error('Firestore 저장 실패', key, error);
-        setSyncStatus(key, 'error', formatCloudStoreError(error));
-      });
-    });
+    reconcileOrderSave();
   }
 
   function markSyncError(key, message){
     blockedKeys.add(key);
-    setSyncStatus(key, 'error', message || '클라우드 연결 실패');
+    setSyncStatus(key, 'error', message || '클라우드 연결 실패', { source:'receive' });
   }
 
   function markAllConnectionErrors(message){
     DATA_KEYS.forEach(key => {
       blockedKeys.add(key);
-      setSyncStatus(key, 'error', message || '클라우드 연결 실패');
+      setSyncStatus(key, 'error', message || '클라우드 연결 실패', { source:'receive' });
     });
   }
 
@@ -11994,8 +12028,9 @@ window.HaetsalCloudStore = (function(){
     saveShared: function(value){ return save('shared', value); },
     subscribeShared: function(listener){ return subscribe('shared', listener); },
     getOrderData: function(fallbackFactory){ return getCache('order', fallbackFactory); },
-    saveOrderData: function(value){ return save('order', value); },
-    saveOrderDataWithResult: function(value){ return save('order', value, { returnResult:true }); },
+    saveOrderData: function(value, options){ return save('order', value, options); },
+    saveOrderDataWithResult: function(value, options){ return save('order', value, { ...(options || {}), returnResult:true }); },
+    reconcileOrderSave:reconcileOrderSave,
     subscribeOrderData: function(listener){ return subscribe('order', listener); },
     getTumblerData: function(fallbackFactory){ return getCache('tumbler', fallbackFactory); },
     saveTumblerData: function(value, options){ return save('tumbler', value, options); },
@@ -12945,6 +12980,7 @@ window.HaetsalSharedStore = (function(){
     const ORDER_FULL_BACKUP_DEFERRED_SAVE_DELAY_MS = 250;
     let orderFullBackupSaveInFlight = false;
     let lastOrderFullBackupAttemptSignature = '';
+    let lastOrderFullBackupAttemptId = '';
     let lastOrderFullBackupSavedSignature = '';
     let lastOrderFullBackupFailureAt = 0;
     let lastOrderFullBackupErrorText = '';
@@ -12953,6 +12989,7 @@ window.HaetsalSharedStore = (function(){
     let lastOrderFullBackupSkippedAt = 0;
     let orderFullBackupDeferredSaveTimer = null;
     let orderFullBackupDeferredSaveReason = '';
+    let orderFullBackupDeferredSaveOptions = null;
     let orderMenuCatalogRemoteHydrated = false;
     let lastLiveOrderDocumentsSaveSignature = '';
     let orderArchiveAutoInFlight = false;
@@ -14427,6 +14464,11 @@ window.HaetsalSharedStore = (function(){
     }
 
     function getOrderQueueEmptyMessage(filter){
+      const today = todayYmd();
+      const queueDate = state.appRole === 'MANAGER' ? String(state.productionQueueDate || today) : today;
+      if(queueDate === today && (currentDayLiveOrderAuthority.dateKey !== today || !currentDayLiveOrderAuthority.complete)){
+        return '서버의 현재 주문 목록을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다.';
+      }
       const value = String(filter || 'ALL').toUpperCase();
       if(value === 'MEASURE') return '현재 계량이 필요한 제작 대기 주문이 없습니다. ⚖️';
       if(value === 'DELIVERY') return '현재 열린 배달 주문이 없습니다. 🚚';
@@ -21708,20 +21750,22 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       return { count:0, message:'현재 주문 목록에 없는 제작 대기 주문은 없습니다.' };
     }
 
-    function scheduleDeferredOrderFullBackupSave(reason){
+    function scheduleDeferredOrderFullBackupSave(reason, options){
       const safeReason = String(reason || 'deferred-full-backup-save');
       orderFullBackupDeferredSaveReason = safeReason;
+      orderFullBackupDeferredSaveOptions = { ...(orderFullBackupDeferredSaveOptions || {}), ...(options || {}) };
       if(orderFullBackupDeferredSaveTimer) return;
       orderFullBackupDeferredSaveTimer = window.setTimeout(() => {
         orderFullBackupDeferredSaveTimer = null;
         if(orderFullBackupSaveInFlight){
-          scheduleDeferredOrderFullBackupSave(orderFullBackupDeferredSaveReason || safeReason);
           return;
         }
         const queuedReason = orderFullBackupDeferredSaveReason || safeReason;
+        const queuedOptions = orderFullBackupDeferredSaveOptions || {};
         orderFullBackupDeferredSaveReason = '';
+        orderFullBackupDeferredSaveOptions = null;
         try{
-          saveData({ reason: queuedReason + '-deferred-run' });
+          saveData({ ...queuedOptions, reason:queuedReason + '-deferred-run', returnFullBackupResult:false });
         }catch(error){
           console.error('지연 전체 백업 저장 실행 실패', error);
         }
@@ -21731,18 +21775,20 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     function flushDeferredOrderFullBackupSave(reason){
       if(!orderFullBackupDeferredSaveReason) return;
       const queuedReason = orderFullBackupDeferredSaveReason;
+      const queuedOptions = orderFullBackupDeferredSaveOptions || {};
       orderFullBackupDeferredSaveReason = '';
+      orderFullBackupDeferredSaveOptions = null;
       if(orderFullBackupDeferredSaveTimer){
         window.clearTimeout(orderFullBackupDeferredSaveTimer);
         orderFullBackupDeferredSaveTimer = null;
       }
       window.setTimeout(() => {
         if(orderFullBackupSaveInFlight){
-          scheduleDeferredOrderFullBackupSave(queuedReason + '-' + String(reason || 'still-running'));
+          scheduleDeferredOrderFullBackupSave(queuedReason + '-' + String(reason || 'still-running'), queuedOptions);
           return;
         }
         try{
-          saveData({ reason: queuedReason + '-' + String(reason || 'flush-deferred') });
+          saveData({ ...queuedOptions, reason:queuedReason + '-' + String(reason || 'flush-deferred'), returnFullBackupResult:false });
         }catch(error){
           console.error('대기 중 전체 백업 저장 실행 실패', error);
         }
@@ -22088,7 +22134,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           return;
         }
 
-        if(!forceFullBackup && orderFullBackupSaveInFlight && signature && signature === lastOrderFullBackupAttemptSignature){
+        if(orderFullBackupSaveInFlight && signature && signature === lastOrderFullBackupAttemptSignature){
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-during-full-save');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 중';
@@ -22096,9 +22142,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           return;
         }
 
-        if(!forceFullBackup && orderFullBackupSaveInFlight){
+        if(orderFullBackupSaveInFlight){
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-during-full-save-queued');
-          scheduleDeferredOrderFullBackupSave(reason + '-queued-after-full-save');
+          scheduleDeferredOrderFullBackupSave(reason + '-queued-after-full-save', opts);
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 중';
           refreshOrderSaveStatusChips();
@@ -22118,20 +22164,22 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-before-light-full-backup');
           orderFullBackupSaveInFlight = true;
           lastOrderFullBackupAttemptSignature = signature;
+          lastOrderFullBackupAttemptId = uid('full-backup');
+          const writeOptions = { attemptId:lastOrderFullBackupAttemptId, queueIdentity:String((readImportantFullBackupQueueLocal() || {}).queueIdentity || '') };
           state.saveState = 'pending';
           state.saveStateText = `전체 백업 저장 중 ${formatAMPM(new Date())}`;
           refreshOrderSaveStatusChips();
           if(opts.returnFullBackupResult === true){
             if(typeof window.HaetsalCloudStore.saveOrderDataWithResult !== 'function'){
-              window.HaetsalCloudStore.saveOrderData(fullBackupData);
+              window.HaetsalCloudStore.saveOrderData(fullBackupData, writeOptions);
               return Promise.resolve({ skipped:true, reason:'result-api-unavailable', actualAggregateWriteCompleted:false });
             }
-            return Promise.resolve(window.HaetsalCloudStore.saveOrderDataWithResult(fullBackupData)).then(result => ({
+            return Promise.resolve(window.HaetsalCloudStore.saveOrderDataWithResult(fullBackupData, writeOptions)).then(result => ({
               ...(result && typeof result === 'object' ? result : {}),
               actualAggregateWriteCompleted:!!(result && result.actualAggregateWriteCompleted === true)
             }));
           }
-          window.HaetsalCloudStore.saveOrderData(fullBackupData);
+          window.HaetsalCloudStore.saveOrderData(fullBackupData, writeOptions);
         }else{
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-live-no-cloud');
           orderFullBackupSaveInFlight = false;
@@ -22299,7 +22347,19 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       const phase = status && status.phase ? status.phase : 'idle';
       const beforeState = state.saveState;
       const beforeText = state.saveStateText;
-      if(phase === 'error'){
+      if(status && status.source === 'receive'){
+        if(!lastOrderFullBackupAttemptId && !orderFullBackupSaveInFlight){
+          state.saveState = phase === 'error' ? 'error' : 'pending';
+          state.saveStateText = status.text || '서버 수신 대기';
+        }
+        return beforeState !== state.saveState || beforeText !== state.saveStateText;
+      }
+      if(status && status.source === 'write' && lastOrderFullBackupAttemptId && status.attemptId !== lastOrderFullBackupAttemptId) return false;
+      if(phase === 'unknown'){
+        orderFullBackupSaveInFlight = true;
+        state.saveState = 'pending';
+        state.saveStateText = status.text || '전체 백업 결과 미확정';
+      }else if(phase === 'error'){
         orderFullBackupSaveInFlight = false;
         lastOrderFullBackupFailureAt = Date.now();
         lastOrderFullBackupErrorText = (status && status.text) ? String(status.text) : '전체 백업 저장 실패';
@@ -22312,12 +22372,12 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }else if(phase === 'pending'){
         state.saveState = 'pending';
         state.saveStateText = (status && status.text) || '전체 백업 연결 대기';
-      }else if(phase === 'synced'){
+      }else if(phase === 'synced' && status && status.source === 'write'){
         orderFullBackupSaveInFlight = false;
         lastOrderFullBackupFailureAt = 0;
         lastOrderFullBackupErrorText = '';
-        if(lastOrderFullBackupAttemptSignature) lastOrderFullBackupSavedSignature = lastOrderFullBackupAttemptSignature;
-        clearImportantFullBackupPending();
+        if(lastOrderFullBackupAttemptId && status.attemptId === lastOrderFullBackupAttemptId) lastOrderFullBackupSavedSignature = lastOrderFullBackupAttemptSignature;
+        if(status.queueIdentity) clearImportantFullBackupPending({ importantRetrySuccess:true, expectedQueueIdentity:status.queueIdentity });
         state.saveState = 'saved';
         state.saveStateText = `전체 백업 동기화 완료 ${formatAMPM(new Date())}`;
         flushDeferredOrderFullBackupSave('full-backup-synced');
@@ -46885,6 +46945,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       state,
       render,
       refreshFromShared,
+    resumeDeferredFullBackupAfterReconnect:flushDeferredOrderFullBackupSave,
       // Cloud truth is independent of local carryover detach provenance.
       canAcceptCloudOrder:isServerSafeOpenOrder,
       canAcceptCarryoverProductionOrder:function(order){
@@ -47351,6 +47412,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   function applyTumblerSyncStatus(status){
     const phase = status && status.phase ? status.phase : 'idle';
+    if(phase === 'received'){
+      tState.saveState = 'pending';
+      tState.saveStateText = status.text || '서버 수신 완료';
+      return;
+    }
     if(phase === 'error'){
       tState.saveState = 'error';
       tState.saveStateText = (status && status.text) || '저장 실패';
@@ -48446,7 +48512,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const cachedData = window.HaetsalCloudStore && typeof window.HaetsalCloudStore.getTumblerData === 'function'
       ? window.HaetsalCloudStore.getTumblerData(function(){ return null; })
       : null;
-    const dataReady = !!(syncStatus && syncStatus.phase === 'synced' && cachedData && Array.isArray(cachedData.tumblers) && tState.data && Array.isArray(tState.data.tumblers));
+    const dataReady = !!(syncStatus && ['received', 'synced'].includes(syncStatus.phase) && cachedData && Array.isArray(cachedData.tumblers) && tState.data && Array.isArray(tState.data.tumblers));
     if(!dataReady){
       return { dataReady:false, hasOverdue:false, overdueDays:0, earliestDueDate:'', rentedTumbler:'', overdueItems:[] };
     }
@@ -51434,7 +51500,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   document.addEventListener('click', function(event){
     const button = event.target.closest('[data-view-restore]');
     if(button){
-      if(button.dataset.viewRestore === 'retry') location.reload();
+      if(button.dataset.viewRestore === 'retry'){
+        if(window.HaetsalConnection) window.HaetsalConnection.reconnect().then(() => { if(!restoringWorkQueue) restoreWorkQueue(); });
+      }
       if(button.dataset.viewRestore === 'login') openRestoreLogin();
       return;
     }
@@ -51445,7 +51513,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 </script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-app.js";
-  import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence, getIdTokenResult } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
+  import { initializeAuth, getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onIdTokenChanged, setPersistence, browserSessionPersistence, getIdToken, getIdTokenResult } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-auth.js";
   import { getFirestore, doc, collection, onSnapshot, setDoc, getDoc, getDocFromServer, getDocs, getDocsFromServer, query, where, orderBy, limit, startAfter, documentId, runTransaction, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/12.12.1/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -51458,10 +51526,50 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   };
 
   const app = initializeApp(firebaseConfig);
-  const auth = getAuth(app);
+  function requireAuthSessionStorage(){
+    const key = 'haetsalmaru_auth_session_check';
+    try{
+      sessionStorage.setItem(key, '1');
+      if(sessionStorage.getItem(key) !== '1') throw new Error('session-storage-unavailable');
+      sessionStorage.removeItem(key);
+    }catch(error){
+      throw Object.assign(new Error('브라우저의 세션 저장소를 사용할 수 없습니다. 로그인 상태를 안전하게 보존할 수 없습니다.'), { code:'auth/web-storage-unsupported' });
+    }
+  }
+  try{ requireAuthSessionStorage(); }catch(error){
+    window.HaetsalCloudStore.markAllConnectionErrors(error.message);
+    throw error;
+  }
+  const auth = initializeAuth(app, { persistence:browserSessionPersistence });
   const db = getFirestore(app);
   let verifiedAdminUid = '';
   let verifiedManagerUid = '';
+  let operatorAuthGeneration = 0;
+  let operatorTokenGeneration = 0;
+
+  function beginOperatorLogin(){
+    operatorAuthGeneration += 1;
+    verifiedAdminUid = '';
+    verifiedManagerUid = '';
+    if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.stopAll();
+    restrictUnverifiedOperatorViews();
+  }
+
+  function restrictUnverifiedOperatorViews(){
+    const module = window.OrderModule;
+    const role = module && module.state && module.state.appRole;
+    if((role === 'ADMIN' && !window.HaetsalAdminAuth.isVerified())
+      || (role === 'MANAGER' && !window.HaetsalManagerAuth.isVerified())){
+      if(window.HaetsalOperatorSession) window.HaetsalOperatorSession.clear();
+      module.openDashboard(role);
+    }
+    const tumbler = window.TumblerModule;
+    if(tumbler && ((tumbler.state.view === 'admin' && !window.HaetsalAdminAuth.isVerified())
+      || (tumbler.state.view === 'manager' && !window.HaetsalManagerAuth.isVerified()))){
+      tumbler.ensureDashboard(tumbler.state.view);
+      tumbler.render();
+    }
+  }
 
   async function ensureAnonymousLogin() {
     if (auth.currentUser) return auth.currentUser;
@@ -51475,13 +51583,31 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       verifiedManagerUid = '';
       return { admin:false, manager:false };
     }
-    const tokenResult = await getIdTokenResult(user, forceRefresh === true);
+    const generation = operatorAuthGeneration;
+    const startingTokenGeneration = operatorTokenGeneration;
+    let tokenResult;
+    try{ tokenResult = await getIdTokenResult(user, forceRefresh === true); }catch(error){
+      if(auth.currentUser === user && generation === operatorAuthGeneration && startingTokenGeneration === operatorTokenGeneration
+        && ['auth/user-token-expired', 'auth/user-disabled', 'auth/invalid-user-token'].includes(error && error.code)){
+        verifiedAdminUid = '';
+        verifiedManagerUid = '';
+        restrictUnverifiedOperatorViews();
+      }
+      throw error;
+    }
+    const tokenGeneration = operatorTokenGeneration;
+    const currentToken = await getIdToken(user, false);
+    if(auth.currentUser !== user || generation !== operatorAuthGeneration || tokenGeneration !== operatorTokenGeneration || tokenResult.token !== currentToken){
+      throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
+    }
     const claims = tokenResult && tokenResult.claims ? tokenResult.claims : {};
     const admin = claims.admin === true;
     const manager = admin || claims.manager === true;
     const uid = String(user.uid || '');
     verifiedAdminUid = admin ? uid : '';
     verifiedManagerUid = manager ? uid : '';
+    restrictUnverifiedOperatorViews();
+    if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
     return { admin, manager };
   }
 
@@ -51496,11 +51622,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   }
 
   async function restoreAnonymousAfterAdminAuth(){
+    operatorAuthGeneration += 1;
     verifiedAdminUid = '';
     verifiedManagerUid = '';
-    try{ await signOut(auth); }catch(error){ console.error('Firebase 로그아웃 실패:', error); }
+    restrictUnverifiedOperatorViews();
+    await signOut(auth);
     const anonymousUser = await ensureAnonymousLogin();
     window.firebaseAuthUser = anonymousUser;
+    if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
     return anonymousUser;
   }
 
@@ -51512,6 +51641,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     login: async function(email, password){
       await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
+      beginOperatorLogin();
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseAdminUser(credential.user, true);
       if(!verified){
@@ -51540,6 +51670,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     login: async function(email, password){
       await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
+      beginOperatorLogin();
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseManagerUser(credential.user, true);
       if(!verified){
@@ -51560,40 +51691,136 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
   };
 
-  const firebaseReadyPromise = new Promise((resolve, reject) => {
-    const unsubscribe = onAuthStateChanged(
-      auth,
-      async (user) => {
-        try {
-          if (user) {
-            if(!user.isAnonymous){
-              const roles = await verifyFirebaseOperatorUser(user, true);
-              if(!roles.admin && !roles.manager){
-                user = await restoreAnonymousAfterAdminAuth();
-              }
-            }
-            window.firebaseAuthUser = user;
-            resolve(user);
-            unsubscribe();
-            return;
-          }
-          const signedInUser = await ensureAnonymousLogin();
-          window.firebaseAuthUser = signedInUser;
-          resolve(signedInUser);
-          unsubscribe();
-        } catch (error) {
-          console.error("Firebase 인증 준비 실패:", error);
-          reject(error);
-          unsubscribe();
-        }
-      },
-      (error) => {
-        console.error("Firebase 인증 상태 확인 실패:", error);
-        reject(error);
-        unsubscribe();
+  let resolveFirebaseReady;
+  let resolveRuntimePolicyReady;
+  const firebaseReadyPromise = new Promise(resolve => { resolveFirebaseReady = resolve; });
+  const runtimePolicyReadyPromise = new Promise(resolve => { resolveRuntimePolicyReady = resolve; });
+  let observedAuthUser;
+  const authStateReady = new Promise((resolve, reject) => {
+    onIdTokenChanged(auth, user => {
+      operatorTokenGeneration += 1;
+      const identityChanged = observedAuthUser !== undefined && observedAuthUser !== user;
+      if(identityChanged){
+        operatorAuthGeneration += 1;
+        verifiedAdminUid = '';
+        verifiedManagerUid = '';
+        if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.stopAll();
+        restrictUnverifiedOperatorViews();
       }
-    );
+      observedAuthUser = user;
+      resolve(user);
+      if(!identityChanged && connectionState === 'ready' && user && !user.isAnonymous){
+        verifyFirebaseOperatorUser(user, false).catch(error => console.warn('갱신된 인증 권한 확인 실패:', error));
+      }
+    }, reject);
   });
+
+  const connectionFailures = new Map();
+  let connectionAttempt = 0;
+  let connectionTask = null;
+  let connectionTimer = null;
+  let connectionState = 'starting';
+  let connectionError = '';
+  const connectionNotice = document.createElement('div');
+  connectionNotice.className = 'help-note';
+  // Connection changes must not move a control between pointer down and up.
+  connectionNotice.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:1000;padding:8px;background:#fff;border-top:1px solid #ddd';
+  connectionNotice.setAttribute('role', 'status');
+  const connectionText = document.createElement('span');
+  const reconnectButton = document.createElement('button');
+  reconnectButton.type = 'button';
+  reconnectButton.className = 'btn btn-outline';
+  reconnectButton.textContent = '다시 연결';
+  connectionNotice.append(connectionText, reconnectButton);
+  document.body.prepend(connectionNotice);
+
+  function isConnectionStopped(){
+    return !!((window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+      || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked()));
+  }
+
+  function isTransientConnectionError(error){
+    return /^(auth\/network-request-failed|auth\/session-changed|unavailable|firestore\/unavailable|deadline-exceeded|auth\/timeout|runtime-policy-unconfirmed)$/.test(String(error && error.code || ''));
+  }
+
+  function renderConnectionNotice(){
+    connectionNotice.hidden = connectionState === 'ready' && connectionFailures.size === 0 && !isConnectionStopped();
+    connectionText.textContent = isConnectionStopped() ? '안전 조건에 따라 동기화가 중지되었습니다. 상태를 확인하세요. ' : connectionState === 'ready'
+      ? '일부 실시간 연결을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. '
+      : connectionState === 'starting'
+        ? '연결과 인증을 확인하고 있습니다. '
+        : '연결 또는 인증 확인을 완료하지 못했습니다 (' + connectionError + '). ';
+    reconnectButton.disabled = !!connectionTask || !!(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped());
+  }
+
+  function startConnectionAttempt(manual=false){
+    if(connectionTask) return connectionTask;
+    if(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped()) return Promise.resolve(false);
+    const quotaGuard = window.HaetsalFirestoreQuotaGuard;
+    const quotaRecovery = !!(quotaGuard && quotaGuard.isBlocked());
+    if(quotaRecovery && !(quotaGuard.canAttemptRecoveryProbe && quotaGuard.canAttemptRecoveryProbe())) return Promise.resolve(false);
+    if(manual){ connectionAttempt = 0; if(connectionTimer) clearTimeout(connectionTimer); connectionTimer = null; }
+    if(connectionState === 'ready' && !manual){
+      return Promise.resolve(true);
+    }
+    if(connectionTimer || connectionAttempt >= 6) return Promise.resolve(false);
+    connectionAttempt += 1;
+    connectionState = 'starting';
+    connectionTask = (async function(){
+      await authStateReady;
+      requireAuthSessionStorage();
+      await setPersistence(auth, browserSessionPersistence);
+      const user = await ensureAnonymousLogin();
+      const currentGeneration = operatorAuthGeneration;
+      if(!user.isAnonymous) await verifyFirebaseOperatorUser(user, true);
+      if(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped()) return false;
+      if(user !== auth.currentUser || currentGeneration !== operatorAuthGeneration) throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
+      window.firebaseAuthUser = user;
+      resolveFirebaseReady(user);
+      const policy = await loadRuntimePolicyOnce({ allowQuotaRecoveryProbe:quotaRecovery });
+      if(isConnectionStopped()) return false;
+      if(user !== auth.currentUser || currentGeneration !== operatorAuthGeneration) throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
+      if(policy.blocked){ connectionState = 'blocked'; connectionError = 'runtime-policy-blocked'; return false; }
+      if(policy.checked !== true) throw Object.assign(new Error(policy.error || '정책 확인 실패'), { code:policy.failureCode || 'runtime-policy-unconfirmed' });
+      if(!user.isAnonymous) await verifyFirebaseOperatorUser(user, false);
+      resolveRuntimePolicyReady(policy);
+      connectionState = 'ready';
+      connectionError = '';
+      if(manual && window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.reconnect();
+      if(window.HaetsalCloudStore.reconcileOrderSave) await window.HaetsalCloudStore.reconcileOrderSave();
+      if(manual && user === auth.currentUser && currentGeneration === operatorAuthGeneration
+        && !user.isAnonymous && (window.HaetsalAdminAuth.isVerified() || window.HaetsalManagerAuth.isVerified())
+        && !['saving','unknown'].includes(window.HaetsalCloudStore.getSyncStatus('order').phase)
+        && window.OrderModule && window.OrderModule.resumeDeferredFullBackupAfterReconnect){
+        window.OrderModule.resumeDeferredFullBackupAfterReconnect('explicit-reconnect');
+      }
+      return true;
+    })().catch(error => {
+      connectionState = 'failed';
+      connectionError = String(error.code || error.message || 'connection-failed');
+      console.error('Firebase 연결 준비 실패:', error);
+      window.HaetsalCloudStore.markAllConnectionErrors('클라우드 연결 실패 (' + connectionError + ')');
+      if(isTransientConnectionError(error) && connectionAttempt < 6 && !isConnectionStopped()){
+        const delay = Math.min(30000, 1000 * Math.pow(2, connectionAttempt - 1)) * (0.8 + Math.random() * 0.4);
+        connectionTimer = setTimeout(() => { connectionTimer = null; startConnectionAttempt(); }, delay);
+      }
+      return false;
+    }).finally(() => { connectionTask = null; renderConnectionNotice(); });
+    renderConnectionNotice();
+    return connectionTask;
+  }
+
+  window.HaetsalConnection = {
+    reconnect:() => startConnectionAttempt(true),
+    getState:() => ({ state:connectionState, attempt:connectionAttempt, error:connectionError, scopes:Array.from(connectionFailures.entries()) }),
+    scopeFailed:(key, code) => { connectionFailures.set(key, code); renderConnectionNotice(); },
+    scopeHealthy:key => { connectionFailures.delete(key); renderConnectionNotice(); },
+    scopeReleased:key => { connectionFailures.delete(key); renderConnectionNotice(); }
+  };
+  reconnectButton.addEventListener('click', () => startConnectionAttempt(true));
+  window.addEventListener('online', () => { if(connectionState !== 'ready') startConnectionAttempt(); });
+  document.addEventListener('visibilitychange', () => { if(!document.hidden && connectionState !== 'ready') startConnectionAttempt(); });
+  window.addEventListener('haetsal:runtime-stopped', () => { if(connectionTimer) clearTimeout(connectionTimer); connectionTimer = null; renderConnectionNotice(); });
 
   window.firebaseApp = app;
   window.firebaseAuth = auth;
@@ -51606,6 +51833,39 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     tumbler: doc(db, 'haetsalCombinedApp', 'tumbler_data')
   };
   const runtimePolicyRef = doc(db, 'haetsalCombinedApp', 'app_runtime_policy');
+  const ORDER_BACKUP_ACK_KEY = 'haetsalmaru_order_backup_pending_ack_v1';
+
+  function readPendingOrderBackup(){
+    const requestId = sessionStorage.getItem(ORDER_BACKUP_ACK_KEY);
+    if(!requestId) return null;
+    const raw = localStorage.getItem(ORDER_BACKUP_ACK_KEY + ':' + requestId);
+    if(!raw) throw new Error('미확정 백업 증빙을 찾지 못했습니다. 새 저장 전에 확인이 필요합니다.');
+    const receipt = JSON.parse(raw);
+    if(!receipt || receipt.clientWriteId !== requestId) throw new Error('미확정 백업 증빙 확인 필요');
+    if(receipt.rejected === true) return null;
+    return receipt;
+  }
+
+  function finishOrderBackupReceipt(receipt){
+    // A duplicated tab can still reference this receipt after this tab clears its pointer.
+    localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify({ ...receipt, confirmed:true, confirmedAt:receipt.confirmedAt || new Date().toISOString() }));
+    if(sessionStorage.getItem(ORDER_BACKUP_ACK_KEY) === receipt.clientWriteId){
+      sessionStorage.removeItem(ORDER_BACKUP_ACK_KEY);
+    }
+    return { key:'order', actualAggregateWriteCompleted:true, aggregateWriteCompletedAt:new Date().toISOString(), writeProof:{ attemptId:receipt.attemptId, queueIdentity:receipt.queueIdentity, clientWriteId:receipt.clientWriteId } };
+  }
+
+  async function verifyPendingOrderBackup(){
+    const receipt = readPendingOrderBackup();
+    if(!receipt) return { skipped:true, reason:'no-pending-write', actualAggregateWriteCompleted:false };
+    if(isConnectionStopped()) return { skipped:true, resultUnknown:true, actualAggregateWriteCompleted:false };
+    if(receipt.confirmed === true && receipt.confirmedAt) return finishOrderBackupReceipt(receipt);
+    const snapshot = await getDocFromServer(doc(db, 'haetsalCombinedApp', 'order_data'));
+    if(!snapshot.exists() || snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites || snapshot.data().clientWriteId !== receipt.clientWriteId){
+      return { skipped:true, resultUnknown:true, actualAggregateWriteCompleted:false };
+    }
+    return finishOrderBackupReceipt(receipt);
+  }
   const orderSafetyBackupRef = doc(db, 'haetsalCombinedApp', 'order_safety_backup');
   const orderLiveQueueRef = doc(db, 'haetsalCombinedApp', 'order_live_queue');
   const emergencyCompactArchiveRef = doc(db, 'haetsalCombinedApp', 'order_emergency_compact_archive');
@@ -52303,14 +52563,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   function markFirestoreQuotaExceeded(error, source){
     if(window.HaetsalFirestoreQuotaGuard && typeof window.HaetsalFirestoreQuotaGuard.mark === 'function'){
-      return window.HaetsalFirestoreQuotaGuard.mark(error, source);
+      const blocked = window.HaetsalFirestoreQuotaGuard.mark(error, source);
+      if(blocked && window.HaetsalConnection) window.HaetsalConnection.scopeFailed(String(source || 'quota'), 'resource-exhausted');
+      return blocked;
     }
     return false;
   }
 
   function clearFirestoreQuotaExceeded(source){
     if(window.HaetsalFirestoreQuotaGuard && typeof window.HaetsalFirestoreQuotaGuard.clear === 'function'){
-      return window.HaetsalFirestoreQuotaGuard.clear(source);
+      const cleared = window.HaetsalFirestoreQuotaGuard.clear(source);
+      if(!window.HaetsalFirestoreQuotaGuard.isBlocked()){
+        connectionFailures.forEach((code, key) => { if(code === 'resource-exhausted') connectionFailures.delete(key); });
+        renderConnectionNotice();
+      }
+      return cleared;
     }
     return false;
   }
@@ -52351,11 +52618,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         : { checked:false, exists:false, blocked:false, error:error && error.message ? String(error.message) : String(error || '') };
       const remainsQuotaBlocked = quotaBlocked
         || (quotaGuard && typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked());
-      return remainsQuotaBlocked ? { ...failurePolicy, blocked:true, quotaBlocked:true } : failurePolicy;
+      return remainsQuotaBlocked ? { ...failurePolicy, blocked:true, quotaBlocked:true } : { ...failurePolicy, failureCode:String(error && error.code || '') };
     }
   }
 
-  const runtimePolicyReadyPromise = firebaseReadyPromise.then(() => loadRuntimePolicyOnce({ allowQuotaRecoveryProbe:true }));
+  // Readiness stays pending after a transient failure; the finite controller resumes the same initialization.
   window.runtimePolicyReadyPromise = runtimePolicyReadyPromise;
 
   function makeLiveOrderDocId(orderId){
@@ -60603,7 +60870,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if((policyResult && policyResult.blocked)
       || (quotaGuard && typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked())) return;
     if(window.HaetsalCloudStore && window.HaetsalCloudStore.registerSaveHandler){
-      window.HaetsalCloudStore.registerSaveHandler(function(key, value){
+      window.HaetsalCloudStore.registerSaveHandler(function(key, value, writeOptions){
         if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('firestore-save-handler-' + String(key || ''))){
           return Promise.resolve({ skipped:true, reason:'runtime-stopped' });
         }
@@ -60613,6 +60880,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           return saveSharedWithCouponVersionProtection(ref, value);
         }
         if(key === 'order'){
+          if(writeOptions && writeOptions.verifyOnly) return verifyPendingOrderBackup();
+          const pendingWrite = readPendingOrderBackup();
+          if(pendingWrite) return Promise.resolve({ skipped:true, resultUnknown:true, reason:'original-write-unconfirmed' });
+          const aggregatePayload = buildPayload(value);
+          const receipt = { clientWriteId:aggregatePayload.clientWriteId, attemptId:String(writeOptions && writeOptions.attemptId || ''), queueIdentity:String(writeOptions && writeOptions.queueIdentity || '') };
+          localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify(receipt));
+          sessionStorage.setItem(ORDER_BACKUP_ACK_KEY, receipt.clientWriteId);
+          if(readPendingOrderBackup().clientWriteId !== receipt.clientWriteId) throw new Error('백업 요청 증빙을 저장하지 못했습니다.');
           let safetyBackup = null;
           let liveQueue = null;
           let liveOrderDocs = [];
@@ -60660,8 +60935,22 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               })
             : Promise.resolve();
           return Promise.all([liveOrderDocsSave, liveQueueSave, safetySave])
-            .then(() => setDoc(ref, buildPayload(value)))
-            .then(() => ({ key:'order', actualAggregateWriteCompleted:true, aggregateWriteCompletedAt:new Date().toISOString() }));
+            .then(() => {
+              if((window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('order-aggregate-before-write'))
+                || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())){
+                throw Object.assign(new Error('Firestore write blocked by safety guard'), { code:'runtime-stopped' });
+              }
+              return setDoc(ref, aggregatePayload);
+            })
+            .then(() => finishOrderBackupReceipt(receipt))
+            .catch(async error => {
+              if(/^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(String(error && error.code || ''))){
+                try{ return await verifyPendingOrderBackup(); }catch(verificationError){ error.resultUnknown = true; }
+              }else if(['permission-denied', 'unauthenticated', 'failed-precondition', 'invalid-argument', 'runtime-stopped'].includes(error && error.code)){
+                localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify({ ...receipt, rejected:true, errorCode:error.code }));
+              }
+              throw error;
+            });
         }
         if(key === 'tumbler') return saveTumblerWithReturnProtection(ref,value);
         return setDoc(ref, buildPayload(value));
@@ -60673,8 +60962,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
     function subscribeCloudDoc(key, scopeInstance){
       const scopeKey = 'cloud-doc-' + String(key || '');
-      return onSnapshot(cloudDocRefs[key], snapshot => {
-        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
+      return onSnapshot(cloudDocRefs[key], { includeMetadataChanges:true }, snapshot => {
+        if(!markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance, snapshot)) return;
         if(!snapshot.exists()) return;
         const payload = snapshot.data();
         if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
@@ -60694,6 +60983,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.HaetsalCloudStore.applyRemote(key, payload.data);
         }
       }, error => {
+        if(scopeInstance && scopeInstance.released) return;
         const quotaBlocked = markFirestoreQuotaExceeded(error, 'cloud-doc-' + key);
         console.error(`Firestore ${key} 불러오기 실패:`, error);
         if(window.HaetsalCloudStore && window.HaetsalCloudStore.markSyncError){
@@ -60786,8 +61076,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     function subscribeEmergencyCompactArchive(scopeInstance){
-      return onSnapshot(emergencyCompactArchiveRef, snapshot => {
-        markScopedRealtimeSubscriptionHealthy('emergency-compact-archive', scopeInstance);
+      return onSnapshot(emergencyCompactArchiveRef, { includeMetadataChanges:true }, snapshot => {
+        if(!markScopedRealtimeSubscriptionHealthy('emergency-compact-archive', scopeInstance, snapshot)) return;
         if(!snapshot.exists()) return;
         const payload = snapshot.data();
         const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
@@ -60796,6 +61086,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.HaetsalEmergencyCompactArchiveReceiver.receiveCloudArchive(archive || { records:[] });
         }
       }, error => {
+        if(scopeInstance && scopeInstance.released) return;
         const quotaBlocked = markFirestoreQuotaExceeded(error, 'emergency-compact-archive-listener');
         console.error('Firestore 긴급 compact 보존 기록 불러오기 실패:', error);
         if(quotaBlocked){
@@ -61497,6 +61788,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         }
         const businessDate = getCurrentManagerBusinessDateKey();
         let initialSnapshotReceived = false;
+        let replayServerSnapshot = true;
         if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
           window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
         }
@@ -61505,7 +61797,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           : buildLiveOpenOrderQueryRef(businessDate);
         unsubscribeCurrentQuery = onSnapshot(activeQueryRef, { includeMetadataChanges:true }, snapshot => {
           if(stopped || currentQueryGeneration !== queryGeneration) return;
-          markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance);
+          if(scopeInstance && scopedRealtimeSubscriptions.get('live-order-query') !== scopeInstance) return;
+          if(!markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance, snapshot)){
+            replayServerSnapshot = true;
+            if(window.OrderModule && window.OrderModule.setCurrentDayLiveOrderAuthority) window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
+            return;
+          }
           const isInitialSnapshot = !initialSnapshotReceived;
           initialSnapshotReceived = true;
           const snapshotMetadata = {
@@ -61528,7 +61825,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             .filter(Boolean);
           const changedLiveOrders = [];
           const remoteLifecycleRows = [];
-          snapshot.docChanges().forEach(change => {
+          const changes = isInitialSnapshot || replayServerSnapshot
+            ? [...snapshot.docs.map(doc => ({ type:'added', doc })), ...snapshot.docChanges().filter(change => change.type === 'removed')]
+            : snapshot.docChanges();
+          replayServerSnapshot = false;
+          changes.forEach(change => {
             if(!change || !change.doc || !String(change.doc.id || '').startsWith(liveOrderDocPrefix)) return;
             const payload = change.doc.data();
             if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
@@ -61616,7 +61917,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           const shouldUseCompatibilityQuery = errorCode.includes('failed-precondition')
             || errorMessage.includes('failed-precondition')
             || errorMessage.includes('requires an index');
-          if(!initialSnapshotReceived && !shouldUseCompatibilityQuery){
+          if(!initialSnapshotReceived && !shouldUseCompatibilityQuery && /^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(errorCode)){
             loadOrderLiveQueueOnceForCurrentDay();
           }
           if(!initialSnapshotReceived && shouldUseCompatibilityQuery && !compatibilityMode){
@@ -61645,8 +61946,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const targetOrderId = String(orderId || '').trim();
       const scopeKey = 'user-live-order:' + targetOrderId;
       let initialSnapshotReceived = false;
-      return onSnapshot(getLiveOrderRef(targetOrderId), docSnap => {
-        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
+      return onSnapshot(getLiveOrderRef(targetOrderId), { includeMetadataChanges:true }, docSnap => {
+        if(!markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance, docSnap)) return;
         const isInitialSnapshot = !initialSnapshotReceived;
         initialSnapshotReceived = true;
         if(!docSnap.exists()) return;
@@ -61665,6 +61966,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }
         });
       }, error => {
+        if(scopeInstance && scopeInstance.released) return;
         const quotaBlocked = markFirestoreQuotaExceeded(error, 'user-live-order-listener-' + targetOrderId);
         console.error('Firestore 사용자 주문별 실시간 저장소 불러오기 실패:', error);
         if(quotaBlocked){
@@ -61678,8 +61980,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     function subscribeDeliveryRecord(orderId, scopeInstance){
       const targetOrderId = String(orderId || '').trim();
       const scopeKey = 'delivery-record:' + targetOrderId;
-      return onSnapshot(getDeliveryRecordRef(targetOrderId), docSnap => {
-        markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance);
+      return onSnapshot(getDeliveryRecordRef(targetOrderId), { includeMetadataChanges:true }, docSnap => {
+        if(!markScopedRealtimeSubscriptionHealthy(scopeKey, scopeInstance, docSnap)) return;
         addRealtimeUsageDiagnostic('deliverySnapshotReads', 1);
         if(!docSnap.exists()){
           addRealtimeUsageDiagnostic('deliveryMissingSnapshots', 1);
@@ -61691,6 +61993,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           window.OrderModule.receiveDeliveryRecords([normalized], '배달 기록 주문별 저장소');
         }
       }, error => {
+        if(scopeInstance && scopeInstance.released) return;
         const quotaBlocked = markFirestoreQuotaExceeded(error, 'delivery-record-listener-' + targetOrderId);
         console.error('Firestore 배달 기록 불러오기 실패:', error);
         if(quotaBlocked){
@@ -61747,10 +62050,16 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return Math.max(0, Math.round(baseDelay + jitter));
     }
 
-    function markScopedRealtimeSubscriptionHealthy(key, scopeInstance){
+    function markScopedRealtimeSubscriptionHealthy(key, scopeInstance, snapshot){
       const entry = scopedRealtimeSubscriptions.get(key);
       if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
+      const metadata = snapshot && snapshot.metadata;
+      if(!metadata || metadata.fromCache || metadata.hasPendingWrites){
+        entry.status = metadata && metadata.hasPendingWrites ? 'pending-write' : 'cached';
+        return false;
+      }
       entry.status = 'healthy';
+      window.HaetsalConnection.scopeHealthy(key);
       entry.lastHealthyAt = Date.now();
       tabletRuntimeDiagnostics.observeRealtimeState({
         scope:key,
@@ -61769,6 +62078,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const previousAttempt = Math.max(0, Number(previous && previous.attempt) || 0);
       const generation = Math.max(0, Number(previous && previous.generation) || 0) + 1;
       const lastErrorCode = getScopedRealtimeRetryErrorCode(error);
+      const retryable = /^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(lastErrorCode);
+      if(!retryable){
+        scopedRealtimeRetryStates.set(normalizedKey, { key:normalizedKey, label, attempt:previousAttempt, generation, timer:null, ready:false, waiting:false, exhausted:false, terminal:true, lastErrorCode });
+        return false;
+      }
       if(!isScopedRealtimeOnline()){
         scopedRealtimeRetryStates.set(normalizedKey, {
           key:normalizedKey,
@@ -61832,6 +62146,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const entry = scopedRealtimeSubscriptions.get(key);
       if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
       const label = entry.label;
+      window.HaetsalConnection.scopeFailed(key, getScopedRealtimeRetryErrorCode(error));
       tabletRuntimeDiagnostics.observeRealtimeState({
         scope:key,
         state:'failed',
@@ -61908,6 +62223,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     function stopScopedRealtimeSubscription(key, options){
       const opts = options && typeof options === 'object' ? options : {};
       const preserveRetry = opts.preserveRetry === true;
+      if(!preserveRetry) window.HaetsalConnection.scopeReleased(key);
       const entry = scopedRealtimeSubscriptions.get(key);
       if(!entry){
         if(!preserveRetry) clearScopedRealtimeRetryState(key);
@@ -61979,11 +62295,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         .forEach(stopScopedRealtimeSubscription);
     }
 
-    function runScopedRealtimeHealthCheck(){
+    function runScopedRealtimeHealthCheck(manual=false){
       if(!isScopedRealtimeRecoveryAllowed()) return false;
       const guardVerificationGeneration = liveOrderQueryGuardVerificationGeneration;
       scopedRealtimeRetryStates.forEach((retryState, key) => {
-        if(scopedRealtimeSubscriptions.has(key)) return;
+        if(scopedRealtimeSubscriptions.has(key) || (retryState.terminal && !(manual === true && /^(unauthenticated|firestore\/unauthenticated)$/.test(retryState.lastErrorCode))) || (retryState.exhausted && manual !== true)) return;
         if(retryState.timer) clearTimeout(retryState.timer);
         scopedRealtimeRetryStates.set(key, {
           ...retryState,
@@ -61992,7 +62308,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           timer:null,
           ready:true,
           waiting:false,
-          exhausted:false
+          exhausted:false,
+          terminal:false
         });
       });
       const synced = syncScopedRealtimeSubscriptions();
@@ -62047,10 +62364,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
     window.HaetsalRealtimeScope = {
       sync:syncScopedRealtimeSubscriptions,
+      reconnect:() => runScopedRealtimeHealthCheck(true),
       stopAll:stopAllScopedRealtimeSubscriptions
     };
     try{
-      window.addEventListener('online', runScopedRealtimeHealthCheck);
+      window.addEventListener('online', () => runScopedRealtimeHealthCheck());
       window.addEventListener('haetsal:runtime-stopped', stopAllScopedRealtimeSubscriptions);
       document.addEventListener('visibilitychange', function(){
         if(!document.hidden) runScopedRealtimeHealthCheck();
@@ -62063,6 +62381,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       window.HaetsalCloudStore.markAllConnectionErrors('클라우드 연결 실패');
     }
   });
+  startConnectionAttempt();
 </script>
 </body>
 </html>
