@@ -51642,6 +51642,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
       beginOperatorLogin();
+      try{
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseAdminUser(credential.user, true);
       if(!verified){
@@ -51650,6 +51651,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       window.firebaseAuthUser = credential.user;
       return { verified:true, uid:credential.user.uid, email:credential.user.email || '' };
+      }finally{
+        if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
+      }
     },
     logout: async function(){
       const anonymousUser = await restoreAnonymousAfterAdminAuth();
@@ -51671,6 +51675,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       await firebaseReadyPromise;
       await setPersistence(auth, browserSessionPersistence);
       beginOperatorLogin();
+      try{
       const credential = await signInWithEmailAndPassword(auth, String(email || '').trim(), String(password || ''));
       const verified = await verifyFirebaseManagerUser(credential.user, true);
       if(!verified){
@@ -51679,6 +51684,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       window.firebaseAuthUser = credential.user;
       return { verified:true, uid:credential.user.uid, email:credential.user.email || '' };
+      }finally{
+        if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
+      }
     },
     logout: async function(){
       const anonymousUser = await restoreAnonymousAfterAdminAuth();
@@ -51835,31 +51843,132 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   const runtimePolicyRef = doc(db, 'haetsalCombinedApp', 'app_runtime_policy');
   const ORDER_BACKUP_ACK_KEY = 'haetsalmaru_order_backup_pending_ack_v1';
 
-  function readPendingOrderBackup(){
-    const requestId = sessionStorage.getItem(ORDER_BACKUP_ACK_KEY);
-    if(!requestId) return null;
-    const raw = localStorage.getItem(ORDER_BACKUP_ACK_KEY + ':' + requestId);
-    if(!raw) throw new Error('미확정 백업 증빙을 찾지 못했습니다. 새 저장 전에 확인이 필요합니다.');
-    const receipt = JSON.parse(raw);
-    if(!receipt || receipt.clientWriteId !== requestId) throw new Error('미확정 백업 증빙 확인 필요');
-    if(receipt.rejected === true) return null;
+  let orderBackupJournalPromise = null;
+
+  function orderBackupStorageError(error, resultUnknown){
+    return Object.assign(new Error('브라우저에 백업 증빙을 보존하거나 확인할 수 없습니다.'), {
+      code:'local-receipt-storage-failed', resultUnknown:resultUnknown === true,
+      storageErrorName:String(error && error.name || 'Error')
+    });
+  }
+
+  function openOrderBackupJournal(){
+    if(!orderBackupJournalPromise){
+      orderBackupJournalPromise = new Promise((resolve, reject) => {
+        let finished = false;
+        const request = indexedDB.open('haetsalmaru_order_backup_ack_v1', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('receipts', { autoIncrement:true });
+        request.onerror = () => { finished = true; reject(request.error); };
+        request.onblocked = () => { finished = true; reject(new Error('backup-journal-blocked')); };
+        request.onsuccess = () => {
+          const db = request.result;
+          if(finished){ db.close(); return; }
+          db.onversionchange = () => { db.close(); orderBackupJournalPromise = null; };
+          db.onclose = () => { orderBackupJournalPromise = null; };
+          resolve(db);
+        };
+      }).catch(error => { orderBackupJournalPromise = null; throw error; });
+    }
+    return orderBackupJournalPromise;
+  }
+
+  function updateOrderBackupJournal(action, receipt){
+    return openOrderBackupJournal().then(db => new Promise((resolve, reject) => {
+      const tx = db.transaction('receipts', action === 'read' ? 'readonly' : 'readwrite');
+      const store = tx.objectStore('receipts');
+      let result, failure;
+      const abort = message => { failure = new Error(message); tx.abort(); };
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = tx.onabort = () => reject(failure || tx.error || new Error('backup-journal-aborted'));
+      const metadata = store.get('meta');
+      metadata.onsuccess = () => {
+        let meta = metadata.result;
+        if(!meta && action === 'create') meta = { epoch:makeClientWriteId().slice(6), lastSequence:0 };
+        if(!meta || typeof meta.epoch !== 'string' || !meta.epoch || !Number.isSafeInteger(meta.lastSequence)){ abort('invalid-backup-journal'); return; }
+        if(action === 'create'){
+          const add = store.add({});
+          add.onsuccess = () => {
+            const sequence = add.result;
+            if(!Number.isSafeInteger(sequence) || sequence < 1){ abort('invalid-backup-sequence'); return; }
+            result = { ...receipt, clientWriteId:'write_' + meta.epoch + '_' + sequence, journalEpoch:meta.epoch, journalSequence:sequence };
+            store.put({ receipt:result, state:'pending' }, sequence);
+            store.put({ ...meta, lastSequence:sequence }, 'meta');
+          };
+          return;
+        }
+        const sequence = Number(receipt && receipt.journalSequence);
+        if(!Number.isSafeInteger(sequence) || sequence < 1 || sequence > meta.lastSequence || receipt.journalEpoch !== meta.epoch
+          || receipt.clientWriteId !== 'write_' + meta.epoch + '_' + sequence){ abort('backup-receipt-mismatch'); return; }
+        const get = store.get(sequence);
+        get.onsuccess = () => {
+          const row = get.result;
+          if(row && (!row.receipt || row.receipt.clientWriteId !== receipt.clientWriteId)){ abort('backup-receipt-mismatch'); return; }
+          if(action === 'ack'){
+            if(row && row.state === 'rejected'){ abort('rejected-backup-receipt'); return; }
+            // Allocation and pending row commit together; only confirmed ACK deletes the row.
+            if(row) store.delete(sequence);
+          }else if(action === 'reject' && row){
+            store.put({ ...row, state:'rejected' }, sequence);
+          }
+          result = row ? { receipt:row.receipt, rejected:action === 'reject' || row.state === 'rejected', confirmed:action === 'ack' }
+            : { receipt, confirmed:true };
+        };
+      };
+    })).catch(error => { throw orderBackupStorageError(error, action !== 'create'); });
+  }
+
+  function readSessionOrderBackupReceipt(){
+    const raw = sessionStorage.getItem(ORDER_BACKUP_ACK_KEY);
+    if(!raw) return null;
+    return raw.startsWith('{') ? JSON.parse(raw) : { clientWriteId:raw, legacy:true };
+  }
+
+  async function createOrderBackupReceipt(options){
+    const receipt = await updateOrderBackupJournal('create', options);
+    try{
+      sessionStorage.setItem(ORDER_BACKUP_ACK_KEY, JSON.stringify(receipt));
+      if(readSessionOrderBackupReceipt().clientWriteId !== receipt.clientWriteId) throw new Error('backup-session-receipt-mismatch');
+    }catch(error){
+      await updateOrderBackupJournal('reject', receipt);
+      throw orderBackupStorageError(error, false);
+    }
     return receipt;
   }
 
-  function finishOrderBackupReceipt(receipt){
-    // A duplicated tab can still reference this receipt after this tab clears its pointer.
-    localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify({ ...receipt, confirmed:true, confirmedAt:receipt.confirmedAt || new Date().toISOString() }));
-    if(sessionStorage.getItem(ORDER_BACKUP_ACK_KEY) === receipt.clientWriteId){
-      sessionStorage.removeItem(ORDER_BACKUP_ACK_KEY);
+
+  async function readPendingOrderBackup(){
+    const pointer = readSessionOrderBackupReceipt();
+    if(!pointer) return null;
+    if(pointer.legacy){
+      const raw = localStorage.getItem(ORDER_BACKUP_ACK_KEY + ':' + pointer.clientWriteId);
+      if(!raw) throw orderBackupStorageError(new Error('missing-legacy-backup-receipt'), true);
+      const receipt = JSON.parse(raw);
+      if(!receipt || receipt.clientWriteId !== pointer.clientWriteId) throw orderBackupStorageError(new Error('legacy-backup-receipt-mismatch'), true);
+      return receipt.rejected === true ? null : receipt;
     }
-    return { key:'order', actualAggregateWriteCompleted:true, aggregateWriteCompletedAt:new Date().toISOString(), writeProof:{ attemptId:receipt.attemptId, queueIdentity:receipt.queueIdentity, clientWriteId:receipt.clientWriteId } };
+    const status = await updateOrderBackupJournal('read', pointer);
+    return status.rejected ? null : { ...status.receipt, confirmed:status.confirmed === true };
+  }
+
+  async function finishOrderBackupReceipt(receipt){
+    try{
+    if(receipt.journalEpoch){
+      await updateOrderBackupJournal('ack', receipt);
+    }else{
+      // Preserve the finite legacy receipts already referenced by old copied sessions.
+      localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify({ ...receipt, confirmed:true, confirmedAt:receipt.confirmedAt || new Date().toISOString() }));
+    }
+      const current = readSessionOrderBackupReceipt();
+      if(current && current.clientWriteId === receipt.clientWriteId) sessionStorage.removeItem(ORDER_BACKUP_ACK_KEY);
+    }catch(error){ throw error && error.code === 'local-receipt-storage-failed' ? error : orderBackupStorageError(error, true); }
+    return { key:'order', actualAggregateWriteCompleted:true, writeProof:{ verifiedAt:new Date().toISOString(), attemptId:receipt.attemptId, queueIdentity:receipt.queueIdentity, clientWriteId:receipt.clientWriteId } };
   }
 
   async function verifyPendingOrderBackup(){
-    const receipt = readPendingOrderBackup();
+    const receipt = await readPendingOrderBackup();
     if(!receipt) return { skipped:true, reason:'no-pending-write', actualAggregateWriteCompleted:false };
     if(isConnectionStopped()) return { skipped:true, resultUnknown:true, actualAggregateWriteCompleted:false };
-    if(receipt.confirmed === true && receipt.confirmedAt) return finishOrderBackupReceipt(receipt);
+    if(receipt.confirmed === true && (receipt.journalEpoch || receipt.confirmedAt)) return finishOrderBackupReceipt(receipt);
     const snapshot = await getDocFromServer(doc(db, 'haetsalCombinedApp', 'order_data'));
     if(!snapshot.exists() || snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites || snapshot.data().clientWriteId !== receipt.clientWriteId){
       return { skipped:true, resultUnknown:true, actualAggregateWriteCompleted:false };
@@ -60870,10 +60979,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if((policyResult && policyResult.blocked)
       || (quotaGuard && typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked())) return;
     if(window.HaetsalCloudStore && window.HaetsalCloudStore.registerSaveHandler){
-      window.HaetsalCloudStore.registerSaveHandler(function(key, value, writeOptions){
+      window.HaetsalCloudStore.registerSaveHandler(async function(key, value, writeOptions){
         if(window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('firestore-save-handler-' + String(key || ''))){
           return Promise.resolve({ skipped:true, reason:'runtime-stopped' });
         }
+        if(window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked()) return { skipped:true, reason:'quota-stopped' };
         const ref = cloudDocRefs[key];
         if(!ref) return Promise.resolve();
         if(key === 'shared'){
@@ -60881,13 +60991,17 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         }
         if(key === 'order'){
           if(writeOptions && writeOptions.verifyOnly) return verifyPendingOrderBackup();
-          const pendingWrite = readPendingOrderBackup();
+          const pendingWrite = await readPendingOrderBackup();
           if(pendingWrite) return Promise.resolve({ skipped:true, resultUnknown:true, reason:'original-write-unconfirmed' });
           const aggregatePayload = buildPayload(value);
-          const receipt = { clientWriteId:aggregatePayload.clientWriteId, attemptId:String(writeOptions && writeOptions.attemptId || ''), queueIdentity:String(writeOptions && writeOptions.queueIdentity || '') };
-          localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify(receipt));
-          sessionStorage.setItem(ORDER_BACKUP_ACK_KEY, receipt.clientWriteId);
-          if(readPendingOrderBackup().clientWriteId !== receipt.clientWriteId) throw new Error('백업 요청 증빙을 저장하지 못했습니다.');
+          const receipt = await createOrderBackupReceipt({ attemptId:String(writeOptions && writeOptions.attemptId || ''), queueIdentity:String(writeOptions && writeOptions.queueIdentity || '') });
+          aggregatePayload.clientWriteId = receipt.clientWriteId;
+          let aggregateWriteStarted = false;
+          try{
+          if((window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('order-backup-after-journal'))
+            || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())){
+            throw Object.assign(new Error('Firestore write blocked by safety guard'), { code:'runtime-stopped' });
+          }
           let safetyBackup = null;
           let liveQueue = null;
           let liveOrderDocs = [];
@@ -60934,23 +61048,27 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
                 console.error('Firestore 주문별 실시간 저장 실패:', error);
               })
             : Promise.resolve();
-          return Promise.all([liveOrderDocsSave, liveQueueSave, safetySave])
+          return await Promise.all([liveOrderDocsSave, liveQueueSave, safetySave])
             .then(() => {
               if((window.HaetsalRuntimeGuard && !window.HaetsalRuntimeGuard.canWrite('order-aggregate-before-write'))
                 || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())){
                 throw Object.assign(new Error('Firestore write blocked by safety guard'), { code:'runtime-stopped' });
               }
+              aggregateWriteStarted = true;
               return setDoc(ref, aggregatePayload);
             })
-            .then(() => finishOrderBackupReceipt(receipt))
-            .catch(async error => {
-              if(/^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(String(error && error.code || ''))){
-                try{ return await verifyPendingOrderBackup(); }catch(verificationError){ error.resultUnknown = true; }
-              }else if(['permission-denied', 'unauthenticated', 'failed-precondition', 'invalid-argument', 'runtime-stopped'].includes(error && error.code)){
-                localStorage.setItem(ORDER_BACKUP_ACK_KEY + ':' + receipt.clientWriteId, JSON.stringify({ ...receipt, rejected:true, errorCode:error.code }));
-              }
-              throw error;
-            });
+            .then(() => finishOrderBackupReceipt(receipt));
+          }catch(error){
+            if(!aggregateWriteStarted || ['permission-denied', 'unauthenticated', 'failed-precondition', 'invalid-argument', 'runtime-stopped', 'resource-exhausted'].includes(error && error.code)){
+              const status = await updateOrderBackupJournal('reject', receipt);
+              if(status.confirmed) return finishOrderBackupReceipt(receipt);
+            }else if(/^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(String(error && error.code || ''))){
+              try{ return await verifyPendingOrderBackup(); }catch(verificationError){ error.resultUnknown = true; }
+            }else{
+              error.resultUnknown = true;
+            }
+            throw error;
+          }
         }
         if(key === 'tumbler') return saveTumblerWithReturnProtection(ref,value);
         return setDoc(ref, buildPayload(value));
