@@ -1700,7 +1700,7 @@ body{
 /* =========================================================
    운영 화면 스크롤 안정화 및 통합 운영 보강
    ========================================================= */
-html, body{
+html{
   overscroll-behavior-y:none;
 }
 .page-dashboard{
@@ -11470,7 +11470,7 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202610261915;
+  const APP_BUILD_NUMBER = 202610300816;
   const APP_BUILD_LABEL = '20261026_1915';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
@@ -39609,13 +39609,26 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const center = (ownerRect.top + ownerRect.bottom) / 2;
       let anchor = null;
       let distance = Infinity;
-      for(const card of body.querySelectorAll('.dashboard-orders .order-work-card')){
+      const cards = body.querySelectorAll('.dashboard-orders .order-work-card');
+      let first = 0;
+      if(!orderId){
+        // Work cards and delivery groups follow the existing vertical DOM order.
+        let last = cards.length;
+        while(first < last){
+          const middle = Math.floor((first + last) / 2);
+          if(cards[middle].getBoundingClientRect().bottom <= ownerRect.top) first = middle + 1;
+          else last = middle;
+        }
+      }
+      for(let index = first; index < cards.length; index++){
+        const card = cards[index];
         const control = card.querySelector('[data-order-id]');
         const cardOrderId = String(control && control.dataset.orderId || '');
         if(!cardOrderId || (orderId && cardOrderId !== orderId)) continue;
         const rect = card.getBoundingClientRect();
         if(orderId) return { orderId:cardOrderId, offset:rect.top - ownerRect.top };
-        if(rect.bottom <= ownerRect.top || rect.top >= ownerRect.bottom) continue;
+        if(rect.top >= ownerRect.bottom) break;
+        if(rect.bottom <= ownerRect.top) continue;
         const nextDistance = Math.abs((rect.top + rect.bottom) / 2 - center);
         if(nextDistance < distance){
           anchor = { orderId:cardOrderId, offset:rect.top - ownerRect.top };
@@ -44853,13 +44866,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const distance = Math.hypot(Number(clientX || 0) - gesture.startX, Number(clientY || 0) - gesture.startY);
       const scrollContainer = getCompletionGestureScrollContainer(gesture);
       const scrollChanged = getCompletionScrollTop(scrollContainer) !== gesture.startScrollTop;
-      return gesture.moved || distance >= COMPLETION_SCROLL_GUARD_DISTANCE || scrollChanged;
+      const releasedButton = getCompletionScrollGuardButton(document.elementFromPoint(Number(clientX || 0), Number(clientY || 0)));
+      gesture.retargeted = !gesture.button.isConnected || releasedButton !== gesture.button || gesture.action !== String(gesture.button.dataset.action || '') || gesture.orderId !== String(gesture.button.dataset.orderId || '');
+      return gesture.moved || distance >= COMPLETION_SCROLL_GUARD_DISTANCE || scrollChanged || gesture.retargeted;
     }
 
     function rememberCompletionBlockedClick(gesture){
       if(!gesture) return;
       completionBlockedClick = {
         button:gesture.button,
+        retargeted:gesture.retargeted === true,
         action:gesture.action,
         orderId:gesture.orderId,
         until:Date.now() + 900
@@ -44877,7 +44893,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const sameButton = blocked.button === btn;
       const sameActionTarget = blocked.action === String(btn.dataset.action || '')
         && blocked.orderId === String(btn.dataset.orderId || '');
-      if(!sameButton && !sameActionTarget) return;
+      if(!sameButton && !sameActionTarget && !(blocked.retargeted && event.detail !== 0)) return;
       completionBlockedClick = null;
       event.preventDefault();
       event.stopImmediatePropagation();
