@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202610300816;
-  const APP_BUILD_LABEL = '20261026_1915';
+  const APP_BUILD_NUMBER = 202611012354;
+  const APP_BUILD_LABEL = '20261101_2354';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -11729,11 +11729,11 @@ window.HaetsalCloudStore = (function(){
     return `${hours}:${minutes}`;
   }
 
-  function emit(key){
+  function emit(key, notificationSource='local'){
     const value = clone(caches[key]);
     listeners[key].forEach(listener => {
       try{
-        listener(value);
+        listener(value, notificationSource);
       }catch(error){
         console.error(error);
       }
@@ -11751,9 +11751,9 @@ window.HaetsalCloudStore = (function(){
     });
   }
 
-  function setCache(key, value, shouldNotify=true){
+  function setCache(key, value, shouldNotify=true, notificationSource='local'){
     caches[key] = clone(value);
-    if(shouldNotify) emit(key);
+    if(shouldNotify) emit(key, notificationSource);
     return clone(caches[key]);
   }
 
@@ -11874,7 +11874,7 @@ window.HaetsalCloudStore = (function(){
     listeners[key].add(listener);
     if(caches[key] != null){
       try{
-        listener(clone(caches[key]));
+        listener(clone(caches[key]), 'cache');
       }catch(error){
         console.error(error);
       }
@@ -11979,7 +11979,7 @@ window.HaetsalCloudStore = (function(){
     return attempt.promise;
   }
 
-  function applyRemote(key, value){
+  function applyRemote(key, value, snapshotMetadata){
     if(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped && window.HaetsalRuntimeGuard.isStopped()) return getCache(key, null);
     if(value == null) return getCache(key, null);
     blockedKeys.delete(key);
@@ -11988,9 +11988,13 @@ window.HaetsalCloudStore = (function(){
       remoteGuardProtectionPending[key] = true;
       console.warn('legacy remote overwrite candidate blocked', key);
     }
-    const applied = setCache(key, protectedRemote.value, true);
+    const notificationSource = snapshotMetadata && snapshotMetadata.fromCache === false && snapshotMetadata.hasPendingWrites === false
+      ? 'server' : (snapshotMetadata && snapshotMetadata.hasPendingWrites === true ? 'pending' : (snapshotMetadata && snapshotMetadata.fromCache === true ? 'cache' : 'remote'));
+    const applied = setCache(key, protectedRemote.value, true, notificationSource);
     const attempt = writeAttempts[key];
-    if(key !== 'order' || !attempt) setSyncStatus(key, 'received', '서버 수신 완료 · 백업 저장과 별도', { source:'receive' });
+    const receiptText = key === 'order' && notificationSource !== 'server'
+      ? (notificationSource === 'cache' ? '캐시 수신 · 서버 확인 전' : '수신 자료 · 서버 확인 전') : '서버 수신 완료 · 백업 저장과 별도';
+    if(key !== 'order' || !attempt) setSyncStatus(key, 'received', receiptText, { source:'receive', receiveSource:notificationSource });
     return applied;
   }
 
@@ -12991,6 +12995,7 @@ window.HaetsalSharedStore = (function(){
     let orderFullBackupDeferredSaveReason = '';
     let orderFullBackupDeferredSaveOptions = null;
     let orderMenuCatalogRemoteHydrated = false;
+    let orderMenuCatalogReceiveError = false;
     let lastLiveOrderDocumentsSaveSignature = '';
     let orderArchiveAutoInFlight = false;
     let orderArchiveMaintenanceMode = false;
@@ -14076,7 +14081,7 @@ window.HaetsalSharedStore = (function(){
         ? applyMenuCatalogToSettings({ ...(settings || {}) })
         : recoverMenuCatalogFromBackupIfNeeded(settings, reason || 'saveData');
       const info = getMenuCatalogProtectionInfo(protectedSettings);
-      const blockFullBackup = !explicitMenuSave && info.isDefaultOnly && !hasExplicitMenuCatalogChange(protectedSettings) && (!orderMenuCatalogRemoteHydrated || !isMenuCatalogWorthBackingUp(protectedSettings));
+      const blockFullBackup = !explicitMenuSave && (orderMenuCatalogReceiveError || (info.isDefaultOnly && !hasExplicitMenuCatalogChange(protectedSettings) && (!orderMenuCatalogRemoteHydrated || !isMenuCatalogWorthBackingUp(protectedSettings))));
       rememberMenuCatalogBackup(protectedSettings, reason || 'saveData');
       return { settings: protectedSettings, blockFullBackup };
     }
@@ -16060,9 +16065,25 @@ window.HaetsalSharedStore = (function(){
       return normalizeDeliveryRecords(merged);
     }
 
-    function normalizeStoredOrderData(raw){
+    function hasValidIncomingOrderMenuCatalog(settings){
+      const source = settings || {};
+      if(Object.prototype.hasOwnProperty.call(source, 'menuCatalog') && !Array.isArray(source.menuCatalog)) return false;
+      if(Object.prototype.hasOwnProperty.call(source, 'menuNames') && !Array.isArray(source.menuNames)) return false;
+      const catalog = Array.isArray(source.menuCatalog) ? source.menuCatalog : null;
+      const names = Array.isArray(source.menuNames) ? source.menuNames : null;
+      if(!catalog && !names) return false;
+      return (!catalog || catalog.every(item => String((item && typeof item === 'object' ? item.name : item) || '').trim()))
+        && (!names || names.every(name => String(name || '').trim()));
+    }
+
+    function normalizeStoredOrderData(raw, fallbackMenuSettings){
+      const incomingSettings = ((raw || {}).sysSettings) || {};
+      const validIncomingMenu = hasValidIncomingOrderMenuCatalog(incomingSettings);
+      const knownMenuSettings = validIncomingMenu ? null : (fallbackMenuSettings || ((readMenuCatalogBackup() || {}).sysSettings));
+      const menuFallback = knownMenuSettings && hasValidIncomingOrderMenuCatalog(knownMenuSettings)
+        ? getMenuCatalogBackupSettings(knownMenuSettings) : {};
       const mergedSettings = recoverMenuCatalogFromBackupIfNeeded(
-        applyMenuCatalogToSettings({ ...defaultData().sysSettings, ...(((raw || {}).sysSettings) || {}) }),
+        applyMenuCatalogToSettings({ ...defaultData().sysSettings, ...incomingSettings, ...menuFallback }),
         'normalize-stored-order-data'
       );
       mergedSettings.emergencyOrderCompactArchive = normalizeEmergencyOrderCompactArchive(mergedSettings.emergencyOrderCompactArchive);
@@ -21827,11 +21848,13 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         if(!window.localStorage) return;
         if(isOrderLifecycleFullBackupReason(reason)) return;
         const previous = readImportantFullBackupQueueLocal();
+        // A previous write's ACK must not clear a newer backup intent, even within one millisecond.
         const now = new Date().toISOString();
         window.localStorage.setItem(ORDER_IMPORTANT_FULL_BACKUP_QUEUE_LOCAL_KEY, JSON.stringify({
           reason:String(reason || (previous && previous.reason) || 'important-order-change'),
           queuedAt:(previous && previous.queuedAt) || now,
-          updatedAt:now
+          updatedAt:now,
+          intentId:uid('full-backup-intent')
         }));
       }catch(error){
         console.warn('important full backup queue write failed', error);
@@ -22101,6 +22124,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           sysSettings:state.sysSettings
         }, reason);
         if(menuCatalogProtection.blockFullBackup){
+          if(orderMenuCatalogReceiveError && forceFullBackup){
+            const pendingBackup = readImportantFullBackupQueueLocal();
+            markImportantFullBackupPending(pendingBackup && !isOrderLifecycleFullBackupReason(pendingBackup.reason) ? pendingBackup.reason : reason);
+          }
           saveLiveOrdersForCurrentSave(normalizedForSave, reason + '-menu-catalog-protected-live-only');
           state.saveState = 'pending';
           state.saveStateText = '전체 백업 저장 보류';
@@ -22200,21 +22227,30 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       }
     }
 
-    function applyCloudData(nextData){
+    function applyCloudData(nextData, notificationSource){
       if(orderArchiveMaintenanceMode){
         state.saveState = 'pending';
         state.saveStateText = '안전 분리 중 원격 병합 보류';
         refreshOrderSaveStatusChips();
         return;
       }
-      orderMenuCatalogRemoteHydrated = true;
       const localEmergencyArchiveBeforeSync = getEmergencyOrderCompactArchive(state.sysSettings);
       const localOrderDataBeforeRemote = {
         users: state.users,
         couponHistory: state.couponHistory
       };
       const legacyRemoteProtection = protectOrderDataFromLegacyRemote(localOrderDataBeforeRemote, nextData);
-      const normalized = normalizeStoredOrderData(legacyRemoteProtection.data);
+      const incomingMenuSettings = (legacyRemoteProtection.data && legacyRemoteProtection.data.sysSettings) || {};
+      const validIncomingMenu = hasValidIncomingOrderMenuCatalog(incomingMenuSettings);
+      const confirmedMenuReceipt = validIncomingMenu && notificationSource === 'server';
+      const recoveredMenuReceipt = orderMenuCatalogReceiveError && confirmedMenuReceipt;
+      if(confirmedMenuReceipt){
+        orderMenuCatalogRemoteHydrated = true;
+        orderMenuCatalogReceiveError = false;
+      }else if(!validIncomingMenu && (Object.prototype.hasOwnProperty.call(incomingMenuSettings, 'menuCatalog') || Object.prototype.hasOwnProperty.call(incomingMenuSettings, 'menuNames'))){
+        orderMenuCatalogReceiveError = true;
+      }
+      const normalized = normalizeStoredOrderData(legacyRemoteProtection.data, state.sysSettings);
       const remoteGuardProtected = !!(
         legacyRemoteProtection.protected ||
         (window.HaetsalCloudStore &&
@@ -22251,12 +22287,20 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       const latestOrderCouponSyncResult = applyLatestOrderRemainingCouponsToStateUsers('remote-order-sync');
       const verifiedCouponBalanceSyncResult = applyVerifiedCouponBalancesToStateUsers('remote-order-sync');
       scheduleArchivedOrderMarksServerHydration('remote-order-sync-marker-prehydrate', { delayMs:250, render:true, persistLocal:true, showStatus:false });
-      state.saveState = 'saved';
-      state.saveStateText = `동기화 완료 ${formatAMPM(new Date())}`;
       applyOfflineCouponUseHistoryGuardRecords('offline-coupon-use-history-guard-remote-sync');
       applyJuneOfflineCouponUseHistoryRecovery('offline-coupon-use-history-recovery-remote-sync');
       runRevivedOrderSafetySweep('remote-order-sync-revived-sweep');
       renderAfterRemoteOrderSync('order-data-sync');
+      if(recoveredMenuReceipt){
+        const pendingBackup = readImportantFullBackupQueueLocal();
+        if(pendingBackup && !isOrderLifecycleFullBackupReason(pendingBackup.reason)){
+          if(orderFullBackupSaveInFlight){
+            scheduleDeferredOrderFullBackupSave(pendingBackup.reason + '-menu-recovered', { forceFullBackup:true, saveShared:false });
+          }else{
+            retryImportantFullBackupQueue();
+          }
+        }
+      }
       if(protectedOrderSync || runtimeOrderChanged || protectedMenuCatalogSync || remoteGuardProtected){
         window.setTimeout(() => {
           try{
@@ -23813,7 +23857,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function normalizeOrderMenuSearchText(value){
-      return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+      return String(value || '').normalize('NFC').trim().toLowerCase().replace(/\s+/g, '');
     }
 
     function getOrderMenuSuggestionsForInput(query){
@@ -23835,10 +23879,12 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
 
     function renderOrderMenuSuggestionList(index, query){
       const suggestions = getOrderMenuSuggestionsForInput(query);
+      const warning = orderMenuCatalogReceiveError
+        ? '<div class="order-menu-suggestion-empty" role="status">메뉴 자료 확인 필요 · 최신 목록을 확인하지 못했습니다.</div>' : '';
       if(!suggestions.length){
-        return `<div class="order-menu-suggestion-empty">검색된 메뉴가 없습니다.</div>`;
+        return warning + `<div class="order-menu-suggestion-empty">검색된 메뉴가 없습니다.</div>`;
       }
-      return suggestions.map(item => {
+      return warning + suggestions.map(item => {
         const name = String(item.name || '').trim();
         const status = getMenuStatusValue(item);
         if(status === 'SOLD_OUT'){
@@ -26470,6 +26516,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function updateOperationalControlSettings(updates){
+      if(orderMenuCatalogReceiveError){
+        showMessage('메뉴 자료 확인이 필요해 운영 설정을 변경하지 못했습니다. 연결 상태를 확인한 뒤 다시 시도해주세요.');
+        return;
+      }
       state.sysSettings = { ...state.sysSettings, ...updates, operationalControlUpdatedAt:new Date().toISOString() };
       saveData({ reason:'operational-control', forceFullBackup:true });
       render();
@@ -46846,10 +46896,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     // [8] 최초 실행
     // =========================================================
     if(window.HaetsalCloudStore && window.HaetsalCloudStore.subscribeOrderData){
-      window.HaetsalCloudStore.subscribeOrderData(function(nextData){
+      window.HaetsalCloudStore.subscribeOrderData(function(nextData, notificationSource){
         if(!nextData) return;
         requestOrderScrollRestore();
-        applyCloudData(nextData);
+        applyCloudData(nextData, notificationSource);
       });
     }
 
@@ -61108,13 +61158,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             filterIncomingOrdersByCloudGuards(Array.isArray(orderData.orders) ? orderData.orders : []).then(verifiedOrders => {
               if(generation !== orderCloudApplyGeneration || (scopeInstance && scopeInstance.released)) return;
               if(window.HaetsalCloudStore && window.HaetsalCloudStore.applyRemote){
-                window.HaetsalCloudStore.applyRemote(key, { ...orderData, orders:verifiedOrders });
+                window.HaetsalCloudStore.applyRemote(key, { ...orderData, orders:verifiedOrders }, snapshot.metadata);
               }
               syncOrderGuardVerifications(true);
             });
             return;
           }
-          window.HaetsalCloudStore.applyRemote(key, payload.data);
+          window.HaetsalCloudStore.applyRemote(key, payload.data, snapshot.metadata);
         }
       }, error => {
         if(scopeInstance && scopeInstance.released) return;
