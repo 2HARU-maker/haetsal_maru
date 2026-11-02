@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611012354;
-  const APP_BUILD_LABEL = '20261101_2354';
+  const APP_BUILD_NUMBER = 202611021227;
+  const APP_BUILD_LABEL = '20261102_1227';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -14468,12 +14468,45 @@ window.HaetsalSharedStore = (function(){
       return rows.filter(order => shouldShowOrderInProductionQueue(order));
     }
 
-    function getOrderQueueEmptyMessage(filter){
+    function getOrderQueueAuthorityMessage(){
       const today = todayYmd();
       const queueDate = state.appRole === 'MANAGER' ? String(state.productionQueueDate || today) : today;
+      if(queueDate === today && currentDayLiveOrderAuthority.dateKey === today){
+        if(currentDayLiveOrderAuthority.status === 'cached' && currentDayLiveOrderAuthority.complete){
+          return '마지막 서버 확인 목록을 표시하고 있습니다. 연결 복귀 후 현재 주문 목록을 다시 확인합니다.';
+        }
+        if(currentDayLiveOrderAuthority.status === 'error' || currentDayLiveOrderAuthority.status === 'unconfirmed'){
+          return '서버의 현재 주문 목록을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다.';
+        }
+        if(currentDayLiveOrderAuthority.status === 'partial'){
+          return '현재 주문 조회 한도에 도달했습니다. 전체 주문 목록 확인이 끝난 것은 아닙니다.';
+        }
+        if(currentDayLiveOrderAuthority.status === 'verifying'){
+          return '서버 주문의 현재 상태를 확인하고 있습니다. 확인이 끝나면 목록에 반영합니다.';
+        }
+        if(currentDayLiveOrderAuthority.status === 'pending-write' && currentDayLiveOrderAuthority.pendingMembershipChanged){
+          return '주문 저장 결과를 확인하고 있습니다. 표시된 목록은 마지막 서버 확인 자료를 포함합니다.';
+        }
+      }
       if(queueDate === today && (currentDayLiveOrderAuthority.dateKey !== today || !currentDayLiveOrderAuthority.complete)){
         return '서버의 현재 주문 목록을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다.';
       }
+      return '';
+    }
+
+    function getOrderQueueCountLabel(count){
+      const value = Math.max(0, Number(count) || 0);
+      if(!getOrderQueueAuthorityMessage()) return `${value}건`;
+      const authority = currentDayLiveOrderAuthority;
+      if(authority.status === 'cached' && authority.complete) return `마지막 확인 ${value}건`;
+      if(authority.status === 'partial') return `표시 ${value}건`;
+      if(authority.status === 'error') return value ? `확인 불가 · 마지막 표시 ${value}건` : '확인 불가';
+      return value ? `확인 중 · 표시 ${value}건` : '확인 중';
+    }
+
+    function getOrderQueueEmptyMessage(filter){
+      const authorityMessage = getOrderQueueAuthorityMessage();
+      if(authorityMessage) return authorityMessage;
       const value = String(filter || 'ALL').toUpperCase();
       if(value === 'MEASURE') return '현재 계량이 필요한 제작 대기 주문이 없습니다. ⚖️';
       if(value === 'DELIVERY') return '현재 열린 배달 주문이 없습니다. 🚚';
@@ -19434,6 +19467,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     let currentDayLiveOrderAuthority = {
       dateKey:'',
       complete:false,
+      status:'unconfirmed',
+      pendingMembershipChanged:false,
       ids:new Set(),
       hiddenIds:new Set()
     };
@@ -19516,17 +19551,42 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       const nextIds = new Set((Array.isArray(orderIds) ? orderIds : []).map(value => String(value || '').trim()).filter(Boolean));
       const previous = currentDayLiveOrderAuthority;
       const sameDate = previous.dateKey === nextDateKey;
+      const retainConfirmed = sameDate && opts.resetScope !== true && opts.retainConfirmed === true;
+      if(opts.status === 'verifying' && retainConfirmed
+        && Array.from(nextIds).every(orderId => previous.ids.has(orderId))) return false;
+      const verifiedIds = retainConfirmed && opts.includeVerified === true ? new Set(nextIds) : new Set();
+      if(retainConfirmed){
+        nextIds.clear();
+        previous.ids.forEach(orderId => nextIds.add(orderId));
+        verifiedIds.forEach(orderId => nextIds.add(orderId));
+      }
+      // Completeness belongs to the last server result; status tracks its current freshness.
+      const nextComplete = opts.status === 'partial' ? false : retainConfirmed ? previous.complete : complete === true;
+      const nextStatus = String(opts.status || (nextComplete ? 'confirmed' : 'unconfirmed'));
+      const nextPendingMembershipChanged = retainConfirmed
+        && (previous.pendingMembershipChanged === true || opts.pendingMembershipChanged === true
+          || (Array.isArray(opts.pendingIds) && opts.pendingIds.some(orderId => !previous.ids.has(String(orderId || '')))));
+      // Keep confirmed same-day removals hidden until fresh verified membership allows them back.
       const nextHiddenIds = sameDate ? new Set(previous.hiddenIds) : new Set();
-      nextIds.forEach(orderId => nextHiddenIds.delete(orderId));
+      if(!retainConfirmed && nextComplete && sameDate){
+        previous.ids.forEach(orderId => { if(!nextIds.has(orderId)) nextHiddenIds.add(orderId); });
+      }
+      if(!retainConfirmed) nextIds.forEach(orderId => nextHiddenIds.delete(orderId));
+      verifiedIds.forEach(orderId => nextHiddenIds.delete(orderId));
+      const previousDisplayStatus = previous.status === 'pending-write' && previous.complete && !previous.pendingMembershipChanged ? 'confirmed' : previous.status;
+      const nextDisplayStatus = nextStatus === 'pending-write' && nextComplete && !nextPendingMembershipChanged ? 'confirmed' : nextStatus;
       const changed = previous.dateKey !== nextDateKey
-        || previous.complete !== (complete === true)
+        || previous.complete !== nextComplete
+        || previousDisplayStatus !== nextDisplayStatus
         || previous.ids.size !== nextIds.size
         || Array.from(nextIds).some(orderId => !previous.ids.has(orderId))
         || previous.hiddenIds.size !== nextHiddenIds.size
         || Array.from(nextHiddenIds).some(orderId => !previous.hiddenIds.has(orderId));
       currentDayLiveOrderAuthority = {
         dateKey:nextDateKey,
-        complete:complete === true,
+        complete:nextComplete,
+        status:nextStatus,
+        pendingMembershipChanged:nextPendingMembershipChanged,
         ids:nextIds,
         hiddenIds:nextHiddenIds
       };
@@ -21591,9 +21651,49 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
       };
     }
 
+    function canApplyOrderLifecycleResult(value){
+      const remote = getOrderFromLiveDocument(value);
+      if(!remote) return false;
+      const local = getOrderById(remote.id);
+      return !local || (normalizeOrderProductionCycle(remote.productionCycle) >= normalizeOrderProductionCycle(local.productionCycle)
+        && normalizeOrderStatusRevision(remote.statusRevision) >= normalizeOrderStatusRevision(local.statusRevision));
+    }
+
+    function receiveSupersededOrderLiveDocuments(values, sourceLabel, options){
+      const opts = options || {};
+      const rows = (Array.isArray(values) ? values : []).filter(value => {
+        const remote = getOrderFromLiveDocument(value);
+        if(!remote || !canApplyOrderLifecycleResult(value)) return false;
+        const local = getOrderById(remote.id);
+        const latest = opts.latestOrderLifecycles && opts.latestOrderLifecycles.get(String(remote.id || '').trim());
+        if(latest && (normalizeOrderProductionCycle(remote.productionCycle) < normalizeOrderProductionCycle(latest.productionCycle)
+          || normalizeOrderStatusRevision(remote.statusRevision) < normalizeOrderStatusRevision(latest.statusRevision))) return false;
+        if(isOrderOpenStatus(remote)){
+          const authority = currentDayLiveOrderAuthority;
+          const id = String(remote.id || '').trim();
+          if(latest && latest.closed) return false;
+          if(latest && normalizeOrderProductionCycle(remote.productionCycle) === normalizeOrderProductionCycle(latest.productionCycle)
+            && normalizeOrderStatusRevision(remote.statusRevision) === normalizeOrderStatusRevision(latest.statusRevision)
+            && normalizeOrderStageRevision(remote.stageRevision) < normalizeOrderStageRevision(latest.stageRevision)) return false;
+          if(authority.dateKey === todayYmd()
+            && (authority.hiddenIds.has(id) || (authority.complete && !authority.ids.has(id)))) return false;
+          if(local && normalizeOrderProductionCycle(remote.productionCycle) === normalizeOrderProductionCycle(local.productionCycle)
+            && normalizeOrderStatusRevision(remote.statusRevision) === normalizeOrderStatusRevision(local.statusRevision)
+            && normalizeOrderStageRevision(remote.stageRevision) < normalizeOrderStageRevision(local.stageRevision)) return false;
+        }
+        return true;
+      });
+      const result = receiveOrderLiveDocuments(rows, sourceLabel, { ...(options || {}), initialSnapshot:false, hasPendingWrites:false });
+      return { ...result, eligibleOrderIds:rows.map(value => String((getOrderFromLiveDocument(value) || {}).id || '').trim()).filter(Boolean) };
+    }
+
     function finishCurrentDayLiveOrderSnapshot(values, sourceLabel, options){
       const opts = options || {};
-      const result = receiveOrderLiveDocuments(values, sourceLabel, { ...opts, deferRender:true });
+      const result = receiveOrderLiveDocuments(values, sourceLabel, {
+        ...opts,
+        deferRender:true,
+        hasPendingWrites:opts.verifiedRowsOnly === true ? false : opts.hasPendingWrites
+      });
       const shouldRender = opts.authorityChanged === true || Number(result && result.count || 0) > 0;
       if(shouldRender && isDashboardView()){
         renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
@@ -41981,6 +42081,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const deliveryPendingOrders = getOpenDeliveryOrdersForDashboard();
       const activeOrderFilter = getOrderQueueFilterValue();
       const visibleActiveOrders = activeOrderFilter === 'DELIVERY' ? deliveryPendingOrders : getFilteredActiveOrders(activeOrders);
+      const queueAuthorityMessage = getOrderQueueAuthorityMessage();
       const todayOrders = dashboardOrders.filter(order => getOrderBusinessDateKey(order) === todayYmd());
       const todayPickupDone = dashboardOrders.filter(order => getNormalizedOrderStatus(order) === 'PICKUP_DONE' && getOrderBusinessDateKey(order) === todayYmd());
       const todayDeliveryDone = dashboardOrders.filter(order => getNormalizedOrderStatus(order) === 'DELIVERY_DONE' && getOrderBusinessDateKey(order) === todayYmd());
@@ -42122,16 +42223,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
                   ${isCarryoverOrderAuthorized() && activeOrderFilter !== 'DELIVERY' ? renderCarryoverOrderRecoverySection() : ''}
                   <div class="main-card">
                     <div class="section-head order-queue-head">
-                      <h2>${activeOrderFilter === 'DELIVERY' ? '🚚 배달 현황' : '🔔 제작 대기중'} <span class="pill rose">${visibleActiveOrders.length}건</span></h2>
+                      <h2>${activeOrderFilter === 'DELIVERY' ? '🚚 배달 현황' : '🔔 제작 대기중'} <span class="pill rose">${getOrderQueueCountLabel(visibleActiveOrders.length)}</span></h2>
                       <div class="order-queue-filter-row">
-                        <button class="order-queue-filter-btn ${activeOrderFilter === 'ALL' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="ALL">전체 ${productionPendingOrders.length}</button>
-                        <button class="order-queue-filter-btn ${activeOrderFilter === 'MEASURE' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="MEASURE">계량 대기중 ${measurePendingOrders.length}</button>
-                        <button class="order-queue-filter-btn ${activeOrderFilter === 'DELIVERY' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="DELIVERY">배달 현황 ${deliveryPendingOrders.length}</button>
+                        <button class="order-queue-filter-btn ${activeOrderFilter === 'ALL' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="ALL">전체 ${getOrderQueueCountLabel(productionPendingOrders.length).replace(/건$/, '')}</button>
+                        <button class="order-queue-filter-btn ${activeOrderFilter === 'MEASURE' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="MEASURE">계량 대기중 ${getOrderQueueCountLabel(measurePendingOrders.length).replace(/건$/, '')}</button>
+                        <button class="order-queue-filter-btn ${activeOrderFilter === 'DELIVERY' ? 'active' : ''}" data-action="set-order-queue-filter" data-value="DELIVERY">배달 현황 ${getOrderQueueCountLabel(deliveryPendingOrders.length).replace(/건$/, '')}</button>
                         ${activeOrderFilter === 'DELIVERY' ? `<button class="order-queue-filter-btn ${state.deliveryQueueViewMode === 'LOCATION' ? 'active' : ''}" data-action="set-delivery-queue-view" data-value="LOCATION">장소별 보기</button><button class="order-queue-filter-btn ${state.deliveryQueueViewMode === 'ORDER' ? 'active' : ''}" data-action="set-delivery-queue-view" data-value="ORDER">접수순 보기</button>` : ''}
                       </div>
                     </div>
+                    ${visibleActiveOrders.length > 0 && queueAuthorityMessage ? `<div class="center muted" role="status">${escapeHtml(queueAuthorityMessage)}</div>` : ''}
                     ${visibleActiveOrders.length === 0 ? `
-                      <div class="center muted" style="padding:60px 20px;font-size:18px;font-weight:800">${getOrderQueueEmptyMessage(activeOrderFilter)}</div>
+                      <div class="center muted" role="status" style="padding:60px 20px;font-size:18px;font-weight:800">${getOrderQueueEmptyMessage(activeOrderFilter)}</div>
                     ` : `
                       ${activeOrderFilter === 'DELIVERY' ? renderDeliveryDashboardOrders(visibleActiveOrders) : `<div class="order-list-large">${visibleActiveOrders.map(renderPendingOrderCard).join('')}</div>`}
                     `}
@@ -47001,6 +47103,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       receiveLiveOrderDocs: function(values, sourceLabel, options){
         return receiveOrderLiveDocuments(values, sourceLabel || '주문별 실시간 저장소', options);
       },
+      receiveSupersededLiveOrderDocs:receiveSupersededOrderLiveDocuments,
+      canApplyLifecycleResult:canApplyOrderLifecycleResult,
       prepareRemoteLifecycleScroll: function(values, sourceLabel, options){
         return prepareRemoteOrderLifecycleScrollPreservation(values, sourceLabel || '주문별 실시간 저장소', options);
       },
@@ -61900,11 +62004,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         || ['PICKUP_DONE','DELIVERY_DONE','CANCELLED','COMPLETED','DONE'].includes(status);
     }
 
-    async function resolveAmbiguousRemovedLiveOrderDocument(docId, orderId, businessDate){
+    async function resolveAmbiguousRemovedLiveOrderDocument(docId, orderId, businessDate, isCurrentQuery){
       const id = String(orderId || '').trim();
       if(!id) return false;
       try{
         const snapshot = await getDocFromServer(doc(liveOrderCollectionRef, String(docId || '')));
+        if(typeof isCurrentQuery === 'function' && !isCurrentQuery()) return false;
         if(!snapshot.exists()){
           if(window.OrderModule && typeof window.OrderModule.hideCurrentDayLiveOrderId === 'function'){
             window.OrderModule.hideCurrentDayLiveOrderId(businessDate, id);
@@ -61973,8 +62078,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         const businessDate = getCurrentManagerBusinessDateKey();
         let initialSnapshotReceived = false;
         let replayServerSnapshot = true;
+        let snapshotSequence = 0;
+        const latestOrderLifecycles = new Map();
+        const appliedLiveOrderSignatures = new Map();
+        let liveOrderApplicationSequence = 0;
         if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
-          window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
+          window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false, { resetScope:true });
         }
         const activeQueryRef = compatibilityMode
           ? buildCompatibleLiveOpenOrderQueryRef()
@@ -61982,18 +62091,29 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         unsubscribeCurrentQuery = onSnapshot(activeQueryRef, { includeMetadataChanges:true }, snapshot => {
           if(stopped || currentQueryGeneration !== queryGeneration) return;
           if(scopeInstance && scopedRealtimeSubscriptions.get('live-order-query') !== scopeInstance) return;
-          if(!markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance, snapshot)){
+          const currentSnapshotSequence = ++snapshotSequence;
+          const applicationSequenceAtStart = liveOrderApplicationSequence;
+          const snapshotIsHealthy = markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance, snapshot);
+          const verifiedRowsOnly = !snapshotIsHealthy && snapshot.metadata
+            && snapshot.metadata.fromCache === false && snapshot.metadata.hasPendingWrites === true;
+          if(!snapshotIsHealthy && !verifiedRowsOnly){
             replayServerSnapshot = true;
-            if(window.OrderModule && window.OrderModule.setCurrentDayLiveOrderAuthority) window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
+            appliedLiveOrderSignatures.clear();
+            if(window.OrderModule && window.OrderModule.setCurrentDayLiveOrderAuthority) window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false, {
+              retainConfirmed:true,
+              status:snapshot.metadata && snapshot.metadata.fromCache === true ? 'cached'
+                : snapshot.metadata && snapshot.metadata.fromCache === false && snapshot.metadata.hasPendingWrites === true ? 'pending-write' : 'unconfirmed'
+            });
             return;
           }
           const isInitialSnapshot = !initialSnapshotReceived;
-          initialSnapshotReceived = true;
+          if(snapshotIsHealthy) initialSnapshotReceived = true;
           const snapshotMetadata = {
             remoteSnapshot:true,
             initialSnapshot:isInitialSnapshot,
             hasPendingWrites:!!(snapshot.metadata && snapshot.metadata.hasPendingWrites),
-            fromCache:!!(snapshot.metadata && snapshot.metadata.fromCache)
+            fromCache:!!(snapshot.metadata && snapshot.metadata.fromCache),
+            verifiedRowsOnly
           };
           const activeDocumentIds = snapshot.docs
             .filter(docSnap => String((docSnap && docSnap.id) || '').startsWith(liveOrderDocPrefix))
@@ -62008,13 +62128,15 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             })
             .filter(Boolean);
           const changedLiveOrders = [];
+          const changedOrderSignatures = new Map();
           const remoteLifecycleRows = [];
           const changes = isInitialSnapshot || replayServerSnapshot
             ? [...snapshot.docs.map(doc => ({ type:'added', doc })), ...snapshot.docChanges().filter(change => change.type === 'removed')]
             : snapshot.docChanges();
-          replayServerSnapshot = false;
+          replayServerSnapshot = verifiedRowsOnly;
           changes.forEach(change => {
             if(!change || !change.doc || !String(change.doc.id || '').startsWith(liveOrderDocPrefix)) return;
+            if(verifiedRowsOnly && (!change.doc.metadata || change.doc.metadata.fromCache !== false || change.doc.metadata.hasPendingWrites !== false)) return;
             const payload = change.doc.data();
             if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
             const changeData = payload.data && typeof payload.data === 'object' ? payload.data : {};
@@ -62023,10 +62145,25 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             const belongsToCurrentDate = !!(window.OrderModule
               && typeof window.OrderModule.isOrderForBusinessDate === 'function'
               && window.OrderModule.isOrderForBusinessDate(changeOrder, businessDate));
+            if(belongsToCurrentDate && orderId && change.doc.metadata
+              && change.doc.metadata.fromCache === false && change.doc.metadata.hasPendingWrites === false){
+              latestOrderLifecycles.set(orderId, {
+                productionCycle:changeOrder.productionCycle,
+                statusRevision:changeOrder.statusRevision,
+                stageRevision:changeOrder.stageRevision,
+                closed:isClosedLiveOrderPayload(payload.data),
+                sequence:currentSnapshotSequence
+              });
+            }
             if(change.type === 'removed'){
               if(!isClosedLiveOrderPayload(payload.data)){
                 if(!compatibilityMode || belongsToCurrentDate){
-                  resolveAmbiguousRemovedLiveOrderDocument(change.doc.id, orderId, businessDate);
+                  resolveAmbiguousRemovedLiveOrderDocument(change.doc.id, orderId, businessDate, () =>
+                    !stopped && currentQueryGeneration === queryGeneration
+                    && latestOrderLifecycles.get(orderId) && latestOrderLifecycles.get(orderId).sequence === currentSnapshotSequence
+                    && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.canApplyLifecycleResult === 'function'
+                    && window.HaetsalOrderLiveQueue.canApplyLifecycleResult(payload.data)
+                    && (!scopeInstance || scopedRealtimeSubscriptions.get('live-order-query') === scopeInstance));
                 }
                 return;
               }
@@ -62034,6 +62171,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             }else if(!belongsToCurrentDate){
               return;
             }
+            const writeSignature = getLiveOrderDocumentWriteSignature(payload.data);
+            const signature = writeSignature ? `${change.type === 'removed' ? 'removed' : 'present'}:${writeSignature}` : '';
+            if(verifiedRowsOnly && signature && appliedLiveOrderSignatures.get(orderId)?.signature === signature) return;
+            if(signature) changedOrderSignatures.set(orderId, signature);
             rememberLiveOrderDocumentWriteSignature(payload.data);
             changedLiveOrders.push(payload.data);
             if(!(change.doc.metadata && change.doc.metadata.hasPendingWrites)) remoteLifecycleRows.push(payload.data);
@@ -62058,26 +62199,79 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           const serverAuthorityComplete = snapshotMetadata.fromCache === false
             && snapshotMetadata.hasPendingWrites === false
             && snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT;
-          const authorityChanged = !!(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'
-            && window.OrderModule.setCurrentDayLiveOrderAuthority(
-              businessDate,
-              activeDocumentIds,
-              serverAuthorityComplete,
-              { deferRender:true }
-            ));
+          // Preserve ACK reconciliation; skip only rows applied after this callback began.
+          const getUnappliedOrders = values => values.filter(value => {
+            const orderId = String((value.order || value).id || value.orderId || '').trim();
+            const applied = appliedLiveOrderSignatures.get(orderId);
+            return !applied || applied.signature !== changedOrderSignatures.get(orderId)
+              || applied.sequence <= applicationSequenceAtStart;
+          });
+          const rememberAppliedOrders = values => {
+            if(!values.length) return;
+            const sequence = ++liveOrderApplicationSequence;
+            values.forEach(value => {
+              const orderId = String((value.order || value).id || value.orderId || '').trim();
+              if(changedOrderSignatures.has(orderId)) appliedLiveOrderSignatures.set(orderId, { signature:changedOrderSignatures.get(orderId), sequence });
+            });
+          };
           const finishSnapshot = verifiedOrders => {
-            if(window.OrderModule && typeof window.OrderModule.finishCurrentDayLiveOrderSnapshot === 'function'){
+            let authorityChanged = false;
+            if(verifiedRowsOnly && window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
+              const verifiedIds = verifiedOrders.filter(value => !isClosedLiveOrderPayload(value))
+                .map(value => String((value.order || value).id || value.orderId || '').trim()).filter(Boolean);
+              const pendingIds = snapshot.docs.filter(docSnap => docSnap.metadata && docSnap.metadata.hasPendingWrites)
+                .map(docSnap => {
+                  const value = docSnap.data();
+                  const order = value && value.data && (value.data.order || value.data);
+                  return order && window.OrderModule.isOrderForBusinessDate(order, businessDate) ? String(order.id || '').trim() : '';
+                }).filter(Boolean);
+              authorityChanged = window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, verifiedIds, false, {
+                deferRender:true,
+                retainConfirmed:true,
+                includeVerified:true,
+                status:snapshot.size >= LIVE_OPEN_ORDER_QUERY_LIMIT ? 'partial' : 'pending-write',
+                pendingIds,
+                pendingMembershipChanged:snapshot.docChanges().some(change => change.type === 'removed' && change.doc.metadata && change.doc.metadata.hasPendingWrites)
+              });
+            }else if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
+              authorityChanged = window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, activeDocumentIds, serverAuthorityComplete, {
+                deferRender:true,
+                status:serverAuthorityComplete ? 'confirmed' : 'partial'
+              });
+            }
+            const unappliedOrders = getUnappliedOrders(verifiedOrders);
+            if((!verifiedRowsOnly || authorityChanged || unappliedOrders.length)
+              && window.OrderModule && typeof window.OrderModule.finishCurrentDayLiveOrderSnapshot === 'function'){
               window.OrderModule.finishCurrentDayLiveOrderSnapshot(
-                verifiedOrders,
+                unappliedOrders,
                 '오늘 주문별 실시간 저장소',
                 { ...snapshotMetadata, authorityChanged }
               );
+              rememberAppliedOrders(unappliedOrders);
             }
-            syncOrderGuardVerifications(true);
+            if(!verifiedRowsOnly || unappliedOrders.length) syncOrderGuardVerifications(true);
           };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
+            if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
+              const verifyingIds = changedLiveOrders.filter(value => !isClosedLiveOrderPayload(value))
+                .map(value => String((value.order || value).id || value.orderId || '').trim()).filter(Boolean);
+              window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, verifyingIds, false, { retainConfirmed:true, status:'verifying' });
+            }
+            replayServerSnapshot = true;
             filterIncomingOrdersByCloudGuards(changedLiveOrders, { liveQueryGeneration:guardVerificationGeneration }).then(verifiedOrders => {
               if(stopped || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
+              if(currentSnapshotSequence !== snapshotSequence){
+                if(window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs === 'function'){
+                  const unappliedOrders = getUnappliedOrders(verifiedOrders);
+                  if(unappliedOrders.length){
+                    const result = window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs(unappliedOrders, '이전 알림의 주문별 상태 반영', { ...snapshotMetadata, latestOrderLifecycles });
+                    const eligibleIds = new Set(result && result.eligibleOrderIds || []);
+                    rememberAppliedOrders(unappliedOrders.filter(value => eligibleIds.has(String((value.order || value).id || value.orderId || '').trim())));
+                  }
+                }
+                return;
+              }
+              replayServerSnapshot = verifiedRowsOnly;
               finishSnapshot(verifiedOrders);
             });
           }else{
@@ -62085,10 +62279,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }
         }, error => {
           if(stopped || currentQueryGeneration !== queryGeneration) return;
+          snapshotSequence += 1;
+          appliedLiveOrderSignatures.clear();
           const quotaBlocked = markFirestoreQuotaExceeded(error, 'live-order-listener');
           console.error('Firestore 오늘 주문별 실시간 저장소 불러오기 실패:', error);
           if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
-            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false);
+            window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false, { retainConfirmed:true, status:'error' });
           }
           if(quotaBlocked){
             stopAllScopedRealtimeSubscriptions();
