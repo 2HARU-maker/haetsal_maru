@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611021227;
-  const APP_BUILD_LABEL = '20261102_1227';
+  const APP_BUILD_NUMBER = 202611030740;
+  const APP_BUILD_LABEL = '20261103_0740';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -33630,7 +33630,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return productionCompletionInteractionBusyOrderIds.has(String(orderId || '').trim());
     }
 
-    function beginProductionCompletionInteraction(orderId){
+    function beginProductionCompletionInteraction(orderId, feedbackKey){
       const id = String(orderId || '').trim();
       if(!id || productionCompletionInteractionBusyOrderIds.has(id)) return false;
       productionCompletionInteractionBusyOrderIds.add(id);
@@ -33641,7 +33641,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         result:'busy',
         busyCount:productionCompletionInteractionBusyOrderIds.size
       });
-      requestOrderLifecycleRender();
+      const expectedKey = feedbackKey == null ? getProductionCompletionFeedbackKey(getOrderById(id)) : feedbackKey;
+      if(!refreshProductionCompletionFeedback(id, expectedKey)) requestOrderLifecycleRender();
       return true;
     }
 
@@ -33833,6 +33834,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const opts = options || {};
       const order = getOrderById(orderId);
       if(!order) return;
+      const initialFeedbackKey = getProductionCompletionFeedbackKey(order);
       observeTabletRuntime('observeCompletion', {
         action:'complete-order',
         phase:'handler-entry',
@@ -33852,7 +33854,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         return { status:'pending', skipped:true, reason:'production-completion-interaction-busy' };
       }
       beginOrderLifecycleScrollPreservation(`order-complete:${String(orderId || '')}`);
-      if(trackProductionCompletionBusy) beginProductionCompletionInteraction(order.id);
+      if(trackProductionCompletionBusy) beginProductionCompletionInteraction(order.id, initialFeedbackKey);
       try{
         observeTabletRuntime('observeCompletion', {
           action:'complete-order',
@@ -33902,7 +33904,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           return { status:String(request.status || 'pending'), skipped:true, reason:'manual-reclick-blocked' };
         }
         markCompletionRequestOnLocalOrder(order.id, 'pending', '동기화 대기 중');
-        requestOrderLifecycleRender();
+        if(!refreshProductionCompletionFeedback(order.id, initialFeedbackKey)) requestOrderLifecycleRender();
         observeTabletRuntime('observeCompletion', {
           action:'complete-order',
           phase:'transaction-start',
@@ -40753,16 +40755,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       `;
     }
 
-    function renderPendingOrderCard(order){
-      const orderTime = new Date(orderTimestamp(order));
-      const diffMins = Math.max(0, Math.floor((Date.now() - orderTime.getTime()) / 60000));
-      const isDelayed = diffMins >= Number(state.sysSettings.warningTime || 15);
-      const totalQty = Number(getOrderTotalQuantity(order) || 0);
+    function getProductionCompletionControl(order){
       const isDelivery = order.deliveryType === 'DELIVERY';
-      const deliveryLabel = isDelivery
-        ? `🚚 ${order.deliveryLocation ? escapeHtml(order.deliveryLocation) : '배달장소 없음'}`
-        : '🏪 픽업';
-      const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const completionRequestStatus = String(order.completionRequestStatus || '');
       const completionInteractionBusy = isProductionCompletionInteractionBusy(order.id);
       const completionPending = completionInteractionBusy || completionRequestStatus === 'pending' || completionRequestStatus === 'retrying';
@@ -40787,6 +40781,58 @@ body.mobile-tablet-device .pos-keyboard-btn{
       }
       const completeButtonLabel = completionNeedsCheck ? '상태확인' : (completionPending ? '반영확인중' : baseCompleteLabel);
       const completionStatusHtml = completionRequestStatus ? `<div class="help-note" style="margin-top:4px;font-size:12px">${escapeHtml(order.completionRequestMessage || completeButtonLabel)}</div>` : '';
+      return { completeAction, completeButtonLabel, completeButtonDisabled, completionStatusHtml };
+    }
+
+    function getProductionCompletionFeedbackKey(order){
+      const user = window.firebaseAuthUser, role = String(state.appRole || '');
+      if(!order || !user || !user.uid || user.isAnonymous
+        || !(role === 'ADMIN' ? isFirebaseAdminVerified() : role === 'MANAGER' && isFirebaseManagerVerified())) return '';
+      return JSON.stringify([state.currentView, state.dashboardTab, role, String(user.uid),
+        Number(state.userCouponHistoryGeneration || 0), getTodayString(), getOrderQueueFilterValue(),
+        String(order.id || ''), normalizeOrderProductionCycle(order.productionCycle),
+        normalizeOrderStatusRevision(order.statusRevision), normalizeOrderStageRevision(order.stageRevision),
+        String(order.status || ''), getOrderWorkStage(order), String(order.updatedAt || ''),
+        String(order.deliveryType || ''), Number(getOrderTotalQuantity(order) || 0)]);
+    }
+
+    function refreshProductionCompletionFeedback(orderId, expectedKey){
+      const id = String(orderId || '').trim();
+      if(!expectedKey || !isProductionCompletionInteractionBusy(id) || !isDashboardView() || state.dashboardTab !== 'ORDERS'
+        || state.editingOrderId || modalRoot.firstElementChild || isLoginModalInputActiveForRemoteRender()
+        || dashboardTouchInteraction != null || searchTermIsComposing || orderEntryInputIsComposing || orderEditInputIsComposing) return false;
+      const order = getOrderById(id);
+      if(!order || !['MEASURE_WAITING','PRODUCTION_WAITING'].includes(getOrderWorkStage(order))
+        || getProductionCompletionFeedbackKey(order) !== expectedKey) return false;
+      const buttons = Array.from(app.querySelectorAll('.order-work-complete > button[data-order-id]'))
+        .filter(button => String(button.dataset.orderId || '') === id);
+      if(buttons.length !== 1) return false;
+      const button = buttons[0], label = button.querySelector('.order-complete-label');
+      if(!label || button.dataset.completionFeedbackKey !== expectedKey) return false;
+      const active = document.activeElement;
+      if(active && active !== button && active !== document.body && active !== document.documentElement) return false;
+      const notes = Array.from(button.parentElement.children).filter(node => node.classList.contains('help-note'));
+      if(notes.length > 1) return false;
+      const control = getProductionCompletionControl(order);
+      button.dataset.action = control.completeAction;
+      button.disabled = control.completeButtonDisabled;
+      label.textContent = control.completeButtonLabel;
+      if(notes[0]) notes[0].remove();
+      if(control.completionStatusHtml) button.insertAdjacentHTML('afterend', control.completionStatusHtml);
+      return true;
+    }
+
+    function renderPendingOrderCard(order){
+      const orderTime = new Date(orderTimestamp(order));
+      const diffMins = Math.max(0, Math.floor((Date.now() - orderTime.getTime()) / 60000));
+      const isDelayed = diffMins >= Number(state.sysSettings.warningTime || 15);
+      const totalQty = Number(getOrderTotalQuantity(order) || 0);
+      const isDelivery = order.deliveryType === 'DELIVERY';
+      const deliveryLabel = isDelivery
+        ? `🚚 ${order.deliveryLocation ? escapeHtml(order.deliveryLocation) : '배달장소 없음'}`
+        : '🏪 픽업';
+      const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
+      const { completeAction, completeButtonLabel, completeButtonDisabled, completionStatusHtml } = getProductionCompletionControl(order);
       return `
         <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}">
           <div class="order-work-left">
@@ -40809,7 +40855,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             </div>
           </div>
           <div class="order-work-complete">
-            <button class="btn btn-dark" data-action="${completeAction}" data-order-id="${order.id}" ${completeButtonDisabled ? 'disabled' : ''}><span class="order-complete-count">총 ${totalQty}잔</span><span class="order-complete-label">${escapeHtml(completeButtonLabel)}</span></button>
+            <button class="btn btn-dark" data-action="${completeAction}" data-order-id="${order.id}" data-completion-feedback-key="${escapeHtml(getProductionCompletionFeedbackKey(order))}" ${completeButtonDisabled ? 'disabled' : ''}><span class="order-complete-count">총 ${totalQty}잔</span><span class="order-complete-label">${escapeHtml(completeButtonLabel)}</span></button>
             ${completionStatusHtml}
           </div>
         </div>
