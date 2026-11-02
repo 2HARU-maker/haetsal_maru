@@ -21683,7 +21683,8 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         }
         return true;
       });
-      return receiveOrderLiveDocuments(rows, sourceLabel, { ...(options || {}), initialSnapshot:false, hasPendingWrites:false });
+      const result = receiveOrderLiveDocuments(rows, sourceLabel, { ...(options || {}), initialSnapshot:false, hasPendingWrites:false });
+      return { ...result, eligibleOrderIds:rows.map(value => String((getOrderFromLiveDocument(value) || {}).id || '').trim()).filter(Boolean) };
     }
 
     function finishCurrentDayLiveOrderSnapshot(values, sourceLabel, options){
@@ -62080,6 +62081,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         let snapshotSequence = 0;
         const latestOrderLifecycles = new Map();
         const appliedLiveOrderSignatures = new Map();
+        let liveOrderApplicationSequence = 0;
         if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
           window.OrderModule.setCurrentDayLiveOrderAuthority(businessDate, [], false, { resetScope:true });
         }
@@ -62090,6 +62092,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           if(stopped || currentQueryGeneration !== queryGeneration) return;
           if(scopeInstance && scopedRealtimeSubscriptions.get('live-order-query') !== scopeInstance) return;
           const currentSnapshotSequence = ++snapshotSequence;
+          const applicationSequenceAtStart = liveOrderApplicationSequence;
           const snapshotIsHealthy = markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance, snapshot);
           const verifiedRowsOnly = !snapshotIsHealthy && snapshot.metadata
             && snapshot.metadata.fromCache === false && snapshot.metadata.hasPendingWrites === true;
@@ -62170,7 +62173,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             }
             const writeSignature = getLiveOrderDocumentWriteSignature(payload.data);
             const signature = writeSignature ? `${change.type === 'removed' ? 'removed' : 'present'}:${writeSignature}` : '';
-            if(verifiedRowsOnly && signature && appliedLiveOrderSignatures.get(orderId) === signature) return;
+            if(verifiedRowsOnly && signature && appliedLiveOrderSignatures.get(orderId)?.signature === signature) return;
             if(signature) changedOrderSignatures.set(orderId, signature);
             rememberLiveOrderDocumentWriteSignature(payload.data);
             changedLiveOrders.push(payload.data);
@@ -62196,6 +62199,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           const serverAuthorityComplete = snapshotMetadata.fromCache === false
             && snapshotMetadata.hasPendingWrites === false
             && snapshot.size < LIVE_OPEN_ORDER_QUERY_LIMIT;
+          // Preserve ACK reconciliation; skip only rows applied after this callback began.
+          const getUnappliedOrders = values => values.filter(value => {
+            const orderId = String((value.order || value).id || value.orderId || '').trim();
+            const applied = appliedLiveOrderSignatures.get(orderId);
+            return !applied || applied.signature !== changedOrderSignatures.get(orderId)
+              || applied.sequence <= applicationSequenceAtStart;
+          });
+          const rememberAppliedOrders = values => {
+            if(!values.length) return;
+            const sequence = ++liveOrderApplicationSequence;
+            values.forEach(value => {
+              const orderId = String((value.order || value).id || value.orderId || '').trim();
+              if(changedOrderSignatures.has(orderId)) appliedLiveOrderSignatures.set(orderId, { signature:changedOrderSignatures.get(orderId), sequence });
+            });
+          };
           const finishSnapshot = verifiedOrders => {
             let authorityChanged = false;
             if(verifiedRowsOnly && window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
@@ -62221,19 +62239,17 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
                 status:serverAuthorityComplete ? 'confirmed' : 'partial'
               });
             }
-            if((!verifiedRowsOnly || authorityChanged || verifiedOrders.length)
+            const unappliedOrders = getUnappliedOrders(verifiedOrders);
+            if((!verifiedRowsOnly || authorityChanged || unappliedOrders.length)
               && window.OrderModule && typeof window.OrderModule.finishCurrentDayLiveOrderSnapshot === 'function'){
               window.OrderModule.finishCurrentDayLiveOrderSnapshot(
-                verifiedOrders,
+                unappliedOrders,
                 '오늘 주문별 실시간 저장소',
                 { ...snapshotMetadata, authorityChanged }
               );
-              verifiedOrders.forEach(value => {
-                const orderId = String((value.order || value).id || value.orderId || '').trim();
-                if(changedOrderSignatures.has(orderId)) appliedLiveOrderSignatures.set(orderId, changedOrderSignatures.get(orderId));
-              });
+              rememberAppliedOrders(unappliedOrders);
             }
-            if(!verifiedRowsOnly || verifiedOrders.length) syncOrderGuardVerifications(true);
+            if(!verifiedRowsOnly || unappliedOrders.length) syncOrderGuardVerifications(true);
           };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
@@ -62246,7 +62262,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               if(stopped || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
               if(currentSnapshotSequence !== snapshotSequence){
                 if(window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs === 'function'){
-                  window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs(verifiedOrders, '이전 알림의 주문별 상태 반영', { ...snapshotMetadata, latestOrderLifecycles });
+                  const unappliedOrders = getUnappliedOrders(verifiedOrders);
+                  if(unappliedOrders.length){
+                    const result = window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs(unappliedOrders, '이전 알림의 주문별 상태 반영', { ...snapshotMetadata, latestOrderLifecycles });
+                    const eligibleIds = new Set(result && result.eligibleOrderIds || []);
+                    rememberAppliedOrders(unappliedOrders.filter(value => eligibleIds.has(String((value.order || value).id || value.orderId || '').trim())));
+                  }
                 }
                 return;
               }
