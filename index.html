@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611030740;
-  const APP_BUILD_LABEL = '20261103_0740';
+  const APP_BUILD_NUMBER = 202611032007;
+  const APP_BUILD_LABEL = '20261103_2007';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -21699,10 +21699,6 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
           orderEditUrgentIds:Array.isArray(result.remoteLifecycleOrderIds) ? result.remoteLifecycleOrderIds : []
         });
-      }
-      if(opts.remoteSnapshot === true && opts.fromCache === false && opts.hasPendingWrites === false
-        && window.HaetsalViewRestore && typeof window.HaetsalViewRestore.onLiveSnapshot === 'function'){
-        window.HaetsalViewRestore.onLiveSnapshot();
       }
       return { ...result, authorityChanged:opts.authorityChanged === true, renderRequested:shouldRender };
     }
@@ -51352,6 +51348,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   let indicator = null;
   let lastSavedView = '';
   let restoringWorkQueue = false;
+  let workQueueRestoreGeneration = 0;
+  let workQueueRestoreAttempt = null;
+  let workQueueRestoreRetry = null;
 
   function safeSessionSet(key, value){
     try{ sessionStorage.setItem(key, value); return true; }catch(error){ console.warn(error); return false; }
@@ -51403,18 +51402,63 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(safeSessionSet(SNAPSHOT_KEY, JSON.stringify(snapshot))) lastSavedView = view;
   }
 
-  function waitForWorkQueueStep(promise){
-    let timer;
-    return Promise.race([promise, new Promise((resolve, reject) => {
-      timer = setTimeout(() => reject(new Error('VIEW_RESTORE_TIMEOUT')), 10000);
-    })]).finally(() => clearTimeout(timer));
+  function waitForWorkQueueStep(promise, attempt){
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => {
+        if(settled) return;
+        settled = true;
+        clearTimeout(timer);
+        attempt.cancellations.delete(cancel);
+        callback(value);
+      };
+      const cancel = () => finish(resolve, null);
+      const timer = setTimeout(() => {
+        if(workQueueRestoreAttempt !== attempt || !attempt.isCurrent()) return;
+        document.getElementById('view-restore-status').textContent = '응답을 기다리고 있습니다. 확인되면 이전 작업 화면으로 자동 연결합니다.';
+        document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
+      }, 10000);
+      attempt.cancellations.add(cancel);
+      // The UI timeout does not cancel a live SDK operation or discard its late result.
+      Promise.resolve(promise).then(value => finish(resolve, value), error => finish(reject, error));
+    });
+  }
+
+  function cancelWorkQueueRestore(event){
+    const previous = workQueueRestoreAttempt;
+    workQueueRestoreGeneration += 1;
+    workQueueRestoreAttempt = null;
+    restoringWorkQueue = false;
+    if(event && event.type === 'haetsal:runtime-stopped' && window.HaetsalViewRestore.pending){
+      document.getElementById('view-restore-status').textContent = '앱 연결이 중지되었습니다. 로그인 화면으로 이동할 수 있습니다.';
+      document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
+    }
+    if(!previous) return;
+    previous.cancellations.forEach(cancel => cancel());
+    if(window.HaetsalViewRestore.onLiveSnapshot === previous.onSnapshot) delete window.HaetsalViewRestore.onLiveSnapshot;
+  }
+
+  function canRestoreWorkQueue(){
+    return !(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+      && !(window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked());
+  }
+
+  function retryWorkQueueRestore(){
+    const restore = window.HaetsalViewRestore;
+    if(!restore || !restore.pending || !window.HaetsalConnection || workQueueRestoreRetry) return workQueueRestoreRetry;
+    const retry = window.HaetsalConnection.reconnect().then(connected => {
+      if(connected !== true || !restore.pending) return;
+      cancelWorkQueueRestore();
+      restoreWorkQueue();
+    }).finally(() => { if(workQueueRestoreRetry === retry) workQueueRestoreRetry = null; });
+    workQueueRestoreRetry = retry;
+    return retry;
   }
 
   function openRestoreLogin(){
     const restore = window.HaetsalViewRestore;
     if(!restore || !restore.pending || !window.OrderModule) return;
-    restoringWorkQueue = false;
-    delete restore.onLiveSnapshot;
+    cancelWorkQueueRestore();
     const state = window.OrderModule.state;
     if(window.HaetsalOperatorSession) window.HaetsalOperatorSession.clear();
     state.appRole = 'GUEST';
@@ -51431,43 +51475,73 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   async function restoreWorkQueue(){
     const restore = window.HaetsalViewRestore;
+    if(!restore || !restore.pending || restoringWorkQueue) return;
+    if(!canRestoreWorkQueue()){ cancelWorkQueueRestore({ type:'haetsal:runtime-stopped' }); return; }
     const intent = restore.intent;
+    cancelWorkQueueRestore();
+    const attempt = { generation:workQueueRestoreGeneration, cancellations:new Set(), user:null, onSnapshot:null };
+    attempt.isCurrent = () => workQueueRestoreAttempt === attempt && restore.pending && restore.intent === intent
+      && attempt.generation === workQueueRestoreGeneration && canRestoreWorkQueue()
+      && (!attempt.user || window.firebaseAuthUser === attempt.user);
+    workQueueRestoreAttempt = attempt;
     restoringWorkQueue = true;
     try{
+      const key = intent.appRole === 'ADMIN' ? 'HaetsalAdminAuth' : 'HaetsalManagerAuth';
       const verified = await waitForWorkQueueStep((async function(){
-        const key = intent.appRole === 'ADMIN' ? 'HaetsalAdminAuth' : 'HaetsalManagerAuth';
         while(!(window[key] && typeof window[key].verifyCurrent === 'function')){
-          if(!restoringWorkQueue) return false;
+          if(!attempt.isCurrent()) return false;
           await new Promise(resolve => setTimeout(resolve, 50));
         }
         if(window.firebaseReadyPromise) await window.firebaseReadyPromise;
-        if(!restoringWorkQueue) return false;
+        if(!attempt.isCurrent()) return false;
+        attempt.user = window.firebaseAuthUser;
         const result = await window[key].verifyCurrent();
         return !!(result && result.verified === true && window[key].isVerified());
-      })());
+      })(), attempt);
+      if(!attempt.isCurrent()) return;
       if(!verified){ openRestoreLogin(); return; }
       document.getElementById('view-restore-status').textContent = '권한을 확인했습니다. 서버의 현재 주문 목록을 연결하고 있습니다.';
-      const queueReady = new Promise(resolve => {
-        restore.onLiveSnapshot = function(){ if(restoringWorkQueue) resolve(); };
-      });
       window.OrderModule.state.orderQueueFilter = intent.orderQueueFilter;
       if(window.OrderModule.openDashboard(intent.appRole, 'ORDERS') === false){ openRestoreLogin(); return; }
       window.HaetsalCombinedApp.showRoute('order');
-      await waitForWorkQueueStep(queueReady);
-      const auth = intent.appRole === 'ADMIN' ? window.HaetsalAdminAuth : window.HaetsalManagerAuth;
-      const current = await waitForWorkQueueStep(auth.verifyCurrent());
-      if(!(current && current.verified === true && auth.isVerified()) || window.OrderModule.state.appRole !== intent.appRole){ openRestoreLogin(); return; }
-      restoringWorkQueue = false;
-      delete restore.onLiveSnapshot;
-      restore.pending = false;
-      document.documentElement.classList.remove('view-restore-pending');
-      saveLastViewSnapshot();
+      while(attempt.isCurrent()){
+        const queueReady = new Promise(resolve => {
+          attempt.onSnapshot = function(){
+            if(!attempt.isCurrent()) return;
+            const scope = window.HaetsalRealtimeScope;
+            const proof = scope && scope.getLiveOrderSnapshot && scope.getLiveOrderSnapshot();
+            if(!proof || proof.uid !== String(attempt.user && attempt.user.uid || '') || proof.role !== intent.appRole) return;
+            if(proof.error){
+              document.getElementById('view-restore-status').textContent = '연결 또는 권한 확인을 완료하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. 다시 연결하거나 로그인 화면으로 이동하세요.';
+              document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
+            }
+            if(proof.ready) resolve(proof);
+          };
+          restore.onLiveSnapshot = attempt.onSnapshot;
+          attempt.onSnapshot();
+        });
+        const proof = await waitForWorkQueueStep(queueReady, attempt);
+        if(!attempt.isCurrent()) return;
+        const current = await waitForWorkQueueStep(window[key].verifyCurrent(), attempt);
+        if(!attempt.isCurrent()) return;
+        if(!(current && current.verified === true && window[key].isVerified()) || window.OrderModule.state.appRole !== intent.appRole){ openRestoreLogin(); return; }
+        const latest = window.HaetsalRealtimeScope.getLiveOrderSnapshot();
+        if(!latest || !latest.ready || latest.scope !== proof.scope) continue;
+        restore.pending = false;
+        document.documentElement.classList.remove('view-restore-pending');
+        saveLastViewSnapshot();
+        return;
+      }
     }catch(error){
-      restoringWorkQueue = false;
-      delete restore.onLiveSnapshot;
+      if(!attempt.isCurrent()) return;
       document.getElementById('view-restore-status').textContent = '연결 또는 권한 확인을 완료하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. 다시 연결하거나 로그인 화면으로 이동하세요.';
       document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
       console.error('이전 작업 화면 연결 실패', error);
+    }finally{
+      if(workQueueRestoreAttempt === attempt){
+        restoringWorkQueue = false;
+        if(restore.onLiveSnapshot === attempt.onSnapshot) delete restore.onLiveSnapshot;
+      }
     }
   }
 
@@ -51717,13 +51791,17 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const button = event.target.closest('[data-view-restore]');
     if(button){
       if(button.dataset.viewRestore === 'retry'){
-        if(window.HaetsalConnection) window.HaetsalConnection.reconnect().then(() => { if(!restoringWorkQueue) restoreWorkQueue(); });
+        retryWorkQueueRestore();
       }
       if(button.dataset.viewRestore === 'login') openRestoreLogin();
       return;
     }
     Promise.resolve().then(saveLastViewSnapshot);
   });
+  window.addEventListener('haetsal:runtime-stopped', cancelWorkQueueRestore);
+  window.HaetsalViewRestore.onConnectionReady = function(){
+    if(!workQueueRestoreRetry && window.HaetsalViewRestore.pending && !restoringWorkQueue) restoreWorkQueue();
+  };
   restoreLastViewSnapshot();
 })();
 </script>
@@ -52010,6 +52088,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       resolveRuntimePolicyReady(policy);
       connectionState = 'ready';
       connectionError = '';
+      if(window.HaetsalViewRestore && window.HaetsalViewRestore.onConnectionReady) window.HaetsalViewRestore.onConnectionReady();
       if(manual && window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.reconnect();
       if(window.HaetsalCloudStore.reconcileOrderSave) await window.HaetsalCloudStore.reconcileOrderSave();
       if(manual && user === auth.currentUser && currentGeneration === operatorAuthGeneration
@@ -61455,6 +61534,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const ORDER_GUARD_QUERY_CHUNK_SIZE = 30;
     let orderGuardVerificationFlushScheduled = false;
     let liveOrderQueryGuardVerificationGeneration = 0;
+    let liveOrderRestoreSnapshot = null;
 
     function addRealtimeUsageDiagnostic(key, amount){
       realtimeUsageDiagnostics[key] = Number(realtimeUsageDiagnostics[key] || 0) + Number(amount || 0);
@@ -62108,6 +62188,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       let unsubscribeCurrentQuery = null;
       let dateRolloverTimer = null;
       let queryGeneration = 0;
+      const publishRestoreSnapshot = (proof, ready, error) => {
+        if(liveOrderRestoreSnapshot !== proof) return;
+        proof.ready = ready;
+        proof.error = String(error || '');
+        if(window.HaetsalViewRestore && window.HaetsalViewRestore.onLiveSnapshot) window.HaetsalViewRestore.onLiveSnapshot();
+      };
 
       const startCurrentDateQuery = function(compatibilityMode=false){
         if(stopped) return;
@@ -62122,6 +62208,18 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           dateRolloverTimer = null;
         }
         const businessDate = getCurrentManagerBusinessDateKey();
+        const restoreUser = auth.currentUser;
+        const restoreAuthGeneration = operatorAuthGeneration;
+        const restoreProof = {
+          uid:String(restoreUser && restoreUser.uid || ''), role:String(window.OrderModule.state.appRole || ''), businessDate,
+          ready:false, error:'',
+          isCurrent:() => !stopped && currentQueryGeneration === queryGeneration
+            && auth.currentUser === restoreUser && operatorAuthGeneration === restoreAuthGeneration
+            && getCurrentManagerBusinessDateKey() === businessDate
+            && String(window.OrderModule.state.appRole || '') === restoreProof.role
+            && (!scopeInstance || (!scopeInstance.released && scopedRealtimeSubscriptions.get('live-order-query') === scopeInstance))
+        };
+        liveOrderRestoreSnapshot = restoreProof;
         let initialSnapshotReceived = false;
         let replayServerSnapshot = true;
         let snapshotSequence = 0;
@@ -62135,8 +62233,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           ? buildCompatibleLiveOpenOrderQueryRef()
           : buildLiveOpenOrderQueryRef(businessDate);
         unsubscribeCurrentQuery = onSnapshot(activeQueryRef, { includeMetadataChanges:true }, snapshot => {
-          if(stopped || currentQueryGeneration !== queryGeneration) return;
+          if(stopped || businessDate !== getCurrentManagerBusinessDateKey() || currentQueryGeneration !== queryGeneration) return;
           if(scopeInstance && scopedRealtimeSubscriptions.get('live-order-query') !== scopeInstance) return;
+          publishRestoreSnapshot(restoreProof, false);
           const currentSnapshotSequence = ++snapshotSequence;
           const applicationSequenceAtStart = liveOrderApplicationSequence;
           const snapshotIsHealthy = markScopedRealtimeSubscriptionHealthy('live-order-query', scopeInstance, snapshot);
@@ -62296,6 +62395,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               rememberAppliedOrders(unappliedOrders);
             }
             if(!verifiedRowsOnly || unappliedOrders.length) syncOrderGuardVerifications(true);
+            publishRestoreSnapshot(restoreProof, serverAuthorityComplete);
           };
           if(changedLiveOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             if(window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
@@ -62305,7 +62405,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             }
             replayServerSnapshot = true;
             filterIncomingOrdersByCloudGuards(changedLiveOrders, { liveQueryGeneration:guardVerificationGeneration }).then(verifiedOrders => {
-              if(stopped || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
+              if(stopped || businessDate !== getCurrentManagerBusinessDateKey() || currentQueryGeneration !== queryGeneration || (scopeInstance && scopeInstance.released)) return;
               if(currentSnapshotSequence !== snapshotSequence){
                 if(window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs === 'function'){
                   const unappliedOrders = getUnappliedOrders(verifiedOrders);
@@ -62324,7 +62424,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
             finishSnapshot([]);
           }
         }, error => {
-          if(stopped || currentQueryGeneration !== queryGeneration) return;
+          if(stopped || businessDate !== getCurrentManagerBusinessDateKey() || currentQueryGeneration !== queryGeneration) return;
+          publishRestoreSnapshot(restoreProof, false, error && error.code || 'live-order-error');
           snapshotSequence += 1;
           appliedLiveOrderSignatures.clear();
           const quotaBlocked = markFirestoreQuotaExceeded(error, 'live-order-listener');
@@ -62789,6 +62890,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
 
     window.HaetsalRealtimeScope = {
+      getLiveOrderSnapshot:() => {
+        const proof = liveOrderRestoreSnapshot;
+        return proof && proof.isCurrent() ? { scope:proof, uid:proof.uid, role:proof.role, businessDate:proof.businessDate, ready:proof.ready, error:proof.error } : null;
+      },
       sync:syncScopedRealtimeSubscriptions,
       reconnect:() => runScopedRealtimeHealthCheck(true),
       stopAll:stopAllScopedRealtimeSubscriptions
