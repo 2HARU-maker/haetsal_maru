@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611032007;
-  const APP_BUILD_LABEL = '20261103_2007';
+  const APP_BUILD_NUMBER = 202611040049;
+  const APP_BUILD_LABEL = '20261104_0049';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -21618,6 +21618,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         updated += Number(result.updated || 0);
       });
       const count = added + updated;
+      const statisticsIds = new Set(opts.statisticsOrderIds || rows.map(value => String((getOrderFromLiveDocument(value) || {}).id || "")));
+      const statisticsRows = (opts.statisticsOrders || rows.map(normalizeReceiptStatisticsLive).filter(Boolean)).filter(order => statisticsIds.has(String(order.id || "")));
+      const statisticsChanged = opts.remoteSnapshot === true && opts.fromCache === false && opts.hasPendingWrites === false && opts.statisticsScope
+        ? rememberReceiptStatisticsOrders(statisticsRows, opts.statisticsScope) : false;
       if(count > 0){
         runRevivedOrderSafetySweep('merge-live-documents-revived-sweep');
         addAuditLog('ORDER_LIVE_DOCUMENTS_MERGED', {
@@ -21641,7 +21645,9 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
           });
         }
       }
+      if(statisticsChanged && count === 0 && opts.deferRender !== true) renderAfterRemoteOrderSync("receipt-statistics-updated");
       return {
+        statisticsChanged,
         added,
         updated,
         count,
@@ -21694,7 +21700,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         deferRender:true,
         hasPendingWrites:opts.verifiedRowsOnly === true ? false : opts.hasPendingWrites
       });
-      const shouldRender = opts.authorityChanged === true || Number(result && result.count || 0) > 0;
+      const shouldRender = opts.authorityChanged === true || result.statisticsChanged === true || Number(result && result.count || 0) > 0;
       if(shouldRender && isDashboardView()){
         renderAfterRemoteOrderSync(sourceLabel || 'live-document-sync', {
           orderEditUrgentIds:Array.isArray(result.remoteLifecycleOrderIds) ? result.remoteLifecycleOrderIds : []
@@ -28850,8 +28856,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const tumblerStats = summary.tumblerStats || {};
       const requestStats = summary.requestStats || {};
       const productionDoneCups = orderStats.productionDone !== undefined
-        ? Number(orderStats.productionDone || 0)
-        : Number(orderStats.pickupDone || 0) + Number(orderStats.deliveryDone || 0);
+        ? orderStats.productionDone
+        : '—';
       return `
         <div class="summary-dashboard-section summary-compact">
           <div class="summary-dashboard-grid">
@@ -28863,7 +28869,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             <div class="summary-dashboard-card">
               <h3>✅ 오늘 처리 완료</h3>
               <div class="summary-dashboard-big" style="color:#059669">${productionDoneCups}</div>
-              <div class="summary-dashboard-sub">총 제작완료 ${productionDoneCups}잔 · 배달완료 ${Number(orderStats.deliveryDone || 0)}잔</div>
+              <div class="summary-dashboard-sub">총 제작완료 ${productionDoneCups}잔 · 배달완료 ${orderStats.deliveryDone ?? '—'}잔</div>
             </div>
             <div class="summary-dashboard-card">
               <h3>🥤 현재 텀블러 운영</h3>
@@ -28880,11 +28886,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
           <div class="summary-compact-overview">
             <div class="main-card">
               <h2>📌 오늘 주문 요약</h2>
+              ${renderReceiptStatisticsStatus(summary.receiptStatistics)}
               <div class="summary-mini-list compact">
-                <div class="summary-mini-row"><span>오늘 접수</span><strong>${Number(orderStats.todayOrders || 0)}건</strong></div>
+                <div class="summary-mini-row"><span>오늘 접수</span><strong>${orderStats.todayOrders ?? '—'}건</strong></div>
                 <div class="summary-mini-row"><span>제작완료</span><strong style="color:#059669">${productionDoneCups}잔</strong></div>
-                <div class="summary-mini-row"><span>배달완료</span><strong style="color:#2563eb">${Number(orderStats.deliveryDone || 0)}잔</strong></div>
-                <div class="summary-mini-row"><span>취소완료</span><strong style="color:#e11d48">${Number(orderStats.cancelled || 0)}건</strong></div>
+                <div class="summary-mini-row"><span>배달완료</span><strong style="color:#2563eb">${orderStats.deliveryDone ?? '—'}잔</strong></div>
+                <div class="summary-mini-row"><span>취소완료</span><strong style="color:#e11d48">${orderStats.cancelled ?? '—'}건</strong></div>
               </div>
             </div>
             <div class="main-card">
@@ -28896,13 +28903,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
               </div>
             </div>
           </div>
-          ${renderStatsSection(statsOrders || [], statsCompleted || [], Number(totalCups || 0), cupStats || {}, deliveryStats || {})}
+          ${renderStatsSection(statsOrders || [], statsCompleted || [], totalCups, cupStats || {}, deliveryStats || {}, summary.periodStatistics)}
         </div>
       `;
     }
 
-    function renderStatsSection(statsOrders, statsCompleted, totalCups, cupStats, deliveryStats){
-      const trendItems = buildTrendItems(statsOrders);
+    function renderStatsSection(statsOrders, statsCompleted, totalCups, cupStats, deliveryStats, snapshot){
+      const confirmed = !!(snapshot && snapshot.valid.orderCount);
+      const cupsConfirmed = !!(snapshot && snapshot.valid.totalCups);
+      const breakdownConfirmed = cupsConfirmed && snapshot.valid.cupBreakdown;
+      const deliveryConfirmed = confirmed && snapshot.valid.deliveryOrders;
+      const trendItems = cupsConfirmed ? buildTrendItems(statsOrders) : [];
       return `
         <div class="main-card">
           <div class="section-head">
@@ -28922,42 +28933,43 @@ body.mobile-tablet-device .pos-keyboard-btn{
               ` : ''}
             </div>
           </div>
+          ${renderReceiptStatisticsStatus(snapshot)}
           <div class="stats-grid">
             <div class="stats-box">
               <h3>☕ 판매 현황</h3>
-              <div class="stats-item"><div class="k">선택 기간 총 주문 건수</div><div class="v" style="color:#2563eb">${statsOrders.length}</div></div>
-              <div class="stats-item"><div class="k">선택 기간 처리 완료 건수</div><div class="v" style="color:#059669">${statsCompleted.length}</div></div>
+              <div class="stats-item"><div class="k">선택 기간 총 주문 건수</div><div class="v" style="color:#2563eb">${confirmed ? statsOrders.length : '—'}</div></div>
+              <div class="stats-item"><div class="k">선택 기간 처리 완료 건수</div><div class="v" style="color:#059669">${confirmed && snapshot.valid.cancelledCount ? statsCompleted.length : '—'}</div></div>
               <div class="stats-item"><div class="k">선택 기간 총 잔 수</div><div class="v" style="color:#d97706">${totalCups}</div></div>
-              ${renderBarChart([
+              ${confirmed && cupsConfirmed ? renderBarChart([
                 { label:'총 주문', value: statsOrders.length, color:'blue' },
                 { label:'완료', value: statsCompleted.length, color:'green' },
                 { label:'총 잔 수', value: totalCups, color:'orange' }
-              ], 'blue')}
+              ], 'blue') : ''}
             </div>
             <div class="stats-box">
               <h3>🥤 컵 종류별 통계 (잔 수 기준)</h3>
-              <div class="stats-item"><div class="k">텀블러</div><div class="v" style="color:#059669">${cupStats.TUMBLER || 0}</div></div>
-              <div class="stats-item"><div class="k">매장용 컵</div><div class="v" style="color:#2563eb">${cupStats.STORE_CUP || 0}</div></div>
-              <div class="stats-item"><div class="k">일회용컵</div><div class="v" style="color:#e11d48">${cupStats.DISPOSABLE || 0}</div></div>
-              ${renderBarChart([
+              <div class="stats-item"><div class="k">텀블러</div><div class="v" style="color:#059669">${breakdownConfirmed ? (cupStats.TUMBLER || 0) : '—'}</div></div>
+              <div class="stats-item"><div class="k">매장용 컵</div><div class="v" style="color:#2563eb">${breakdownConfirmed ? (cupStats.STORE_CUP || 0) : '—'}</div></div>
+              <div class="stats-item"><div class="k">일회용컵</div><div class="v" style="color:#e11d48">${breakdownConfirmed ? (cupStats.DISPOSABLE || 0) : '—'}</div></div>
+              ${confirmed && breakdownConfirmed ? renderBarChart([
                 { label:'텀블러', value: cupStats.TUMBLER || 0, color:'green' },
                 { label:'매장용 컵', value: cupStats.STORE_CUP || 0, color:'blue' },
                 { label:'일회용컵', value: cupStats.DISPOSABLE || 0, color:'red' }
-              ], 'blue')}
+              ], 'blue') : ''}
             </div>
             <div class="stats-box">
               <h3>📦 수령 방법별 통계 (주문 건수 기준)</h3>
-              <div class="stats-item"><div class="k">🏪 매장 픽업</div><div class="v" style="color:#d97706">${deliveryStats.PICKUP || 0}</div></div>
-              <div class="stats-item"><div class="k">🚚 배달 접수</div><div class="v" style="color:#2563eb">${deliveryStats.DELIVERY || 0}</div></div>
-              ${renderBarChart([
+              <div class="stats-item"><div class="k">🏪 매장 픽업</div><div class="v" style="color:#d97706">${deliveryConfirmed ? (deliveryStats.PICKUP || 0) : '—'}</div></div>
+              <div class="stats-item"><div class="k">🚚 배달 접수</div><div class="v" style="color:#2563eb">${deliveryConfirmed ? (deliveryStats.DELIVERY || 0) : '—'}</div></div>
+              ${deliveryConfirmed ? renderBarChart([
                 { label:'픽업', value: deliveryStats.PICKUP || 0, color:'orange' },
                 { label:'배달', value: deliveryStats.DELIVERY || 0, color:'blue' }
-              ], 'blue')}
+              ], 'blue') : ''}
             </div>
             <div class="stats-box">
               <h3>🗓️ 최근 추이</h3>
               <div class="help-note" style="margin-bottom:8px">최근 7일 기준 잔 수 추이입니다.</div>
-              ${trendItems.length ? renderBarChart(trendItems, 'gray') : `<div class="center muted" style="padding:30px 10px">표시할 주문 데이터가 없습니다.</div>`}
+              ${trendItems.length ? renderBarChart(trendItems, 'gray') : `<div class="center muted" style="padding:30px 10px">${confirmed && cupsConfirmed ? '표시할 주문 데이터가 없습니다.' : '—'}</div>`}
             </div>
           </div>
         </div>
@@ -36740,31 +36752,303 @@ body.mobile-tablet-device .pos-keyboard-btn{
       `;
     }
 
-    function getStatsOrders(){
-      const now = new Date();
-      const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0,0,0);
-      const endOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23,59,59);
-      let start, end;
-      if(state.statsPeriodType === 'DAY'){
-        start = startOfDay(now);
-        end = endOfDay(now);
-      }else if(state.statsPeriodType === 'WEEK'){
-        start = new Date(now);
-        start.setDate(now.getDate() - now.getDay());
-        start = startOfDay(start);
-        end = endOfDay(now);
-      }else if(state.statsPeriodType === 'MONTH'){
-        start = new Date(now.getFullYear(), now.getMonth(), 1, 0,0,0);
-        end = endOfDay(now);
-      }else{
-        start = startOfDay(new Date(state.statsStartDate));
-        end = endOfDay(new Date(state.statsEndDate));
-      }
-      return getOrdersForStatsAndHistory().filter(order => {
-        const t = new Date(getOrderBusinessTimestamp(order) || getOrderProcessedTimestamp(order));
-        return t >= start && t <= end;
-      });
+        function isReceiptStatisticsDay(value){
+      return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value+'T00:00:00Z')) && new Date(value+'T00:00:00Z').toISOString().slice(0,10) === value;
     }
+
+    function getReceiptStatisticsDate(order){
+      if(!order || typeof order !== 'object') return '';
+      const validDay = isReceiptStatisticsDay;
+      if(Object.prototype.hasOwnProperty.call(order, '__statisticsReceiptDate')) return validDay(order.__statisticsReceiptDate) ? order.__statisticsReceiptDate : '';
+      const sequenceDate = String(order.sequenceDate || '').trim();
+      if(/^\d{8}$/.test(sequenceDate)){ const day = sequenceDate.slice(0,4)+'-'+sequenceDate.slice(4,6)+'-'+sequenceDate.slice(6,8); return validDay(day) ? day : ''; }
+      const explicit = String(order.businessDate || '').trim();
+      const serverTime = getFirstOrderTimeValue(order, ['businessAtServer','businessAtServerIso','createdAtServer','createdAtServerIso']);
+      if(serverTime) return getDateString(serverTime);
+      if(validDay(explicit)) return explicit;
+      const received = getFirstOrderTimeValue(order, ['businessAt','createdAt','timestamp','receivedAt']);
+      return received ? getDateString(received) : '';
+    }
+
+    function getReceiptStatisticsQuantity(order){
+      if(Object.prototype.hasOwnProperty.call(order,'__statisticsQuantity')){
+        const quantity = Number(order.__statisticsQuantity);
+        return Number.isSafeInteger(quantity) && quantity > 0 ? quantity : null;
+      }
+      if(Array.isArray(order.items) && order.items.length){
+        let total = 0;
+        for(const item of order.items){
+          const quantity = Number(item && item.quantity);
+          if(!Number.isSafeInteger(quantity) || quantity < 1) return null;
+          total += quantity;
+        }
+        return Number.isSafeInteger(total) ? total : null;
+      }
+      const quantity = Number(order.quantity != null ? order.quantity : order.totalCups);
+      return Number.isSafeInteger(quantity) && quantity > 0 ? quantity : null;
+    }
+
+    function getReceiptStatisticsOrderSignature(order){
+      return JSON.stringify([getReceiptStatisticsDate(order), Number(order.seq), getNormalizedOrderStatus(order), order.deliveryType,
+        getReceiptStatisticsQuantity(order), (Array.isArray(order.items) ? order.items : []).map(item => [item == null ? undefined : item.cupType,item == null ? undefined : item.quantity])]);
+    }
+
+    function mergeReceiptStatisticsOrders(lists){
+      const byId = new Map();
+      const conflicts = new Set();
+      const receiptDays = new Map();
+      let invalidCount = 0;
+      const copy = order => ({ ...order, items:Array.isArray(order.items) ? order.items.map(item => ({ ...item })) : order.items });
+      const stamp = order => { const date = toOrderDate(getFirstOrderTimeValue(order, [
+        'updatedAtServer','updatedAtServerIso','editedAt','updatedAt','statusUpdatedAtServer',
+        'statusUpdatedAtServerIso','statusUpdatedAt','stageUpdatedAt','processedAt','createdAt'
+      ])); return date ? date.getTime() : 0; };
+      (Array.isArray(lists) ? lists : []).forEach(list => (Array.isArray(list) ? list : []).forEach(order => {
+        if(!order || typeof order !== 'object'){ invalidCount += 1; return; }
+        const id = String(order.id || '').trim();
+        if(!id){ invalidCount += 1; return; }
+        const days = receiptDays.get(id) || new Set();
+        (order.__statisticsReceiptDates || []).concat(getReceiptStatisticsDate(order)).filter(Boolean).forEach(day => days.add(day));
+        receiptDays.set(id,days);
+        const old = byId.get(id);
+        if(!old){ byId.set(id, copy(order)); if(order.__statisticsConflict) conflicts.add(id); return; }
+        const cycle = normalizeOrderProductionCycle(order.productionCycle) - normalizeOrderProductionCycle(old.productionCycle);
+        const revision = normalizeOrderStatusRevision(order.statusRevision) - normalizeOrderStatusRevision(old.statusRevision);
+        const stage = normalizeOrderStageRevision(order.stageRevision) - normalizeOrderStageRevision(old.stageRevision);
+        if(isOrderClosedStatus(old) && isOrderOpenStatus(order)
+          && !(cycle > 0 && revision >= 0 && hasExplicitReopenAfterClosedLiveGuard(order, getOrderStatusTimeValue(old)))) return;
+        let newer = cycle || revision;
+        if(!cycle && isOrderClosedStatus(old) !== isOrderClosedStatus(order)) newer = isOrderClosedStatus(order) ? 1 : -1;
+        if(!newer && isOrderOpenStatus(old) && isOrderOpenStatus(order)) newer = stage;
+        if(!newer && isOrderClosedStatus(old) !== isOrderClosedStatus(order)){
+          newer = isOrderClosedStatus(order) ? 1 : -1;
+        }
+        if(!newer && !!old.__statisticsAuthoritativeLive !== !!order.__statisticsAuthoritativeLive) newer = order.__statisticsAuthoritativeLive ? 1 : -1;
+        if(!newer) newer = stamp(order) - stamp(old);
+        if(newer > 0){ byId.set(id, copy(order)); conflicts.delete(id); }
+        else if(!newer && getReceiptStatisticsOrderSignature(order) !== getReceiptStatisticsOrderSignature(old)) conflicts.add(id);
+      }));
+      conflicts.forEach(id => { byId.get(id).__statisticsConflict = true; });
+      receiptDays.forEach((days,id) => { if(days.size > 1) byId.get(id).__statisticsReceiptDates = Array.from(days); });
+      return { orders:Array.from(byId.values()), conflicts:Array.from(conflicts), invalidCount };
+    }
+
+    function calculateReceiptStatistics(lists, startDate, endDate, coverage){
+      const merged = mergeReceiptStatisticsOrders(lists);
+      const orders = merged.orders.filter(order => {
+        const day = getReceiptStatisticsDate(order);
+        return day && day >= startDate && day <= endDate;
+      });
+      const membershipConflict = merged.orders.some(order => order.__statisticsReceiptDates && order.__statisticsReceiptDates.length > 1
+        && order.__statisticsReceiptDates.some(day => day >= startDate && day <= endDate));
+      const complete = coverage === true && isReceiptStatisticsDay(startDate) && isReceiptStatisticsDay(endDate) && startDate <= endDate && merged.invalidCount === 0 && !membershipConflict;
+      const valid = { orderCount:complete, lastReceiptNumber:complete, cupBreakdown:complete, deliveryOrders:complete,
+        totalCups:complete, deliveryCups:complete, cancelledCount:complete };
+      const result = { startDate, endDate, orders, orderCount:orders.length,
+        lastReceiptNumber:startDate === endDate ? 0 : null, totalCups:0, deliveryCups:0, cancelledCount:0, valid, conflicts:[] };
+      for(const order of orders){
+        const id = String(order.id);
+        if(merged.conflicts.includes(id)){
+          result.conflicts.push(id);
+          valid.deliveryOrders = valid.totalCups = valid.deliveryCups = valid.cancelledCount = valid.lastReceiptNumber = false;
+        }
+        const seq = Number(order.seq);
+        if(!Number.isSafeInteger(seq) || seq < 1) valid.lastReceiptNumber = false;
+        else if(startDate === endDate) result.lastReceiptNumber = Math.max(result.lastReceiptNumber, seq);
+        const quantity = getReceiptStatisticsQuantity(order);
+        if(quantity === null) valid.totalCups = false;
+        else result.totalCups += quantity;
+        if(order.__statisticsCupBreakdownValid === false) valid.cupBreakdown = false;
+        const items = Array.isArray(order.items) && order.items.length ? order.items : [{quantity, cupType:order.cupType}];
+        if(items.some(item => !['TUMBLER','STORE_CUP','DISPOSABLE'].includes(item.cupType)
+          || !Number.isSafeInteger(Number(item.quantity)) || Number(item.quantity) < 1)
+          || items.reduce((sum,item) => sum+Number(item.quantity),0) !== quantity) valid.cupBreakdown = false;
+        if(!['PICKUP','DELIVERY'].includes(order.deliveryType)) valid.deliveryCups = valid.deliveryOrders = false;
+        if(order.deliveryType === 'DELIVERY'){
+          if(quantity === null) valid.deliveryCups = false;
+          else result.deliveryCups += quantity;
+        }
+        if(getNormalizedOrderStatus(order) === 'CANCELLED') result.cancelledCount += 1;
+        if(!['PENDING','PROCESSING','PICKUP_DONE','DELIVERY_DONE','CANCELLED','COMPLETED','DONE'].includes(String(order.status || '').toUpperCase())) valid.cancelledCount = false;
+      }
+      // A received record without a receipt day cannot be assigned to a day using its completion time.
+      if(merged.orders.some(order => !getReceiptStatisticsDate(order))){
+        Object.keys(valid).forEach(key => { valid[key] = false; });
+      }
+      return result;
+    }
+
+    function getReceiptStatisticsPeriod(){
+      const today = todayYmd();
+      let startDate = today, endDate = today;
+      if(state.statsPeriodType === 'WEEK'){
+        const d = new Date(today+'T00:00:00Z');
+        d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+        startDate = d.toISOString().slice(0,10);
+      }else if(state.statsPeriodType === 'MONTH') startDate = today.slice(0,7)+'-01';
+      else if(state.statsPeriodType === 'CUSTOM'){
+        startDate = String(state.statsStartDate || '');
+        endDate = String(state.statsEndDate || '');
+      }
+      return { startDate, endDate };
+    }
+
+    function normalizeReceiptStatisticsPayload(payload){
+      const source = payload && payload.data || payload || {};
+      const lite = source.orderLite || source.order || {};
+      const order = { ...lite, id:String(source.orderId || lite.id || ''),
+        productionCycle:source.productionCycle || lite.productionCycle,
+        statusRevision:source.statusRevision || lite.statusRevision,
+        status:lite.status || source.status, deliveryType:lite.deliveryType || source.deliveryType,
+        businessDate:source.businessDate || lite.businessDate,
+        createdAt:source.createdAt || lite.createdAt,
+        businessAt:source.businessAt || lite.businessAt,
+        businessAtServer:source.orderCreatedAtServer || lite.businessAtServer,
+        createdAtServer:source.orderCreatedAtServer || lite.createdAtServer,
+        createdAtServerIso:source.orderCreatedAtServerIso || lite.createdAtServerIso,
+        updatedAtServer:source.orderUpdatedAtServer || lite.updatedAtServer,
+        statusUpdatedAtServer:source.orderStatusUpdatedAtServer || lite.statusUpdatedAtServer,
+        quantity:lite.quantity != null ? lite.quantity : source.totalCups };
+      order.__statisticsReceiptDate = getReceiptStatisticsDate(order);
+      return order;
+    }
+
+    let receiptStatisticsOwner = null;
+    let receiptStatisticsEntries = new Map();
+
+    function getReceiptStatisticsOwner(){
+      const cloud = window.HaetsalCompletedOrderDocs;
+      const owner = cloud && cloud.getStatisticsScope ? cloud.getStatisticsScope() : null;
+      if(!owner || !owner.user || !['ADMIN','MANAGER'].includes(owner.role)) return null;
+      if(!receiptStatisticsOwner || receiptStatisticsOwner.user !== owner.user
+        || receiptStatisticsOwner.generation !== owner.generation || receiptStatisticsOwner.role !== owner.role){
+        receiptStatisticsOwner = owner;
+        receiptStatisticsEntries = new Map();
+      }
+      return owner;
+    }
+
+    function rememberReceiptStatisticsOrders(orders, owner){
+      const current = getReceiptStatisticsOwner();
+      if(!current || (owner && (current.user !== owner.user || current.generation !== owner.generation || current.role !== owner.role))) return false;
+      let changed = false;
+      const visible = rows => JSON.stringify(rows.map(order => [getReceiptStatisticsOrderSignature(order),!!order.__statisticsConflict]));
+      receiptStatisticsEntries.forEach(entry => {
+        const rows = (Array.isArray(orders) ? orders : []).filter(order => {
+          const day = getReceiptStatisticsDate(order);
+          return (day && day >= entry.startDate && day <= entry.endDate) || entry.rows.some(row => row.id === order.id);
+        }).map(order => ({ ...order, __statisticsAuthoritativeLive:true }));
+        if(rows.length){
+          const next = mergeReceiptStatisticsOrders([entry.rows, rows]).orders;
+          if(visible(next) !== visible(entry.rows)) changed = true;
+          entry.rows = next;
+        }
+      });
+      return changed;
+    }
+
+    function normalizeReceiptStatisticsLive(value){
+      const source = value && value.data || value || {};
+      const order = getOrderFromLiveDocument(source);
+      if(!order) return null;
+      return { ...order, createdAtServer:source.orderCreatedAtServer || order.createdAtServer,
+        createdAtServerIso:source.orderCreatedAtServerIso || order.createdAtServerIso,
+        updatedAtServer:source.orderUpdatedAtServer || source.serverUpdatedAt || order.updatedAtServer,
+        updatedAtServerIso:source.orderUpdatedAtServerIso || order.updatedAtServerIso,
+        statusUpdatedAtServer:source.orderStatusUpdatedAtServer || order.statusUpdatedAtServer,
+        statusUpdatedAtServerIso:source.orderStatusUpdatedAtServerIso || order.statusUpdatedAtServerIso };
+    }
+
+    function getReceiptStatisticsSnapshot(startDate, endDate, forceServer){
+      const owner = getReceiptStatisticsOwner();
+      const key = startDate+':'+endDate;
+      if(forceServer === true) receiptStatisticsEntries.delete(key);
+      let entry = owner && receiptStatisticsEntries.get(key);
+      const validRange = isReceiptStatisticsDay(startDate) && isReceiptStatisticsDay(endDate) && startDate <= endDate;
+      if(!entry && owner && validRange && forceServer !== true){
+        const parent = Array.from(receiptStatisticsEntries.values()).find(value => value.complete && value.startDate <= startDate && value.endDate >= endDate);
+        if(parent){
+          entry = { ...parent, startDate, endDate, derived:true,
+            sourceStartDate:parent.sourceStartDate || parent.startDate, sourceEndDate:parent.sourceEndDate || parent.endDate,
+            rows:parent.rows.filter(order => { const day = getReceiptStatisticsDate(order); return !day || (day >= startDate && day <= endDate)
+              || (order.__statisticsReceiptDates || []).some(value => value >= startDate && value <= endDate); }) };
+          receiptStatisticsEntries.set(key,entry);
+          const todayKey = todayYmd()+':'+todayYmd();
+          const parentKey = parent.startDate+':'+parent.endDate;
+          for(const old of receiptStatisticsEntries.keys()) if(old !== key && old !== todayKey && old !== parentKey) receiptStatisticsEntries.delete(old);
+        }
+      }
+      if(!entry && owner && validRange){
+        entry = { startDate, endDate, rows:[], state:'loading', complete:false, message:'', checkedAt:'' };
+        receiptStatisticsEntries.set(key, entry);
+        const todayKey = todayYmd()+':'+todayYmd();
+        for(const old of receiptStatisticsEntries.keys()) if(old !== key && old !== todayKey) receiptStatisticsEntries.delete(old);
+        const isCurrent = () => {
+          const current = getReceiptStatisticsOwner();
+          return current && current.user === owner.user && current.generation === owner.generation && current.role === owner.role
+            && receiptStatisticsEntries.get(key) === entry;
+        };
+        Promise.resolve().then(() => isCurrent() ? window.HaetsalCompletedOrderDocs.readStatisticsRange(startDate,endDate) : null).then(result => {
+          if(!isCurrent()) return;
+          const compact = (result.compact || []).map(record => {
+            const order = expandEmergencyCompactOrderRecord(record);
+            if(order){
+              const received = record.t || record.createdAt || record.timestamp;
+              order.__statisticsReceiptDate = received ? getDateString(received) : '';
+              order.__statisticsQuantity = record.q != null ? record.q : (record.totalCups != null ? record.totalCups : record.quantity);
+              const details = record.i || record.c || [];
+              order.__statisticsCupBreakdownValid = Array.isArray(details) && details.length > 0
+                && details.every(item => Array.isArray(item) && Number.isSafeInteger(Number(item[record.i ? 3 : 1])) && Number(item[record.i ? 3 : 1]) > 0);
+            }
+            return order;
+          }).filter(Boolean);
+          const merged = mergeReceiptStatisticsOrders([compact, result.orders, (result.payloads || []).map(normalizeReceiptStatisticsPayload), entry.rows]);
+          entry.rows = merged.orders.filter(order => {
+            const day = getReceiptStatisticsDate(order);
+            return !day || (day >= startDate && day <= endDate)
+              || (order.__statisticsReceiptDates || []).some(value => value >= startDate && value <= endDate);
+          });
+          entry.complete = result.complete === true && merged.invalidCount === 0;
+          entry.state = entry.complete ? 'loaded' : 'partial';
+          entry.message = result.message || '';
+          entry.retryable = result.retryable !== false;
+          entry.checkedAt = new Date().toISOString();
+          renderAfterRemoteOrderSync('receipt-statistics-loaded');
+        }).catch(error => {
+          if(!isCurrent()) return;
+          entry.state = 'error';
+          entry.complete = false;
+          entry.retryable = true;
+          entry.message = '통계 자료를 확인하지 못했습니다. 0건이라는 뜻은 아닙니다.';
+          renderAfterRemoteOrderSync('receipt-statistics-error');
+          console.warn('receipt-statistics-read', String(error && error.code || 'read-failed'));
+        });
+      }
+      const result = calculateReceiptStatistics([entry ? entry.rows : []],startDate,endDate,!!(entry && entry.complete));
+      return { ...result, state:entry ? entry.state : 'unconfirmed', checkedAt:entry ? entry.checkedAt : '', message:entry ? entry.message : '', retryable:entry ? entry.retryable : false,
+        derived:!!(entry && entry.derived), sourceStartDate:entry && entry.sourceStartDate || startDate, sourceEndDate:entry && entry.sourceEndDate || endDate };
+    }
+
+    function receiptStatisticsValue(snapshot, key){
+      return snapshot && snapshot.valid && snapshot.valid[key] ? snapshot[key] : '—';
+    }
+
+    function renderReceiptStatisticsStatus(snapshot){
+      const range = snapshot.startDate === snapshot.endDate ? snapshot.startDate : snapshot.startDate+' ~ '+snapshot.endDate;
+      const proof = window.HaetsalRealtimeScope && window.HaetsalRealtimeScope.getLiveOrderSnapshot();
+      const latest = !snapshot.derived && snapshot.state === 'loaded' && (!proof || proof.ready);
+      const text = snapshot.state === 'loading' ? '통계 자료 확인 중 · 확정 합계가 아닙니다.'
+        : snapshot.state === 'error' ? snapshot.message
+        : snapshot.state !== 'loaded' || Object.values(snapshot.valid).some(value => !value) ? (snapshot.message || '일부 자료만 확인했습니다.')+' —는 0이 아닌 미확정입니다.'
+        : latest ? '접수일 기준 서버 자료 확인' : '마지막 확인 자료 · 현재 서버 최신 확인 전';
+      return '<div class="help-note" role="status">'+escapeHtml(range+' · '+text)
+        +(snapshot.derived ? ' · 확인 범위 '+escapeHtml(snapshot.sourceStartDate+' ~ '+snapshot.sourceEndDate) : '')
+        +(snapshot.checkedAt ? ' · '+escapeHtml(formatDateTime(snapshot.checkedAt)) : '')
+        +(['loaded','error','partial'].includes(snapshot.state) && snapshot.retryable !== false ? ' <button class="btn btn-outline" data-action="reload-receipt-statistics" data-start="'+escapeHtml(snapshot.startDate)+'" data-end="'+escapeHtml(snapshot.endDate)+'">다시 확인</button>' : '')+'</div>';
+    }
+
+
+    function getStatsOrders(){ const range = getReceiptStatisticsPeriod(); return getReceiptStatisticsSnapshot(range.startDate,range.endDate).orders; }
 
     function getCouponUsageDownloadDateRange(startDate, endDate){
       const start = new Date(String(startDate || '') + 'T00:00:00');
@@ -42124,41 +42408,22 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const activeOrderFilter = getOrderQueueFilterValue();
       const visibleActiveOrders = activeOrderFilter === 'DELIVERY' ? deliveryPendingOrders : getFilteredActiveOrders(activeOrders);
       const queueAuthorityMessage = getOrderQueueAuthorityMessage();
-      const todayOrders = dashboardOrders.filter(order => getOrderBusinessDateKey(order) === todayYmd());
-      const todayPickupDone = dashboardOrders.filter(order => getNormalizedOrderStatus(order) === 'PICKUP_DONE' && getOrderBusinessDateKey(order) === todayYmd());
-      const todayDeliveryDone = dashboardOrders.filter(order => getNormalizedOrderStatus(order) === 'DELIVERY_DONE' && getOrderBusinessDateKey(order) === todayYmd());
-      const todayCancelled = dashboardOrders.filter(order => getNormalizedOrderStatus(order) === 'CANCELLED' && getOrderBusinessDateKey(order) === todayYmd());
-      let todayPickupDoneCups = todayPickupDone.reduce((sum, order) => sum + Number(getOrderTotalQuantity(order) || 0), 0);
-      let todayDeliveryDoneCups = todayDeliveryDone.reduce((sum, order) => sum + Number(getOrderTotalQuantity(order) || 0), 0);
-      let todayProductionDoneCups = todayPickupDoneCups + todayDeliveryDoneCups;
+      const todayStatistics = getReceiptStatisticsSnapshot(todayYmd(),todayYmd());
+      const todayProductionDoneCups = receiptStatisticsValue(todayStatistics,"totalCups");
+      const todayDeliveryDoneCups = receiptStatisticsValue(todayStatistics,"deliveryCups");
       const currentCompletedOrders = dashboardOrders
         .filter(order => isOrderClosedStatus(order) && getOrderBusinessDateKey(order) === state.completedFilterDate)
         .sort((a,b) => new Date(getOrderProcessedTimestamp(b) || getOrderBusinessTimestamp(b) || 0) - new Date(getOrderProcessedTimestamp(a) || getOrderBusinessTimestamp(a) || 0));
       const archivedCompletedOrders = getArchivedCompletedOrdersForSelectedDate();
       const emergencyCompactCompletedOrders = getEmergencyCompactCompletedOrdersForDate(state.completedFilterDate);
       const archivedCompletedStatus = getArchivedCompletedOrdersStatusForSelectedDate();
-      const todayArchivedCompletedOrders = Array.isArray(state.archivedCompletedOrdersByDate && state.archivedCompletedOrdersByDate[todayYmd()])
-        ? state.archivedCompletedOrdersByDate[todayYmd()]
-        : [];
-      const todayArchivedSummaryOrders = mergeCurrentAndArchivedCompletedOrders([], [
-        ...todayArchivedCompletedOrders,
-        ...getEmergencyCompactCompletedOrdersForDate(todayYmd())
-      ]).filter(order => isOrderClosedStatus(order) && getOrderBusinessDateKey(order) === todayYmd());
-      if(todayArchivedSummaryOrders.length){
-        const todayCompletedSummaryOrders = mergeCurrentAndArchivedCompletedOrders([...todayPickupDone, ...todayDeliveryDone], todayArchivedSummaryOrders);
-        todayPickupDoneCups = todayCompletedSummaryOrders
-          .filter(order => getNormalizedOrderStatus(order) === 'PICKUP_DONE')
-          .reduce((sum, order) => sum + Number(getOrderTotalQuantity(order) || 0), 0);
-        todayDeliveryDoneCups = todayCompletedSummaryOrders
-          .filter(order => getNormalizedOrderStatus(order) === 'DELIVERY_DONE')
-          .reduce((sum, order) => sum + Number(getOrderTotalQuantity(order) || 0), 0);
-        todayProductionDoneCups = todayPickupDoneCups + todayDeliveryDoneCups;
-      }
       const targetCompletedOrders = mergeCurrentAndArchivedCompletedOrders(currentCompletedOrders, [...archivedCompletedOrders, ...emergencyCompactCompletedOrders]);
       const visibleCompletedOrders = targetCompletedOrders.slice(0, Number(state.completedVisibleCount || 10));
-      const statsOrders = getStatsOrders();
+      const statsRange = getReceiptStatisticsPeriod();
+      const statsSnapshot = state.dashboardTab === "SUMMARY" ? getReceiptStatisticsSnapshot(statsRange.startDate,statsRange.endDate) : null;
+      const statsOrders = statsSnapshot ? statsSnapshot.orders : [];
       const statsCompleted = statsOrders.filter(order => isOrderClosedStatus(order));
-      const totalCups = statsOrders.reduce((sum, order) => sum + Number(getOrderTotalQuantity(order) || 0), 0);
+      const totalCups = statsSnapshot ? receiptStatisticsValue(statsSnapshot,"totalCups") : "—";
       const cupStats = statsOrders.reduce((acc, order) => {
         getOrderItemsForDisplay(order).forEach(item => {
           acc[item.cupType] = (acc[item.cupType] || 0) + Number(item.quantity || 0);
@@ -42175,13 +42440,15 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const registrationApprovedCount = getRegistrationRequestsByStatus('APPROVED').length;
       const registrationRejectedCount = getRegistrationRequestsByStatus('REJECTED').length;
       const summaryData = {
+        receiptStatistics:todayStatistics,
+        periodStatistics:statsSnapshot,
         orderStats: {
           open: activeOrders.length,
-          todayOrders: todayOrders.length,
+          todayOrders: receiptStatisticsValue(todayStatistics,"lastReceiptNumber"),
           productionDone: todayProductionDoneCups,
-          pickupDone: todayPickupDoneCups,
+          pickupDone: "—",
           deliveryDone: todayDeliveryDoneCups,
-          cancelled: todayCancelled.length
+          cancelled: receiptStatisticsValue(todayStatistics,"cancelledCount")
         },
         tumblerStats: {
           rented: tumblerSnap.rented.length,
@@ -42231,11 +42498,12 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
                   <div class="mini-card">
                     <h3>📌 오늘 요약</h3>
+                    ${renderReceiptStatisticsStatus(todayStatistics)}
                     <div class="summary-mini">
-                      <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 접수</div><div class="v" style="color:#d97706">${todayOrders.length}</div></div>
+                      <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 접수</div><div class="v" style="color:#d97706">${receiptStatisticsValue(todayStatistics,"lastReceiptNumber")}</div></div>
                       <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 제작완료</div><div class="v" style="color:#059669">${todayProductionDoneCups}</div></div>
                       <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 배달완료</div><div class="v" style="color:#2563eb">${todayDeliveryDoneCups}</div></div>
-                      <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 취소완료</div><div class="v" style="color:#e11d48">${todayCancelled.length}</div></div>
+                      <div class="box"><div class="muted" style="font-size:11px;font-weight:800">오늘 취소완료</div><div class="v" style="color:#e11d48">${receiptStatisticsValue(todayStatistics,"cancelledCount")}</div></div>
                     </div>
                   </div>
 
@@ -44689,8 +44957,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(t.dataset && t.dataset.historicalCompletionId){ toggleHistoricalCompletionSelection(t.dataset.historicalCompletionId, t.checked); return; }
       if(t.id === 'rejectReasonPreset'){ state.rejectReasonPreset = t.value; return; }
       if(t.id === 'statsPeriodType'){ state.statsPeriodType = t.value; render(); return; }
-      if(t.id === 'statsStartDate'){ state.statsStartDate = t.value; return; }
-      if(t.id === 'statsEndDate'){ state.statsEndDate = t.value; return; }
+      if(t.id === 'statsStartDate'){ state.statsStartDate = t.value; render(); return; }
+      if(t.id === 'statsEndDate'){ state.statsEndDate = t.value; render(); return; }
       if(t.id === 'couponUsageDownloadScope'){
         state.couponUsageDownloadScope = t.value === 'USER' ? 'USER' : 'ALL';
         render();
@@ -46638,6 +46906,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       else if(action === 'more-pending-orders'){
         state.pendingVisibleCount = Number(state.pendingVisibleCount || 6) + 6;
         render();
+      }
+      else if(action === 'reload-receipt-statistics'){
+        if(getReceiptStatisticsOwner()){ getReceiptStatisticsSnapshot(String(btn.dataset.start || ''),String(btn.dataset.end || ''),true); render(); }
       }
       else if(action === 'reload-archived-completed'){
         const key = String(state.completedFilterDate || getTodayString());
@@ -56882,7 +57153,194 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return { payloads, count:payloads.length, partial:queryErrors.length > 0, errors:queryErrors };
   }
 
+  function getOrderStatisticsScope(){
+    const role = String(window.OrderModule && window.OrderModule.state.appRole || '');
+    const verified = role === 'ADMIN' ? window.HaetsalAdminAuth && window.HaetsalAdminAuth.isVerified()
+      : role === 'MANAGER' && window.HaetsalManagerAuth && window.HaetsalManagerAuth.isVerified();
+    return { user:verified ? auth.currentUser : null, generation:operatorAuthGeneration, role };
+  }
+
+  async function readOrderStatisticsRange(startDate, endDate){
+    const validDay = value => /^\d{4}-\d{2}-\d{2}$/.test(value) && new Date(value+'T00:00:00Z').toISOString().slice(0,10) === value;
+    if(!validDay(startDate) || !validDay(endDate) || startDate > endDate) throw new Error('statistics-invalid-period');
+    const owner = getOrderStatisticsScope();
+    const admin = owner.role === 'ADMIN' && window.HaetsalAdminAuth && window.HaetsalAdminAuth.isVerified();
+    const manager = owner.role === 'MANAGER' && window.HaetsalManagerAuth && window.HaetsalManagerAuth.isVerified();
+    if(!owner.user || !(admin || manager)) throw new Error('statistics-role-unverified');
+    await firebaseReadyPromise;
+    const orders = [], payloads = [], compact = [], reservations = [], issues = [];
+    const currentMonth = getFirebaseOrderSeoulParts(new Date());
+    const currentMonthKey = currentMonth.year+'-'+currentMonth.month;
+    if(endDate.slice(0,7) < currentMonthKey) issues.push('statistics-later-completion-partitions-unconfirmed');
+    if(!admin) issues.push('statistics-manager-fallback-coverage-unconfirmed');
+    let documents = 0;
+    const safe = () => {
+      const current = getOrderStatisticsScope();
+      if(current.user !== owner.user || current.generation !== owner.generation || current.role !== owner.role
+        || (window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+        || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())) throw new Error('statistics-scope-stopped');
+      if(documents >= 3000) throw new Error('statistics-document-limit');
+    };
+    const read = async (ref, liveOrder=false) => {
+      safe();
+      const snapshot = await getDocFromServer(ref);
+      safe();
+      documents += 1;
+      if(snapshot.metadata && (snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites)) throw new Error('statistics-server-unconfirmed');
+      if(!snapshot.exists()) return null;
+      if(liveOrder){ const order = getOfficialLiveOrderFromData(snapshot.data()); return order ? { ...order, __statisticsAuthoritativeLive:true } : null; }
+      return getPayloadData(snapshot.data());
+    };
+    const collect = async (col, constraints, receive) => {
+      let cursor = null;
+      do{
+        safe();
+        const constraintsNow = constraints.concat(cursor ? [startAfter(cursor)] : [], [limit(COMPLETED_ORDER_LIVE_RECOVERY_QUERY_LIMIT)]);
+        const snapshot = await getDocsFromServer(query(col,...constraintsNow));
+        safe();
+        if(snapshot.metadata && (snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites)) throw new Error('statistics-server-unconfirmed');
+        documents += snapshot.size;
+        snapshot.forEach(receive);
+        cursor = snapshot.size === COMPLETED_ORDER_LIVE_RECOVERY_QUERY_LIMIT ? snapshot.docs[snapshot.docs.length-1] : null;
+      }while(cursor);
+    };
+    const attempt = async task => {
+      try{ await task(); }
+      catch(error){
+        if(markFirestoreQuotaExceeded(error,'order-statistics-range')) throw error;
+        safe();
+        issues.push(String(error && error.code || error && error.message || 'read-failed'));
+      }
+    };
+    const period = field => [where(field,'>=',startDate),where(field,'<=',endDate)];
+    const addPayload = snapshot => {
+      const raw = normalizeCompletedOrderCloudPayload(snapshot,'statistics-read-only');
+      if(raw && (raw.orderLite || raw.order)) payloads.push(raw);
+      else issues.push('statistics-invalid-completed-record');
+    };
+    await attempt(async () => {
+      const current = await read(cloudDocRefs.order);
+      if(current && Array.isArray(current.orders)) orders.push(...current.orders);
+      else if(current) issues.push('statistics-invalid-order-data');
+      const archive = current && current.sysSettings && current.sysSettings.emergencyOrderCompactArchive;
+      if(archive && Array.isArray(archive.records)) compact.push(...archive.records);
+    });
+    await attempt(async () => {
+      const data = await read(emergencyCompactArchiveRef);
+      const archive = data && (data.archive || data);
+      if(archive && Array.isArray(archive.records)) compact.push(...archive.records);
+    });
+    await attempt(() => collect(completedOrderCollectionRef,period('data.businessDate'),addPayload));
+    const startIso = getKoreaBusinessDateUtcRange(startDate).startIso;
+    const endIso = getKoreaBusinessDateUtcRange(endDate).endIso;
+    await attempt(() => collect(completedOrderCollectionRef,[where('data.createdAt','>=',startIso),where('data.createdAt','<',endIso)],addPayload));
+    if(admin){
+      await attempt(() => collect(liveOrderCollectionRef,period('data.order.businessDate'),snapshot => {
+        if(snapshot.id.startsWith(liveOrderDocPrefix)){
+          const order = getOfficialLiveOrderFromData(snapshot.data());
+          if(order) orders.push({ ...order, __statisticsAuthoritativeLive:true }); else issues.push('statistics-invalid-live-record');
+        }
+      }));
+      await attempt(() => collect(liveOrderCollectionRef,[where('data.order.sequenceDate','>=',startDate.replaceAll('-','')),where('data.order.sequenceDate','<=',endDate.replaceAll('-',''))],snapshot => {
+        if(snapshot.id.startsWith(liveOrderDocPrefix)){
+          const order = getOfficialLiveOrderFromData(snapshot.data());
+          if(order) orders.push({ ...order, __statisticsAuthoritativeLive:true });
+        }
+      }));
+      const legacyStart = new Date(Date.parse(startDate+'T00:00:00Z')-86400000).toISOString();
+      const legacyEnd = new Date(Date.parse(endDate+'T00:00:00Z')+86400000).toISOString();
+      for(const field of ['data.order.createdAt','data.order.timestamp']){
+        await attempt(() => collect(liveOrderCollectionRef,[where(field,'>=',legacyStart),where(field,'<',legacyEnd)],snapshot => {
+          if(snapshot.id.startsWith(liveOrderDocPrefix)){
+            const order = getOfficialLiveOrderFromData(snapshot.data());
+            if(order) orders.push({ ...order, __statisticsAuthoritativeLive:true });
+          }
+        }));
+        await attempt(() => collect(liveOrderCollectionRef,[where(field,'>=',new Date(startIso)),where(field,'<',new Date(endIso))],snapshot => {
+          if(snapshot.id.startsWith(liveOrderDocPrefix)){
+            const order = getOfficialLiveOrderFromData(snapshot.data());
+            if(order) orders.push({ ...order, __statisticsAuthoritativeLive:true });
+          }
+        }));
+      }
+      for(const field of ['orderCreatedAtServer','data.order.createdAtServer']){
+        await attempt(() => collect(liveOrderCollectionRef,[where(field,'>=',new Date(startIso)),where(field,'<',new Date(endIso))],snapshot => {
+          if(snapshot.id.startsWith(liveOrderDocPrefix)){
+            const order = getOfficialLiveOrderFromData(snapshot.data());
+            if(order) orders.push({ ...order, __statisticsAuthoritativeLive:true });
+          }
+        }));
+      }
+      await attempt(() => collect(combinedAppCollectionRef,period('data.businessDate'),snapshot => {
+        if(snapshot.id.startsWith(completedOrderFallbackDocPrefix)) addPayload(snapshot);
+      }));
+    }
+    await attempt(() => collect(orderSequenceReservationCollectionRef,[where('data.dateKey','>=',startDate.replaceAll('-','')),where('data.dateKey','<=',endDate.replaceAll('-',''))],snapshot => {
+      const reservation = getPayloadData(snapshot.data());
+      if(reservation && reservation.type === 'ORDER_SEQUENCE_RESERVATION' && reservation.orderId) reservations.push(reservation);
+      else issues.push('statistics-invalid-reservation');
+    }));
+    const months = [];
+    for(let month = startDate.slice(0,7); month <= endDate.slice(0,7);){
+      months.push(month.replace('-','_'));
+      if(months.length > 12){ issues.push('statistics-month-limit'); break; }
+      const d = new Date(month+'-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth()+1); month = d.toISOString().slice(0,7);
+    }
+    for(const month of months){
+      if(admin){
+        const parts = [], expectedParts = [];
+        await attempt(() => collect(combinedAppCollectionRef,[where('data.monthKey','==',month)],snapshot => {
+          const data = getPayloadData(snapshot.data());
+          if(!snapshot.id.startsWith('order_archive_') || !data) return;
+          if(data.type === 'orders'){
+            if(Array.isArray(data.orders)){ orders.push(...data.orders); if(data.splitPart) parts.push({id:snapshot.id,data}); }
+            else issues.push('statistics-invalid-archive-part');
+          }else if(data.type === 'orders-manifest' || data.type === 'orders-index') expectedParts.push(...(data.partIds || data.lastPartIds || []));
+        }));
+        const ids = new Set(parts.map(part => part.id));
+        if(expectedParts.some(id => !ids.has(id)) || parts.some(part => !Number.isInteger(part.data.partCount)
+          || parts.filter(other => other.data.runId === part.data.runId).length !== part.data.partCount)) issues.push('statistics-archive-partial');
+      }else{
+        await attempt(async () => {
+          const index = await read(doc(db,'haetsalCombinedApp',makeArchiveIndexDocId('order_archive',month)));
+          if(index) issues.push('statistics-older-archive-runs-unconfirmed');
+          for(const id of (Array.isArray(index && index.lastPartIds) ? index.lastPartIds : [])){
+            if(!String(id).startsWith('order_archive_'+month+'_')) throw new Error('statistics-invalid-archive-part');
+            const part = await read(doc(db,'haetsalCombinedApp',id));
+            if(!part || !Array.isArray(part.orders)) throw new Error('statistics-missing-archive-part');
+            orders.push(...part.orders);
+          }
+        });
+      }
+      await attempt(async () => {
+        const legacy = await read(doc(db,'haetsalCombinedApp','order_archive_'+month));
+        if(legacy && Array.isArray(legacy.orders)) orders.push(...legacy.orders);
+        else if(legacy) issues.push('statistics-invalid-legacy-archive');
+      });
+    }
+    const known = new Set(orders.concat(payloads.map(payload => payload.orderLite || payload.order || payload)).map(order => String(order.id || order.orderId || '')));
+    // Reservations identify documents to read, never accepted orders or a next/last receipt value.
+    for(const reservation of reservations){
+      const id = String(reservation.orderId || '');
+      if(admin && known.has(id)) continue;
+      await attempt(async () => {
+        const order = await read(getLiveOrderRef(id),true);
+        if(order && String(order.id || '') === id){ orders.push(order); known.add(id); }
+        else if(!known.has(id)) issues.push('statistics-reserved-order-unconfirmed');
+      });
+    }
+    safe();
+    const scopeLimited = issues.includes('statistics-manager-fallback-coverage-unconfirmed') || issues.includes('statistics-later-completion-partitions-unconfirmed');
+    const message = issues.includes('statistics-manager-fallback-coverage-unconfirmed') ? '현재 권한에서 전체 통계 자료를 확인할 수 없습니다.'
+      : issues.includes('statistics-later-completion-partitions-unconfirmed') ? '접수일 이후에 보관된 과거 자료의 전체 범위 확인이 필요합니다.'
+      : issues.length ? '자료 일부 미확인' : '';
+    return { orders, payloads, compact, complete:issues.length === 0, message, retryable:!scopeLimited, documents, issueCodes:Array.from(new Set(issues)) };
+  }
+
+
   window.HaetsalCompletedOrderDocs = {
+    getStatisticsScope:getOrderStatisticsScope,
+    readStatisticsRange:readOrderStatisticsRange,
     saveOrder: saveCompletedOrderDocument,
     saveOrders: saveCompletedOrderDocuments,
     readByDate: readCompletedOrderPayloadsByDate,
@@ -62133,6 +62591,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     async function resolveAmbiguousRemovedLiveOrderDocument(docId, orderId, businessDate, isCurrentQuery){
       const id = String(orderId || '').trim();
       if(!id) return false;
+      const statisticsScope = getOrderStatisticsScope();
       try{
         const snapshot = await getDocFromServer(doc(liveOrderCollectionRef, String(docId || '')));
         if(typeof isCurrentQuery === 'function' && !isCurrentQuery()) return false;
@@ -62156,6 +62615,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           const verifiedOrders = await filterIncomingOrdersByCloudGuards([data]);
           if(verifiedOrders.length){
             window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '완료 주문 개별 상태 확인', {
+              statisticsScope,
+              statisticsOrders:verifiedOrders.map(() => getOfficialLiveOrderFromData(payload)).filter(Boolean),
               remoteSnapshot:true,
               initialSnapshot:false,
               hasPendingWrites:false,
@@ -62253,6 +62714,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }
           const isInitialSnapshot = !initialSnapshotReceived;
           if(snapshotIsHealthy) initialSnapshotReceived = true;
+          const statisticsScope = getOrderStatisticsScope();
           const snapshotMetadata = {
             remoteSnapshot:true,
             initialSnapshot:isInitialSnapshot,
@@ -62359,6 +62821,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               if(changedOrderSignatures.has(orderId)) appliedLiveOrderSignatures.set(orderId, { signature:changedOrderSignatures.get(orderId), sequence });
             });
           };
+          const statisticsOrders = values => values.map(value => {
+            const id = String((value.order || value).id || value.orderId || "");
+            const change = changes.find(change => change && change.doc && change.doc.id === makeLiveOrderDocId(id));
+            return change ? getOfficialLiveOrderFromData(change.doc.data()) : null;
+          }).filter(Boolean);
           const finishSnapshot = verifiedOrders => {
             let authorityChanged = false;
             if(verifiedRowsOnly && window.OrderModule && typeof window.OrderModule.setCurrentDayLiveOrderAuthority === 'function'){
@@ -62390,7 +62857,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
               window.OrderModule.finishCurrentDayLiveOrderSnapshot(
                 unappliedOrders,
                 '오늘 주문별 실시간 저장소',
-                { ...snapshotMetadata, authorityChanged }
+                { ...snapshotMetadata, authorityChanged, statisticsScope, statisticsOrders:statisticsOrders(verifiedOrders), statisticsOrderIds:verifiedOrders.map(value => String((value.order || value).id || value.orderId || "")) }
               );
               rememberAppliedOrders(unappliedOrders);
             }
@@ -62410,7 +62877,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
                 if(window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs === 'function'){
                   const unappliedOrders = getUnappliedOrders(verifiedOrders);
                   if(unappliedOrders.length){
-                    const result = window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs(unappliedOrders, '이전 알림의 주문별 상태 반영', { ...snapshotMetadata, latestOrderLifecycles });
+                    const result = window.HaetsalOrderLiveQueue.receiveSupersededLiveOrderDocs(unappliedOrders, '이전 알림의 주문별 상태 반영', { ...snapshotMetadata, latestOrderLifecycles, statisticsScope, statisticsOrders:statisticsOrders(unappliedOrders) });
                     const eligibleIds = new Set(result && result.eligibleOrderIds || []);
                     rememberAppliedOrders(unappliedOrders.filter(value => eligibleIds.has(String((value.order || value).id || value.orderId || '').trim())));
                   }
@@ -62481,10 +62948,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         const payload = docSnap.data();
         if(!payload || !Object.prototype.hasOwnProperty.call(payload, 'data')) return;
         rememberLiveOrderDocumentWriteSignature(payload.data);
+        const statisticsScope = getOrderStatisticsScope();
         filterIncomingOrdersByCloudGuards([payload.data]).then(verifiedOrders => {
           if(scopeInstance && scopeInstance.released) return;
           if(verifiedOrders.length && window.HaetsalOrderLiveQueue && typeof window.HaetsalOrderLiveQueue.receiveLiveOrderDocs === 'function'){
             window.HaetsalOrderLiveQueue.receiveLiveOrderDocs(verifiedOrders, '사용자 주문별 실시간 저장소', {
+              statisticsScope,
+              statisticsOrders:verifiedOrders.map(() => getOfficialLiveOrderFromData(payload)).filter(Boolean),
               remoteSnapshot:true,
               initialSnapshot:isInitialSnapshot,
               hasPendingWrites:!!(docSnap.metadata && docSnap.metadata.hasPendingWrites),
