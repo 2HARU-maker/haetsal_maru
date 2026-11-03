@@ -11470,7 +11470,7 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611040049;
+  const APP_BUILD_NUMBER = 202611040230;
   const APP_BUILD_LABEL = '20261104_0049';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
@@ -28940,6 +28940,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
               <div class="stats-item"><div class="k">선택 기간 총 주문 건수</div><div class="v" style="color:#2563eb">${confirmed ? statsOrders.length : '—'}</div></div>
               <div class="stats-item"><div class="k">선택 기간 처리 완료 건수</div><div class="v" style="color:#059669">${confirmed && snapshot.valid.cancelledCount ? statsCompleted.length : '—'}</div></div>
               <div class="stats-item"><div class="k">선택 기간 총 잔 수</div><div class="v" style="color:#d97706">${totalCups}</div></div>
+              <div class="stats-item"><div class="k">선택 기간 제작완료 잔 수</div><div class="v" style="color:#059669">${receiptStatisticsValue(snapshot,"productionDoneCups")}</div></div>
               ${confirmed && cupsConfirmed ? renderBarChart([
                 { label:'총 주문', value: statsOrders.length, color:'blue' },
                 { label:'완료', value: statsCompleted.length, color:'green' },
@@ -36788,9 +36789,37 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return Number.isSafeInteger(quantity) && quantity > 0 ? quantity : null;
     }
 
-    function getReceiptStatisticsOrderSignature(order){
+    function getReceiptStatisticsProductionCompletion(order){
+      const raw = String(order.status || '').toUpperCase();
+      if(!['PENDING','PROCESSING','PICKUP_DONE','DELIVERY_DONE','CANCELLED','COMPLETED','DONE'].includes(raw)) return null;
+      const status = getNormalizedOrderStatus(order);
+      if(status === 'CANCELLED') return false;
+      if(status === 'PICKUP_DONE' || status === 'DELIVERY_DONE') return true;
+      const rawStage = String(order.workStage == null ? '' : order.workStage).trim();
+      const stage = normalizeOrderWorkStage(rawStage);
+      if(rawStage && !stage) return null;
+      // A reopened production queue can retain completion fields from the previous cycle.
+      if(stage === 'MEASURE_WAITING' || stage === 'PRODUCTION_WAITING') return false;
+      if(stage === 'DELIVERY_WAITING' || stage === 'DELIVERING'){
+        if(order.deliveryType !== 'DELIVERY') return null;
+        if(order.productionCompleted === false) return stage === 'DELIVERY_WAITING' ? false : null;
+        const completed = getTimestampMs(order.productionCompletedAt);
+        const reopened = getTimestampMs(order.reopenedAt);
+        if(reopened && (!completed || completed < reopened)) return null;
+        if(order.productionCompleted === true || completed) return true;
+        return stage === 'DELIVERY_WAITING' ? false : null;
+      }
+      if(!stage && !order.productionCompleted && !order.productionCompletedAt) return false;
+      return null;
+    }
+
+    function getReceiptStatisticsOrderSignature(order, mergeEquality=false){
       return JSON.stringify([getReceiptStatisticsDate(order), Number(order.seq), getNormalizedOrderStatus(order), order.deliveryType,
-        getReceiptStatisticsQuantity(order), (Array.isArray(order.items) ? order.items : []).map(item => [item == null ? undefined : item.cupType,item == null ? undefined : item.quantity])]);
+        getReceiptStatisticsQuantity(order), mergeEquality && isOrderClosedStatus(order) ? null : [
+          normalizeOrderProductionCycle(order.productionCycle), normalizeOrderStatusRevision(order.statusRevision),
+          normalizeOrderStageRevision(order.stageRevision), normalizeOrderWorkStage(order.workStage),
+          getReceiptStatisticsProductionCompletion(order), order.productionCompleted,
+          getTimestampMs(order.productionCompletedAt), getTimestampMs(order.reopenedAt)], (Array.isArray(order.items) ? order.items : []).map(item => [item == null ? undefined : item.cupType,item == null ? undefined : item.quantity])]);
     }
 
     function mergeReceiptStatisticsOrders(lists){
@@ -36826,7 +36855,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         if(!newer && !!old.__statisticsAuthoritativeLive !== !!order.__statisticsAuthoritativeLive) newer = order.__statisticsAuthoritativeLive ? 1 : -1;
         if(!newer) newer = stamp(order) - stamp(old);
         if(newer > 0){ byId.set(id, copy(order)); conflicts.delete(id); }
-        else if(!newer && getReceiptStatisticsOrderSignature(order) !== getReceiptStatisticsOrderSignature(old)) conflicts.add(id);
+        else if(!newer && getReceiptStatisticsOrderSignature(order,true) !== getReceiptStatisticsOrderSignature(old,true)) conflicts.add(id);
       }));
       conflicts.forEach(id => { byId.get(id).__statisticsConflict = true; });
       receiptDays.forEach((days,id) => { if(days.size > 1) byId.get(id).__statisticsReceiptDates = Array.from(days); });
@@ -36843,14 +36872,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
         && order.__statisticsReceiptDates.some(day => day >= startDate && day <= endDate));
       const complete = coverage === true && isReceiptStatisticsDay(startDate) && isReceiptStatisticsDay(endDate) && startDate <= endDate && merged.invalidCount === 0 && !membershipConflict;
       const valid = { orderCount:complete, lastReceiptNumber:complete, cupBreakdown:complete, deliveryOrders:complete,
-        totalCups:complete, deliveryCups:complete, cancelledCount:complete };
+        totalCups:complete, productionDoneCups:complete, deliveryCups:complete, cancelledCount:complete };
       const result = { startDate, endDate, orders, orderCount:orders.length,
-        lastReceiptNumber:startDate === endDate ? 0 : null, totalCups:0, deliveryCups:0, cancelledCount:0, valid, conflicts:[] };
+        lastReceiptNumber:startDate === endDate ? 0 : null, totalCups:0, productionDoneCups:0, deliveryCups:0, cancelledCount:0, valid, conflicts:[] };
       for(const order of orders){
         const id = String(order.id);
         if(merged.conflicts.includes(id)){
           result.conflicts.push(id);
-          valid.deliveryOrders = valid.totalCups = valid.deliveryCups = valid.cancelledCount = valid.lastReceiptNumber = false;
+          valid.productionDoneCups = valid.deliveryOrders = valid.totalCups = valid.deliveryCups = valid.cancelledCount = valid.lastReceiptNumber = false;
         }
         const seq = Number(order.seq);
         if(!Number.isSafeInteger(seq) || seq < 1) valid.lastReceiptNumber = false;
@@ -36858,6 +36887,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const quantity = getReceiptStatisticsQuantity(order);
         if(quantity === null) valid.totalCups = false;
         else result.totalCups += quantity;
+        const productionComplete = getReceiptStatisticsProductionCompletion(order);
+        if(productionComplete === null || (productionComplete && quantity === null)) valid.productionDoneCups = false;
+        else if(productionComplete) result.productionDoneCups += quantity;
         if(order.__statisticsCupBreakdownValid === false) valid.cupBreakdown = false;
         const items = Array.isArray(order.items) && order.items.length ? order.items : [{quantity, cupType:order.cupType}];
         if(items.some(item => !['TUMBLER','STORE_CUP','DISPOSABLE'].includes(item.cupType)
@@ -42409,7 +42441,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const visibleActiveOrders = activeOrderFilter === 'DELIVERY' ? deliveryPendingOrders : getFilteredActiveOrders(activeOrders);
       const queueAuthorityMessage = getOrderQueueAuthorityMessage();
       const todayStatistics = getReceiptStatisticsSnapshot(todayYmd(),todayYmd());
-      const todayProductionDoneCups = receiptStatisticsValue(todayStatistics,"totalCups");
+      const todayProductionDoneCups = receiptStatisticsValue(todayStatistics,"productionDoneCups");
       const todayDeliveryDoneCups = receiptStatisticsValue(todayStatistics,"deliveryCups");
       const currentCompletedOrders = dashboardOrders
         .filter(order => isOrderClosedStatus(order) && getOrderBusinessDateKey(order) === state.completedFilterDate)
