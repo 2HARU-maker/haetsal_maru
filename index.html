@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611031940;
-  const APP_BUILD_LABEL = '20261103_1940';
+  const APP_BUILD_NUMBER = 202611032007;
+  const APP_BUILD_LABEL = '20261103_2007';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -51424,11 +51424,15 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     });
   }
 
-  function cancelWorkQueueRestore(){
+  function cancelWorkQueueRestore(event){
     const previous = workQueueRestoreAttempt;
     workQueueRestoreGeneration += 1;
     workQueueRestoreAttempt = null;
     restoringWorkQueue = false;
+    if(event && event.type === 'haetsal:runtime-stopped' && window.HaetsalViewRestore.pending){
+      document.getElementById('view-restore-status').textContent = '앱 연결이 중지되었습니다. 로그인 화면으로 이동할 수 있습니다.';
+      document.querySelector('#view-restore-screen .view-restore-actions').hidden = false;
+    }
     if(!previous) return;
     previous.cancellations.forEach(cancel => cancel());
     if(window.HaetsalViewRestore.onLiveSnapshot === previous.onSnapshot) delete window.HaetsalViewRestore.onLiveSnapshot;
@@ -51471,7 +51475,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   async function restoreWorkQueue(){
     const restore = window.HaetsalViewRestore;
-    if(!restore || !restore.pending || restoringWorkQueue || !canRestoreWorkQueue()) return;
+    if(!restore || !restore.pending || restoringWorkQueue) return;
+    if(!canRestoreWorkQueue()){ cancelWorkQueueRestore({ type:'haetsal:runtime-stopped' }); return; }
     const intent = restore.intent;
     cancelWorkQueueRestore();
     const attempt = { generation:workQueueRestoreGeneration, cancellations:new Set(), user:null, onSnapshot:null };
