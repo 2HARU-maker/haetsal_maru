@@ -9,7 +9,7 @@ const sourcePath=path.resolve(process.argv[2] || path.join(__dirname,'../../inde
 const source=fs.readFileSync(sourcePath,'utf8');
 const extract=(a,b)=>{const start=source.indexOf(a),end=source.indexOf(b,start);assert(start>=0 && end>start,'Source boundaries must exist: '+a);return source.slice(start,end);};
 const scroll=extract('    function getDashboardScrollContainer(){','    function captureAdminUsersListScrollPosition(){');
-const render=extract('  function render(){\n      const tabletRuntimeRenderStartedAt','    function networkBar(){');
+const render=extract('  function render(){','    function networkBar(){');
 function setup(options = {}){
 let now=0,id=0,timers=new Map(),listeners=new Map(),replacementCount=0,owner,observations=[];
 const docOwner={scrollTop:0,scrollHeight:800,clientHeight:800};
