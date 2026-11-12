@@ -40123,7 +40123,16 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const valid = isDashboardView()
         && snapshot.view === state.currentView
         && String(snapshot.dashboardTab || '') === String(state.dashboardTab || '');
-      if(valid) return snapshot;
+      if(valid){
+        const owner = getDashboardScrollOwner();
+        const observedOwner = snapshot.restoredOwner || snapshot.capturedOwner;
+        const observedTop = snapshot.restoredOwner ? snapshot.restoredTop : snapshot.capturedTop;
+        // Native scrolling may move before its scroll event reaches this handler.
+        // Preserve a replacement owner's recovery, but never replay an old position
+        // over movement already visible on the same scrolling element.
+        if(!owner || owner !== observedOwner
+          || Math.abs(getDashboardScrollTop(owner) - Number(observedTop || 0)) <= 1) return snapshot;
+      }
       orderLifecycleScrollSnapshot = null;
       return null;
     }
@@ -40154,6 +40163,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       orderLifecycleScrollSnapshot = {
         ...(fallback || current),
         lifecycleReason:String(reason || 'order-lifecycle'),
+        capturedOwner:getDashboardScrollOwner(),
+        capturedTop:Number(current.dashboardTop || 0),
         restoredOwner:null,
         restoredTop:null
       };
