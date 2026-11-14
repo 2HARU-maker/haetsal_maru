@@ -52407,6 +52407,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         throw new Error('이 Firebase 계정에는 관리자 권한이 없습니다.');
       }
       window.firebaseAuthUser = credential.user;
+      resumeConnectionAfterOperatorLogin(credential.user);
       return { verified:true, uid:credential.user.uid, email:credential.user.email || '' };
       }finally{
         if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
@@ -52440,6 +52441,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         throw new Error('이 Firebase 계정에는 매니저 권한이 없습니다.');
       }
       window.firebaseAuthUser = credential.user;
+      resumeConnectionAfterOperatorLogin(credential.user);
       return { verified:true, uid:credential.user.uid, email:credential.user.email || '' };
       }finally{
         if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
@@ -52560,6 +52562,19 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return value;
   }
 
+  function resumeConnectionAfterOperatorLogin(user){
+    const generation = operatorAuthGeneration;
+    const resume = () => {
+      if(auth.currentUser !== user || generation !== operatorAuthGeneration || connectionState === 'ready') return;
+      if(connectionTimer) clearTimeout(connectionTimer);
+      connectionTimer = null;
+      connectionAttempt = 0;
+      startConnectionAttempt();
+    };
+    if(connectionTask) connectionTask.then(resume, resume);
+    else resume();
+  }
+
   function startConnectionAttempt(manual=false){
     if(connectionTask){
       if(manual && connectionRun && ['snapshot','save'].includes(connectionRun.stage) && isCurrentConnectionRun(connectionRun)
@@ -52596,14 +52611,15 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const currentGeneration = operatorAuthGeneration;
       run.user = user;
       run.authGeneration = currentGeneration;
-      if(!user.isAnonymous){
-        const rights = await waitForConnectionStep(run, 'permission', () => verifyFirebaseOperatorUser(user, true));
-        if((requestedRole === 'ADMIN' && !rights.admin) || (requestedRole === 'MANAGER' && !rights.manager)) throw Object.assign(new Error('permission-denied'), { code:'permission-denied' });
-      }else if(['ADMIN','MANAGER'].includes(requestedRole)) throw Object.assign(new Error('permission-denied'), { code:'permission-denied' });
       if(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped()) return false;
       if(user !== auth.currentUser || currentGeneration !== operatorAuthGeneration) throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
       window.firebaseAuthUser = user;
       resolveFirebaseReady(user);
+      let restoreRoleDenied = user.isAnonymous && ['ADMIN','MANAGER'].includes(requestedRole);
+      if(!user.isAnonymous){
+        const rights = await waitForConnectionStep(run, 'permission', () => verifyFirebaseOperatorUser(user, true));
+        restoreRoleDenied = (requestedRole === 'ADMIN' && !rights.admin) || (requestedRole === 'MANAGER' && !rights.manager);
+      }
       const policy = await waitForConnectionStep(run, 'policy', () => loadRuntimePolicyOnce({ allowQuotaRecoveryProbe:quotaRecovery }));
       if(isConnectionStopped()) return false;
       if(user !== auth.currentUser || currentGeneration !== operatorAuthGeneration) throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
@@ -52611,9 +52627,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       if(policy.checked !== true) throw Object.assign(new Error(policy.error || '정책 확인 실패'), { code:policy.failureCode || 'runtime-policy-unconfirmed' });
       if(!user.isAnonymous){
         const rights = await waitForConnectionStep(run, 'permission-recheck', () => verifyFirebaseOperatorUser(user, false));
-        if((requestedRole === 'ADMIN' && !rights.admin) || (requestedRole === 'MANAGER' && !rights.manager)) throw Object.assign(new Error('permission-denied'), { code:'permission-denied' });
+        restoreRoleDenied = restoreRoleDenied || (requestedRole === 'ADMIN' && !rights.admin) || (requestedRole === 'MANAGER' && !rights.manager);
       }
       resolveRuntimePolicyReady(policy);
+      if(restoreRoleDenied) throw Object.assign(new Error('permission-denied'), { code:'permission-denied' });
       if(window.HaetsalViewRestore && window.HaetsalViewRestore.onConnectionReady) window.HaetsalViewRestore.onConnectionReady();
       if(manual && window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.reconnect();
       // Verify the original receipt even when the independent current-list query is partial or stalled.
@@ -53552,6 +53569,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   async function loadRuntimePolicyOnce(options){
     const opts = options && typeof options === 'object' ? options : {};
+    const policyUser = auth.currentUser;
+    const policyAuthGeneration = operatorAuthGeneration;
+    const isCurrentPolicyRead = () => auth.currentUser === policyUser && operatorAuthGeneration === policyAuthGeneration;
     const quotaGuard = window.HaetsalFirestoreQuotaGuard;
     if(quotaGuard && typeof quotaGuard.isBlocked === 'function' && quotaGuard.isBlocked()){
       const claimedProbe = opts.allowQuotaRecoveryProbe === true
@@ -53567,6 +53587,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     }
     try{
       const snapshot = await getDocFromServer(runtimePolicyRef);
+      if(!isCurrentPolicyRead()) throw Object.assign(new Error('connection-superseded'), { code:'auth/session-changed' });
       clearFirestoreQuotaExceeded('runtime-policy-read-success');
       if(!snapshot.exists()){
         return window.HaetsalRuntimeGuard && typeof window.HaetsalRuntimeGuard.applyRuntimePolicy === 'function'
@@ -53579,6 +53600,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         ? window.HaetsalRuntimeGuard.applyRuntimePolicy(policy, { checked:true, exists:true })
         : { checked:true, exists:true, blocked:false };
     }catch(error){
+      if(!isCurrentPolicyRead()) throw Object.assign(new Error('connection-superseded'), { code:'auth/session-changed' });
       const quotaBlocked = markFirestoreQuotaExceeded(error, 'runtime-policy-read');
       console.warn('Firestore 앱 실행 정책 문서 확인 실패:', error);
       const failurePolicy = window.HaetsalRuntimeGuard && typeof window.HaetsalRuntimeGuard.recordRuntimePolicyReadFailure === 'function'

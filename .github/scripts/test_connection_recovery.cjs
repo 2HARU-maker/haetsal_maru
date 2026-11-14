@@ -93,12 +93,34 @@ function setup(pending,options={}){
   const user={uid:'synthetic-operator',isAnonymous:options.anonymous===true};
   const window={addEventListener:(n,f)=>{events[n]=f;},HaetsalRuntimeGuard:{isStopped:()=>options.stopped===true},HaetsalFirestoreQuotaGuard:{isBlocked:()=>false},HaetsalViewRestore:{onConnectionReady:()=>count('restore')},HaetsalRealtimeScope:{reconnect:()=>{count('reconnectScopes');return true;},confirmCurrent:()=>options.confirmError?Promise.reject({code:options.confirmError}):step('snapshot',{required:true,ready:true}),getLiveOrderSnapshot:()=>({ready:true,scope:{},uid:user.uid,role:'ADMIN',businessDate:'2026-11-14'})},HaetsalAdminAuth:{isVerified:()=>true},HaetsalManagerAuth:{isVerified:()=>false},OrderModule:{state:{appRole:'ADMIN',currentView:'ADMIN_DASHBOARD',dashboardTab:'ORDERS'},resumeDeferredFullBackupAfterReconnect:()=>count('backup')},HaetsalCloudStore:{reconcileOrderSave:()=>step('save-result',false),getSyncStatus:()=>({phase:options.writePhase||(pending==='save-result'?'unknown':'received')}),markAllConnectionErrors:()=>count('connectionErrors')}};
   const context={window,document:{createElement:element,body:{prepend(){}},addEventListener:(n,f)=>{events[n]=f;}},console:{error:()=>count('error'),warn(){}},auth:{currentUser:user},browserSessionPersistence:{},authStateReady:step('auth-state',user),operatorAuthGeneration:0,requireAuthSessionStorage:()=>count('storage'),setPersistence:()=>step('persistence'),ensureAnonymousLogin:()=>step('login',user),verifyFirebaseOperatorUser:(_u,force)=>step(force?'permission':'permission-recheck',options.claims||{admin:true,manager:true}),loadRuntimePolicyOnce:()=>step('policy',{checked:true,blocked:false}),resolveFirebaseReady:()=>count('firebaseReady'),resolveRuntimePolicyReady:()=>count('policyReady'),setTimeout:(f,ms)=>{const id=++next;timers.set(id,{at:time+ms,f});return id;},clearTimeout:id=>timers.delete(id),setInterval:(f,ms)=>{const id=++next;timers.set(id,{at:time+ms,f,ms});return id;},clearInterval:id=>timers.delete(id),Date:class extends Date{static now(){return time;}},Promise,Map,Set,Math};
+  window.firebaseReadyPromise=new Promise(resolve=>{context.resolveFirebaseReady=value=>{count('firebaseReady');resolve(value);};});
+  window.runtimePolicyReadyPromise=new Promise(resolve=>{context.resolveRuntimePolicyReady=value=>{count('policyReady');resolve(value);};});
+  window.firebaseAuth=context.auth;
   let orderStatusListener;
   window.HaetsalCloudStore.subscribeSyncStatus=(key,listener)=>{assert.equal(key,'order');orderStatusListener=listener;};
   context.notifyOrderStatus=()=>orderStatusListener();
   vm.createContext(context);vm.runInContext(block,context);
   async function advance(ms){const limit=time+ms;await flush();for(;;){const row=[...timers].filter(([,x])=>x.at<=limit).sort((a,b)=>a[1].at-b[1].at)[0];if(!row)break;const[id,t]=row;time=t.at;timers.delete(id);if(t.ms)timers.set(id,{...t,at:time+t.ms});t.f();await flush();}time=limit;await flush();}
   return {api:window.HaetsalConnection,context,calls,advance,events,release:resolveHeld,reject:rejectHeld,button:()=>vm.runInContext('reconnectButton',context),text:()=>vm.runInContext('connectionText.textContent',context)};
+}
+
+async function policyOwnershipCases(){
+  const a=source.indexOf('  async function loadRuntimePolicyOnce(options){'),b=source.indexOf('  // Readiness stays pending',a);assert(a>0&&b>a);const rows=[];
+  for(const outcome of ['success','failure','current-failure']){
+    const slots=[],calls={apply:0,failure:0,clear:0,quota:0},initialUser={uid:'synthetic-policy-operator'},ctx={auth:{currentUser:initialUser},operatorAuthGeneration:1,runtimePolicyRef:{},getDocFromServer:()=>new Promise((resolve,reject)=>slots.push({resolve,reject})),clearFirestoreQuotaExceeded:()=>calls.clear++,markFirestoreQuotaExceeded:()=>{calls.quota++;return false;},console:{warn(){}},window:{HaetsalFirestoreQuotaGuard:{isBlocked:()=>false},HaetsalRuntimeGuard:{applyRuntimePolicy:(value,meta)=>{calls.apply++;return{...value,...meta};},recordRuntimePolicyReadFailure:()=>{calls.failure++;return{checked:false,exists:false};}}}};
+    vm.createContext(ctx);vm.runInContext(source.slice(a,b),ctx);
+    const old=ctx.loadRuntimePolicyOnce(),observed=old.then(value=>({value}),error=>({error}));
+    if(outcome==='current-failure'){
+      slots[0].reject({code:'unavailable'});assert.equal((await observed).value.checked,false);assert.equal(calls.failure,1);assert.equal(calls.quota,1);
+    }else{
+      if(outcome==='failure')ctx.auth.currentUser={uid:'synthetic-policy-next'};ctx.operatorAuthGeneration++;
+      const current=ctx.loadRuntimePolicyOnce();slots[1].resolve({exists:()=>true,data:()=>({data:{policyVersion:2}})});assert.equal((await current).checked,true);
+      if(outcome==='success')slots[0].resolve({exists:()=>false});else slots[0].reject({code:'unavailable'});
+      assert.equal((await observed).error.code,'auth/session-changed');assert.deepEqual(calls,{apply:1,failure:0,clear:1,quota:0});
+    }
+    rows.push({name:'actual policy loader '+outcome+' preserves current auth generation and guard state',status:'PASS_CODE_MODEL'});
+  }
+  return rows;
 }
 
 
@@ -199,15 +221,45 @@ process.once('beforeExit',()=>{if(!regressionSettled){console.error('Connection 
   {
     const h=setup('permission');const first=h.api.reconnect();await flush();h.events['haetsal:runtime-stopped']();assert.equal(await first,false);h.release({});await flush();assert.equal(h.api.getState().state,'failed');assert.equal(h.calls.policyReady,undefined);rows.push({name:'runtime stop and late permission result',status:'PASS_CODE_MODEL'});
   }
-  { const h=setup(null,{claims:{admin:false,manager:false}});assert.equal(await h.api.reconnect(),false);assert.equal(h.api.getState().error,'permission-denied');assert.equal(h.calls.policy,undefined);rows.push({name:'revoked operator role cannot report recovery success',status:'PASS_CODE_MODEL'}); }
+  { const h=setup(null,{claims:{admin:false,manager:false}});assert.equal(await h.api.reconnect(),false);assert.equal(h.api.getState().error,'permission-denied');assert.equal(h.calls.firebaseReady,1);assert.equal(h.calls.policyReady,1);assert.equal(h.calls.restore,undefined);rows.push({name:'revoked operator role denies restore while resolving public initialization',status:'PASS_CODE_MODEL'}); }
   { const h=setup('policy',{writePhase:'unknown'}),task=h.api.reconnect();await flush();h.reject({code:'unavailable'});assert.equal(await task,false);assert.equal(h.calls.connectionErrors,undefined);rows.push({name:'connection failure preserves unknown original write status',status:'PASS_CODE_MODEL'}); }
-  {const h=setup(null,{anonymous:true});assert.equal(await h.api.reconnect(),false);assert.equal(h.api.getState().error,'permission-denied');assert.equal(h.calls.policy,undefined);rows.push({name:'anonymous session cannot recover operator view',status:'PASS_CODE_MODEL'});}
+  {const h=setup(null,{anonymous:true});assert.equal(await h.api.reconnect(),false);assert.equal(h.api.getState().error,'permission-denied');assert.equal(h.calls.firebaseReady,1);assert.equal(h.calls.policyReady,1);assert.equal(h.calls.restore,undefined);rows.push({name:'anonymous session denies operator restore while resolving public initialization',status:'PASS_CODE_MODEL'});}
+  for(const anonymous of [true,false]){
+    const h=setup(null,{anonymous,claims:{admin:false,manager:false}});assert.equal(await h.api.reconnect(),false);
+    h.context.window.OrderModule.state.appRole='GUEST';
+    Object.assign(h.context.window.HaetsalRuntimeGuard,{APP_BUILD_NUMBER:2,WRITE_SCHEMA_VERSION:2,getRuntimePolicy:()=>({checked:true,exists:true,writeEnabled:true,minAllowedBuildNumber:1,requiredWriteSchemaVersion:1}),canWrite:()=>true});
+    h.context.createOrderSubmissionError=code=>Object.assign(new Error(code),{code});
+    const a=source.indexOf('    async function assertOrderWritePreflightReady(reason){'),b=source.indexOf('    async function verifyPendingOrderSubmissionBeforeNewOrder(',a);assert(a>0&&b>a);vm.runInContext(source.slice(a,b),h.context);
+    assert.equal(await h.context.assertOrderWritePreflightReady('guest-after-restore-login-cancel'),true);
+    assert.equal(h.calls.restore,undefined);assert.equal(h.calls['save-result'],undefined);assert.equal(h.calls.backup,undefined);
+    rows.push({name:(anonymous?'anonymous':'revoked')+' denied restoration leaves actual public order preflight ready without login or reconnect',status:'PASS_CODE_MODEL'});
+  }
+  for(const stale of [false,true]){
+    const h=setup('permission'),first=h.api.reconnect();await flush();
+    const user={uid:'synthetic-login',isAnonymous:false};h.context.auth.currentUser=user;h.context.operatorAuthGeneration++;
+    h.context.ensureAnonymousLogin=()=>Promise.resolve(user);h.context.verifyFirebaseOperatorUser=()=>Promise.resolve({admin:true,manager:true});
+    h.context.loginUser=user;vm.runInContext('resumeConnectionAfterOperatorLogin(loginUser)',h.context);
+    assert.equal(h.calls.login,1);
+    if(stale)h.context.operatorAuthGeneration++;
+    h.release({admin:false,manager:false});assert.equal(await first,false);await flush();
+    assert.equal(h.api.getState().run.id,stale?1:2);assert.equal(h.api.getState().state,stale?'failed':'ready');
+    assert.equal(h.calls.backup,undefined);assert.equal(h.calls.policyReady,stale?undefined:1);
+    rows.push({name:stale?'later auth generation prevents queued login recovery':'verified login resumes basic initialization after failed old attempt without backup reissue',status:'PASS_CODE_MODEL'});
+  }
+  {
+    const h=setup();h.context.loginUser=h.context.auth.currentUser;
+    vm.runInContext("connectionAttempt=6;connectionState='failed';resumeConnectionAfterOperatorLogin(loginUser)",h.context);await flush();
+    assert.equal(h.api.getState().state,'ready');assert.equal(h.api.getState().attempt,1);assert.equal(h.calls.backup,undefined);
+    const id=h.api.getState().run.id;vm.runInContext('resumeConnectionAfterOperatorLogin(loginUser)',h.context);await flush();assert.equal(h.api.getState().run.id,id);
+    rows.push({name:'verified login resets exhausted connection only once and preserves healthy connection',status:'PASS_CODE_MODEL'});
+  }
   {const a=source.indexOf('  async function ensureAnonymousLogin() {'),b=source.indexOf('  async function verifyFirebaseOperatorUser(',a),user={uid:'synthetic-anonymous',isAnonymous:true};let calls=0,resolve;const held=new Promise(r=>resolve=r),ctx={auth:{currentUser:null},signInAnonymously:()=>{calls++;return held;}};vm.createContext(ctx);vm.runInContext('let anonymousLoginTask=null;'+source.slice(a,b),ctx);const one=ctx.ensureAnonymousLogin(),two=ctx.ensureAnonymousLogin();assert.equal(calls,1);ctx.auth.currentUser=user;resolve({user});assert.equal(await one,user);assert.equal(await two,user);rows.push({name:'logout and reconnect share pending anonymous SDK login',status:'PASS_CODE_MODEL'});}
   for(const phase of ['auth-state','persistence','login','permission','policy','permission-recheck','snapshot','save-result']){const h=setup(phase),task=h.api.reconnect();await flush();h.reject({code:'unavailable'});assert.equal(await task,false);assert.equal(h.button().disabled,false);assert.equal(h.calls.backup,undefined);rows.push({name:'rejected '+phase+' releases UI without backup',status:'PASS_CODE_MODEL'});}
   {
     const h=setup();h.api.scopeFailed('live-order-query','live-order-unconfirmed');assert.equal(await h.api.reconnect(),true);assert.equal(vm.runInContext('connectionNotice.hidden',h.context),false);h.api.scopeHealthy('live-order-query');assert.equal(vm.runInContext('connectionNotice.hidden',h.context),true);rows.push({name:'ready list retains notice until actual live scope becomes healthy',status:'PASS_CODE_MODEL'});
   }
   rows.push(...scopeCases());
+  rows.push(...await policyOwnershipCases());
   rows.push(...await confirmationCases());
   rows.push(...await lateConfirmationCases());
   rows.push(...await receiptOrderCases());
