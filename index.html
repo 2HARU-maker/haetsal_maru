@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611142007;
-  const APP_BUILD_LABEL = '20261114_2007';
+  const APP_BUILD_NUMBER = 202611150850;
+  const APP_BUILD_LABEL = '20261115_0850';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -37380,7 +37380,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const delta = getCouponHistoryEffectiveDelta(record);
       if(inspectCouponHistoryDeltaInvariant(record).conflict) return '확인 필요';
       if(delta === null) return '증감 기록 없음';
-      return `${delta > 0 ? '+' : ''}${delta}잔`;
+      return `${delta > 0 ? '+' : ''}${delta}장`;
     }
 
     function getCouponLedgerDeltaTone(record){
@@ -37391,7 +37391,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function formatCouponLedgerBalance(value, emptyText){
       const amount = normalizeHistoryRemainingCoupons(value);
-      return amount === null ? (emptyText || '전후 잔액 기록 없음') : `${amount}잔`;
+      return amount === null ? (emptyText || '전후 잔액 기록 없음') : `${amount}장`;
     }
 
     function formatCouponLedgerTimestamp(record){
