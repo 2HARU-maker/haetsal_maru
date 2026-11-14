@@ -32,3 +32,5 @@ jobs:
         run: python3 -m unittest discover -s .github/scripts -p 'test_check_codex_review.py'
       - name: Check inline JavaScript syntax
         run: python3 .github/scripts/check_inline_js.py index.html
+      - name: Check scroll and connection ownership regressions
+        run: node .github/scripts/test_dashboard_scroll.cjs && node .github/scripts/test_connection_recovery.cjs
