@@ -11470,8 +11470,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611040248;
-  const APP_BUILD_LABEL = '20261104_0248';
+  const APP_BUILD_NUMBER = 202611122356;
+  const APP_BUILD_LABEL = '20261112_2356';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -12876,6 +12876,7 @@ window.HaetsalSharedStore = (function(){
     // 이 파일은 Firebase 없이 동작합니다.
     // 데이터는 현재 브라우저(localStorage)에 저장됩니다.
     const STORAGE_KEY = 'haetsalmaru_pure_html_v1';
+    let dashboardRenderToday = '';
     const ORDER_MENU_CATALOG_BACKUP_LOCAL_KEY = 'haetsalmaru_order_menu_catalog_backup_v1';
     const ORDER_MENU_CATALOG_PROTECTION_VERSION = 1;
     const ORDER_EMERGENCY_BACKUP_KEY = 'haetsalmaru_order_emergency_backup_v1';
@@ -18252,7 +18253,7 @@ function getOrderArchiveAutoTodayKey(){
 
     function scheduleAutomaticOrderArchive(reason){
       if(orderArchiveAutoTimer) return false;
-      const diagnostics = getCurrentOrderArchiveDiagnostics();
+      const diagnostics = ORDER_ARCHIVE_AUTO_ENABLED ? getCurrentOrderArchiveDiagnostics() : null;
       setOrderArchiveAutoState({ lastCheckAt:new Date().toISOString(), lastReason:String(reason || 'auto-check'), running:orderArchiveAutoInFlight });
       if(!shouldRunAutomaticOrderArchive(diagnostics)) return false;
       orderArchiveAutoTimer = window.setTimeout(() => {
@@ -22788,7 +22789,7 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     }
 
     function todayYmd(){
-      return getDateString(new Date());
+      return dashboardRenderToday || getDateString(new Date());
     }
 
     function isStaff(){
@@ -39476,6 +39477,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let dashboardTouchScrollObserved = false;
     let dashboardTouchRenderDeferred = false;
     let dashboardTouchRenderFlushTimer = null;
+    let renderedDashboardOrdersKey = '';
+    let renderedDashboardOrderCards = new Map();
+    const nextDashboardOrderCards = new Map();
+    let dashboardOrderCardRenderKey = '';
     let preserveOrderEditModalScrollOnNextRender = false;
     let orderEditModalScrollSnapshot = null;
     let deferredOrderSearchRemoteRender = false;
@@ -40393,6 +40398,125 @@ body.mobile-tablet-device .pos-keyboard-btn{
       });
     }
 
+    function dashboardOrdersRenderKey(){
+      return isDashboardView() && state.dashboardTab === 'ORDERS'
+        && state.currentView === state.appRole + '_DASHBOARD'
+        && !state.showLoginModal && !state.showManagerQueueChoiceModal
+        && !modalRoot.querySelector('input,textarea,select')
+        ? [state.currentView,state.appRole,state.dashboardTab,state.orderQueueFilter,state.deliveryQueueViewMode].join('|') : '';
+    }
+
+    function patchDashboardOrdersView(html){
+      const key = dashboardOrdersRenderKey();
+      if(!key || key !== renderedDashboardOrdersKey) return false;
+      const template = document.createElement('template');
+      template.innerHTML = html;
+      const current = app.firstElementChild, next = template.content.firstElementChild;
+      if(!current || !next || current.className !== next.className) return false;
+      const nodeKey = node => {
+        if(node.nodeType !== 1) return '';
+        if(node.hasAttribute('data-retain-dashboard-order')) return 'order:' + node.dataset.retainDashboardOrder;
+        if(node.id) return 'id:' + node.id;
+        if(node.hasAttribute('data-delivery-location')) return 'location:' + node.dataset.deliveryLocation;
+        if(node.hasAttribute('data-historical-completion-id')) return 'history:' + node.dataset.historicalCompletionId;
+        if(node.matches('.order-work-card,.order-row-large,.done-item')){
+          const control = node.querySelector('[data-order-id]');
+          if(control) return 'order:' + control.dataset.orderId;
+        }
+        return node.dataset.action
+          ? ['action',node.tagName,node.dataset.action,node.dataset.orderId || '',node.dataset.value || ''].join(':') : '';
+      };
+      const patch = (oldNode,newNode) => {
+        if(newNode.nodeType === 1 && newNode.hasAttribute('data-retain-dashboard-order')) return oldNode;
+        if(oldNode.isEqualNode(newNode)) return oldNode;
+        // Changed order cards get new controls so an in-flight gesture cannot target revised content.
+        if(oldNode.nodeType !== newNode.nodeType || oldNode.nodeName !== newNode.nodeName
+          || (oldNode.nodeType === 1 && oldNode.matches('.order-work-card,.order-row-large,.done-item'))){
+          const replacement = materializeDashboardOrderCards(newNode.cloneNode(true));
+          oldNode.replaceWith(replacement);
+          return replacement;
+        }
+        if(oldNode.nodeType !== 1){ oldNode.nodeValue = newNode.nodeValue; return oldNode; }
+        const editing = oldNode === document.activeElement && oldNode.matches('input:not([type="checkbox"]):not([type="radio"]),textarea,select');
+        const editingValue = editing ? oldNode.value : null;
+        for(const attr of Array.from(oldNode.attributes)) if(!newNode.hasAttribute(attr.name)) oldNode.removeAttribute(attr.name);
+        for(const attr of Array.from(newNode.attributes)) if(oldNode.getAttribute(attr.name) !== attr.value) oldNode.setAttribute(attr.name,attr.value);
+        if(editing){ if(oldNode.value !== editingValue) oldNode.value = editingValue; return oldNode; }
+        const oldChildren = Array.from(oldNode.childNodes), keyed = new Map();
+        for(const child of oldChildren){ const k = nodeKey(child); if(k) keyed.set(k,child); }
+        const used = new Set();
+        let cursor = oldNode.firstChild;
+        for(const fresh of Array.from(newNode.childNodes)){
+          const k = nodeKey(fresh);
+          let existing = k ? keyed.get(k) : (cursor && !nodeKey(cursor) && cursor.nodeType === fresh.nodeType && cursor.nodeName === fresh.nodeName ? cursor : null);
+          if(!existing || used.has(existing)){ existing = materializeDashboardOrderCards(fresh.cloneNode(true)); oldNode.insertBefore(existing,cursor); }
+          else { if(existing !== cursor) oldNode.insertBefore(existing,cursor); existing = patch(existing,fresh); }
+          used.add(existing);
+          cursor = existing.nextSibling;
+        }
+        for(const child of oldChildren) if(child.parentNode === oldNode && !used.has(child)) child.remove();
+        return oldNode;
+      };
+      patch(current,next);
+      const fields = current.querySelectorAll('input,textarea,select');
+      const freshFields = next.querySelectorAll('input,textarea,select');
+      fields.forEach((field,index) => {
+        const fresh = freshFields[index];
+        if(!fresh || field.tagName !== fresh.tagName) return;
+        if(field.type === 'checkbox' || field.type === 'radio') field.checked = fresh.checked;
+        else if(field.type !== 'file' && field.value !== fresh.value){
+          if(field !== document.activeElement) field.value = fresh.value;
+          else if(!field.dashboardBlurRenderPending){
+            field.dashboardBlurRenderPending = true;
+            field.addEventListener('blur', () => {
+              field.dashboardBlurRenderPending = false;
+              requestAnimationFrame(() => { if(field.isConnected) render(); });
+            }, { once:true });
+          }
+        }
+      });
+      return true;
+    }
+
+    function prepareDashboardOrderCards(){
+      dashboardOrderCardRenderKey = dashboardOrdersRenderKey();
+      if(!dashboardOrderCardRenderKey || dashboardOrderCardRenderKey !== renderedDashboardOrdersKey) renderedDashboardOrderCards.clear();
+      nextDashboardOrderCards.clear();
+    }
+
+    function reuseDashboardOrderCard(orderId, html){
+      if(!dashboardOrderCardRenderKey) return html;
+      const key = String(orderId || ''), previous = renderedDashboardOrderCards.get(key);
+      const retain = previous && previous.html === html && previous.node.isConnected
+        && previous.node.outerHTML === previous.serialized && !/<(?:input|textarea|select)\b|contenteditable/i.test(html);
+      nextDashboardOrderCards.set(key, retain ? previous : { html, node:null });
+      return retain ? html.slice(0,html.indexOf('<')) + `<template data-retain-dashboard-order="${escapeHtml(key)}"></template>` + html.slice(html.lastIndexOf('>') + 1) : html;
+    }
+
+    function materializeDashboardOrderCards(node){
+      if(node.nodeType === 1 && node.hasAttribute('data-retain-dashboard-order')){
+        const template = document.createElement('template');
+        template.innerHTML = nextDashboardOrderCards.get(node.dataset.retainDashboardOrder).html;
+        return template.content.firstElementChild;
+      }
+      if(node.querySelectorAll) for(const marker of Array.from(node.querySelectorAll('template[data-retain-dashboard-order]'))) marker.replaceWith(materializeDashboardOrderCards(marker));
+      return node;
+    }
+
+    function rememberDashboardOrderCards(){
+      const records = new Map(), duplicates = new Set();
+      if(dashboardOrdersRenderKey()) app.querySelectorAll('.order-work-card').forEach(node => {
+        const control = node.querySelector('[data-order-id]'), key = control && control.dataset.orderId;
+        const entry = nextDashboardOrderCards.get(key);
+        if(!entry || duplicates.has(key)) return;
+        if(records.has(key)){ records.delete(key); duplicates.add(key); return; }
+        records.set(key, entry.node === node ? entry : { html:entry.html, node, serialized:node.outerHTML });
+      });
+      renderedDashboardOrderCards = records;
+      nextDashboardOrderCards.clear();
+      dashboardOrderCardRenderKey = '';
+    }
+
   function render(){
       const tabletRuntimeRenderStartedAt = window.performance && typeof window.performance.now === 'function'
         ? window.performance.now()
@@ -40438,6 +40562,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       preserveOrderScrollOnNextRender = false;
       preserveOrderEditModalScrollOnNextRender = false;
       orderEditModalScrollSnapshot = null;
+      prepareDashboardOrderCards();
       const screenHtml = state.currentView === 'ORDER_COMPLETE'
         ? renderOrderCompleteView()
         : (state.currentView === 'ADMIN_DASHBOARD' || state.currentView === 'MANAGER_DASHBOARD')
@@ -40449,7 +40574,17 @@ body.mobile-tablet-device .pos-keyboard-btn{
         deferredOrderSearchRemoteRender = false;
       }
       adminUserSearchIsComposing = false;
-      app.innerHTML = screenHtml;
+      const dashboardPatched = patchDashboardOrdersView(screenHtml);
+      if(!dashboardPatched){
+        if(screenHtml.includes('data-retain-dashboard-order')){
+          const template = document.createElement('template');
+          template.innerHTML = screenHtml;
+          app.innerHTML = '';
+          app.appendChild(materializeDashboardOrderCards(template.content));
+        }else app.innerHTML = screenHtml;
+      }
+      renderedDashboardOrdersKey = dashboardOrdersRenderKey();
+      rememberDashboardOrderCards();
       renderedOrderView = state.currentView;
       renderedOrderUserId = String(state.selectedUserId || '');
       if((state.currentView === 'ADMIN_DASHBOARD' || state.currentView === 'MANAGER_DASHBOARD') && state.dashboardTab === 'ORDERS'){
@@ -40464,7 +40599,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       restoreOrderScrollPosition(orderScrollSnapshot);
       restoreAdminUsersListScrollPosition(adminUsersScrollSnapshot);
       restoreOrderEditModalScrollPosition(editModalScrollSnapshot);
-      restoreOrderFocusSnapshot(orderFocusSnapshot);
+      if(!dashboardPatched || !app.contains(document.activeElement)) restoreOrderFocusSnapshot(orderFocusSnapshot);
       if(isOperatorDashboardViewForArchiveAuto()){
         scheduleAutomaticOrderArchive('dashboard-render');
       }
@@ -41156,7 +41291,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         : '🏪 픽업';
       const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const { completeAction, completeButtonLabel, completeButtonDisabled, completionStatusHtml } = getProductionCompletionControl(order);
-      return `
+      return reuseDashboardOrderCard(order.id, `
         <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}">
           <div class="order-work-left">
             <div class="order-work-seq order-work-left-seq">#${Number(order.seq || 0)}</div>
@@ -41182,7 +41317,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
             ${completionStatusHtml}
           </div>
         </div>
-      `;
+      `);
     }
 
     function shouldShowDeliveryCompleteCancelButton(order){
@@ -42440,6 +42575,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
     function renderDashboardView(){
+      const previousRenderToday = dashboardRenderToday;
+      // Repeated queue checks share one date only while generating this view.
+      dashboardRenderToday = getDateString(new Date());
+      try{
       ensureDashboardRuntimeDefaults();
       if(state.appRole !== 'ADMIN' && state.dashboardTab === 'STABILITY') state.dashboardTab = 'ORDERS';
       const dashboardOrders = getSafeOrders();
@@ -42652,6 +42791,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
           </div>
         </div>
       `;
+      }finally{ dashboardRenderToday = previousRenderToday; dashboardOrderCardRenderKey = ''; }
     }
 
     function orderTimestamp(order){
@@ -45390,7 +45530,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function handleCompletionGuardClick(event){
       const btn = getCompletionScrollGuardButton(event.target);
       const blocked = completionBlockedClick;
-      if(!btn || !blocked) return;
+      // Keyboard/assistive activation is a new action, not the click left by a drag.
+      if(!btn || !blocked || event.detail === 0) return;
       if(Date.now() > Number(blocked.until || 0)){
         completionBlockedClick = null;
         return;

@@ -22,6 +22,9 @@ const context={console,document,window,app,modalRoot:{contains:()=>true},observa
 for(const name of ['restoreOrderRentRecovery','saveOrderRentRecovery','updateAdminUsersSearchResults','setupAutoReturn','restoreAdminUsersListScrollPosition','restoreOrderEditModalScrollPosition','restoreOrderFocusSnapshot'])context[name]=()=>{};
 for(const name of ['captureOrderFocusSnapshot','captureAdminUsersListScrollPosition','captureOrderEditModalScrollPosition'])context[name]=()=>null;
 context.isOperatorDashboardViewForArchiveAuto=()=>false;context.renderModals=()=>'';context.renderDashboardView=()=>'<synthetic/>';
+// This model exercises full-render restoration; native DOM patching is checked in the browser.
+context.patchDashboardOrdersView=()=>false;context.dashboardOrdersRenderKey=()=>'';context.renderedDashboardOrdersKey='';
+context.prepareDashboardOrderCards=()=>{};context.rememberDashboardOrderCards=()=>{};
 vm.createContext(context);
 vm.runInContext(`let orderLifecycleScrollSnapshot=null,lastDashboardScrollSnapshot=null,orderScrollRestoreGeneration=0,orderLifecycleRenderQueued=false,orderLifecycleRenderGeneration=0,dashboardTouchInteraction=null,dashboardTouchScrollObserved=false,dashboardTouchRenderDeferred=false,dashboardTouchRenderFlushTimer=null,adminUserSearchRemoteRenderPending=false,preserveOrderScrollOnNextRender=false,preserveOrderEditModalScrollOnNextRender=false,orderEditModalScrollSnapshot=null,deferredOrderSearchRemoteRender=false,adminUserSearchIsComposing=false;\n${options.scrollCode || scroll}\n${render}\nthis.inspect=()=>({top:getDashboardScrollTop(getDashboardScrollOwner()),active:dashboardTouchInteraction,deferred:dashboardTouchRenderDeferred,lifecycle:orderLifecycleScrollSnapshot&&orderLifecycleScrollSnapshot.dashboardTop});`,context);
 return {ctx:context,emit(type,target=cardTarget,extra={}){for(const fn of listeners.get(type)||[])fn({type,target,...extra});},touchStart(){this.emit('pointerdown',cardTarget,{pointerType:'touch',pointerId:1});this.emit('touchstart',cardTarget,{touches:[{identifier:1}]});},touchEnd(){this.emit('touchend',cardTarget,{changedTouches:[{identifier:1}]});},scroll(top){owner.scrollTop=top;this.emit('scroll',owner);},advance(delta){const end=now+delta;while(true){let pair=[...timers].filter(([,x])=>x.time<=end).sort((a,b)=>a[1].time-b[1].time)[0];if(!pair)break;now=pair[1].time;timers.delete(pair[0]);pair[1].fn();}now=end;},replacements:()=>replacementCount,owner:()=>owner,setTop:(top)=>{owner.scrollTop=top;},replaceOwner:()=>{owner=makeOwner();},cardTarget,headerTarget};
@@ -56,5 +59,35 @@ check('fallback from replaced owner still restores intended position',()=>{
 });
 check('user movement after fallback capture replaces old restoration goal',()=>{
  const h=setup();h.scroll(500);h.replaceOwner();h.ctx.beginOrderLifecycleScrollPreservation('remote-fallback',h.ctx.getRemoteLifecycleScrollFallback());h.setTop(250);h.ctx.render();assert.equal(h.ctx.inspect().top,250);
+});
+const completionGuard=extract('    function handleCompletionGuardClick(event){','    function startCompletionPointerGesture(event){');
+for(const [name,detail,retargeted,otherOrder,expectedBlocked] of [
+ ['keyboard after drag remains usable',0,false,false,false],
+ ['pointer click after drag remains blocked',1,false,false,true],
+ ['retargeted pointer cannot complete another order',1,true,true,true]
+])check(name,()=>{
+ const button={dataset:{action:'complete-order',orderId:'synthetic-a'}};
+ const target=otherOrder?{dataset:{action:'complete-order',orderId:'synthetic-b'}}:button;
+ const context={completionBlockedClick:{button,action:'complete-order',orderId:'synthetic-a',retargeted,until:Date.now()+900},getCompletionScrollGuardButton:target=>target};
+ vm.createContext(context);vm.runInContext(completionGuard,context);
+ let blocked=false;
+ context.handleCompletionGuardClick({target,detail,preventDefault:()=>{blocked=true;},stopImmediatePropagation:()=>{}});
+ assert.equal(blocked,expectedBlocked);
+});
+check('today is reused only within the current dashboard render',()=>{
+ let reads=0;
+ const context={dashboardRenderToday:'',getDateString:()=>String(++reads)};
+ vm.createContext(context);vm.runInContext(extract('    function todayYmd(){','    function isStaff(){'),context);
+ assert.equal(context.todayYmd(),'1');assert.equal(context.todayYmd(),'2');
+ context.dashboardRenderToday='synthetic-date';
+ assert.equal(context.todayYmd(),'synthetic-date');assert.equal(reads,2);
+ context.dashboardRenderToday='';assert.equal(context.todayYmd(),'3');
+});
+check('disabled automatic archive skips diagnostics but preserves check state',()=>{
+ let checks=0;
+ const context={orderArchiveAutoTimer:null,ORDER_ARCHIVE_AUTO_ENABLED:false,orderArchiveAutoInFlight:false,getCurrentOrderArchiveDiagnostics:()=>{throw Error('Disabled diagnostics ran');},setOrderArchiveAutoState:()=>{checks++;}};
+ vm.createContext(context);
+ vm.runInContext(extract('    function shouldRunAutomaticOrderArchive(diagnostics){','    async function runAutomaticOrderArchiveIfNeeded(reason){'),context);
+ assert.equal(context.scheduleAutomaticOrderArchive('synthetic'),false);assert.equal(checks,1);
 });
 console.log(JSON.stringify({scope:'Source-function synthetic model, not native browser/device verification',source:sourcePath,tests:results.length,results},null,2));
