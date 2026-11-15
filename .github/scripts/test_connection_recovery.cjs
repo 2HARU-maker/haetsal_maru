@@ -168,6 +168,8 @@ process.once('beforeExit',()=>{if(!regressionSettled){console.error('Connection 
     await h.advance(14999);assert.equal(h.button().disabled,true);
     await h.advance(1);assert.equal(await first,false);assert.equal(h.button().disabled,false);
     assert.equal(h.api.getState().error,'connection/wait-timeout');
+    assert(h.text().includes('전체 연결 대기 기준(15초)'));
+    assert(h.text().includes('마지막 확인 단계는 '));
     const second=h.api.reconnect();await flush();assert.equal(h.calls[phase],phase==='snapshot'?2:1,'pending login/write must stay shared; list confirmation belongs to the new attempt');
     const value=phase==='login'||phase==='auth-state'?h.context.auth.currentUser:phase==='policy'?{checked:true,blocked:false}:phase==='snapshot'?{required:true,ready:true}:phase==='permission'||phase==='permission-recheck'?{admin:true,manager:true}:undefined;
     h.release(value);assert.equal(await second,true);assert.equal(h.api.getState().run.id,2);assert.equal(h.api.getState().state,'ready');
