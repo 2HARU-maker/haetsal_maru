@@ -11224,6 +11224,7 @@ window.HaetsalCombinedApp = (function(){
     Object.keys(screens).forEach(key => {
       screens[key].classList.toggle('active', key === name);
     });
+    if(name !== 'order' && window.OrderModule && window.OrderModule.syncDelayClock) window.OrderModule.syncDelayClock();
     if(!(window.HaetsalViewRestore && window.HaetsalViewRestore.pending)) window.scrollTo(0, 0);
     if(name === 'order' && window.OrderModule){
       if(window.OrderModule.refreshFromShared) window.OrderModule.refreshFromShared();
@@ -11470,8 +11471,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611150850;
-  const APP_BUILD_LABEL = '20261115_0850';
+  const APP_BUILD_NUMBER = 202611150950;
+  const APP_BUILD_LABEL = '20261115_0950';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -39471,6 +39472,10 @@ body.mobile-tablet-device .pos-keyboard-btn{
     let orderLifecycleScrollSnapshot = null;
     let lastDashboardScrollSnapshot = null;
     let orderScrollRestoreGeneration = 0;
+    let orderDelayClockTimer = null;
+    let orderDelayClockGeneration = 0;
+    let orderDelayRenderedScope = '';
+    let orderDelayPointerDown = false;
     let orderLifecycleRenderQueued = false;
     let orderLifecycleRenderGeneration = 0;
     let dashboardTouchInteraction = null;
@@ -40241,8 +40246,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(state.currentView === 'ORDER_MAIN') orderInputGeneration += 1;
     }, { capture:true, passive:true }));
 
-    function restoreOrderScrollPosition(snapshot){
-      const restoreGeneration = ++orderScrollRestoreGeneration;
+    function restoreOrderScrollPosition(snapshot, preserveFocusRestore=false){
+      const restoreGeneration = preserveFocusRestore && snapshot && isDashboardView() ? orderScrollRestoreGeneration : ++orderScrollRestoreGeneration;
       if(!snapshot) return;
       if(snapshot.view !== state.currentView) return;
       if(isDashboardView() && String(snapshot.dashboardTab || '') !== String(state.dashboardTab || '')) return;
@@ -40518,6 +40523,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
     }
 
   function render(){
+      if(!getOrderDelayClockScope()) stopOrderDelayClock();
       const tabletRuntimeRenderStartedAt = window.performance && typeof window.performance.now === 'function'
         ? window.performance.now()
         : Date.now();
@@ -40606,6 +40612,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(window.HaetsalRealtimeScope && typeof window.HaetsalRealtimeScope.sync === 'function'){
         window.HaetsalRealtimeScope.sync();
       }
+      orderDelayRenderedScope = getOrderDelayClockScope();
+      syncOrderDelayClock();
       const tabletRuntimeRenderCompletedAt = window.performance && typeof window.performance.now === 'function'
         ? window.performance.now()
         : Date.now();
@@ -41280,10 +41288,105 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return true;
     }
 
+    function getOrderDelayDisplayNow(){ return Date.now(); }
+
+    function getOrderDelayStartTime(order){
+      const value = order && order.timestamp;
+      if(value == null || value === '' || value === 0 || !['string','number','object'].includes(typeof value)) return null;
+      if(typeof value === 'object' && !(value instanceof Date)){
+        const seconds = 'seconds' in value ? value.seconds : value._seconds;
+        const nanoseconds = 'nanoseconds' in value ? value.nanoseconds : ('_nanoseconds' in value ? value._nanoseconds : 0);
+        if(!Number.isInteger(seconds) || !Number.isInteger(nanoseconds) || nanoseconds < 0 || nanoseconds >= 1000000000) return null;
+      }
+      if(typeof value === 'string' && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !isReceiptStatisticsDay(value.slice(0, 10)))) return null;
+      const received = toOrderDate(value);
+      if(!received || received.getTime() <= 0) return null;
+      const parts = getOrderSeoulDateTimeParts(received);
+      const opening = Date.parse(`${parts.year}-${parts.month}-${parts.day}T09:00:00+09:00`);
+      return Number.isFinite(opening) ? Math.max(received.getTime(), opening) : null;
+    }
+
+    function getOrderDelayDisplayState(start, now, warningTime){
+      const minutes = start == null || !Number.isFinite(now) ? null : Math.max(0, Math.floor((now - start) / 60000));
+      return {
+        minutes,
+        isDelayed:minutes != null && minutes >= Number(warningTime || 15),
+        nextAt:minutes == null ? null : (now < start ? start : start + (minutes + 1) * 60000)
+      };
+    }
+
+    function getOrderDelayClockScope(){
+      const owner = window.HaetsalCompletedOrderDocs && window.HaetsalCompletedOrderDocs.getStatisticsScope();
+      if(!document.getElementById('order-screen').classList.contains('active') || !isDashboardView() || state.dashboardTab !== 'ORDERS' || !owner || !owner.user
+        || (window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped())
+        || (window.HaetsalFirestoreQuotaGuard && window.HaetsalFirestoreQuotaGuard.isBlocked())) return '';
+      return JSON.stringify([owner.user.uid,owner.generation,owner.role,state.currentView,getOrderQueueFilterValue(),state.productionQueueDate,state.deliveryQueueViewMode,getTodayString()]);
+    }
+
+    function stopOrderDelayClock(){
+      orderDelayClockGeneration += 1;
+      if(orderDelayClockTimer != null) window.clearTimeout(orderDelayClockTimer);
+      orderDelayClockTimer = null;
+    }
+
+    function syncOrderDelayClock(){
+      stopOrderDelayClock();
+      const scope = getOrderDelayClockScope();
+      if(!scope || document.hidden || scope !== orderDelayRenderedScope) return;
+      const generation = orderDelayClockGeneration;
+      const cards = Array.from(app.querySelectorAll('.order-work-card[data-order-delay-start]')).map(card => ({
+        card, start:card.dataset.orderDelayStart === '' ? null : Number(card.dataset.orderDelayStart),
+        topline:card.querySelector('.order-work-topline')
+      })).filter(entry => entry.start != null && Number.isFinite(entry.start) && entry.topline);
+      if(!cards.length) return;
+      const tick = () => {
+        if(generation !== orderDelayClockGeneration) return;
+        orderDelayClockTimer = null;
+        if(document.hidden || scope !== getOrderDelayClockScope()) return;
+        if(orderDelayPointerDown || dashboardTouchInteraction != null || orderEntryInputIsComposing || orderEditInputIsComposing || adminUserSearchIsComposing){
+          orderDelayClockTimer = window.setTimeout(tick, 120);
+          return;
+        }
+        const now = getOrderDelayDisplayNow();
+        const changes = [];
+        let nextAt = Infinity;
+        cards.forEach(entry => {
+          if(!app.contains(entry.card)) return;
+          const display = getOrderDelayDisplayState(entry.start, now, state.sysSettings.warningTime);
+          nextAt = Math.min(nextAt, display.nextAt);
+          const badge = entry.topline.querySelector('.order-work-delay-inline');
+          const text = `⏰ ${display.minutes}분 지연`;
+          if(entry.card.classList.contains('delayed') !== display.isDelayed || !!badge !== display.isDelayed || (badge && badge.textContent !== text)) changes.push({entry,display,badge,text});
+        });
+        if(changes.length){
+          const scroll = captureOrderScrollPosition();
+          changes.forEach(({entry,display,badge,text}) => {
+            entry.card.classList.toggle('delayed', display.isDelayed);
+            if(!display.isDelayed){ if(badge) badge.remove(); return; }
+            if(badge){ badge.textContent = text; return; }
+            const next = document.createElement('div');
+            next.className = 'order-work-delay-inline order-work-tag';
+            next.textContent = text;
+            entry.topline.insertBefore(next, entry.topline.querySelector('.order-work-time-inline'));
+          });
+          restoreOrderScrollPosition(scroll, true);
+        }
+        if(Number.isFinite(nextAt)) orderDelayClockTimer = window.setTimeout(tick, Math.min(2147483647, Math.max(20, nextAt - getOrderDelayDisplayNow())));
+      };
+      tick();
+    }
+
+    document.addEventListener('pointerdown', event => { if(isDashboardView() && app.contains(event.target)) orderDelayPointerDown = true; }, true);
+    document.addEventListener('pointerup', () => { orderDelayPointerDown = false; }, true);
+    document.addEventListener('pointercancel', () => { orderDelayPointerDown = false; }, true);
+    document.addEventListener('visibilitychange', () => { orderDelayPointerDown = false; syncOrderDelayClock(); });
+    window.addEventListener('pageshow', syncOrderDelayClock);
+    window.addEventListener('blur', () => { orderDelayPointerDown = false; });
+    window.addEventListener('haetsal:runtime-stopped', stopOrderDelayClock);
+
     function renderPendingOrderCard(order){
-      const orderTime = new Date(orderTimestamp(order));
-      const diffMins = Math.max(0, Math.floor((Date.now() - orderTime.getTime()) / 60000));
-      const isDelayed = diffMins >= Number(state.sysSettings.warningTime || 15);
+      const delayStart = getOrderDelayStartTime(order);
+      const { minutes:diffMins, isDelayed } = getOrderDelayDisplayState(delayStart, getOrderDelayDisplayNow(), state.sysSettings.warningTime);
       const totalQty = Number(getOrderTotalQuantity(order) || 0);
       const isDelivery = order.deliveryType === 'DELIVERY';
       const deliveryLabel = isDelivery
@@ -41292,7 +41395,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const { completeAction, completeButtonLabel, completeButtonDisabled, completionStatusHtml } = getProductionCompletionControl(order);
       return reuseDashboardOrderCard(order.id, `
-        <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}">
+        <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}" data-order-delay-start="${delayStart == null ? '' : delayStart}">
           <div class="order-work-left">
             <div class="order-work-seq order-work-left-seq">#${Number(order.seq || 0)}</div>
             <div class="order-work-name">${escapeHtml(order.userNameDisplay || order.userName)}<span class="dept">(${escapeHtml(order.userDept || '소속없음')})</span></div>
@@ -41343,9 +41446,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
 
     function renderDeliveryRecordCard(order){
       if(!order || !order.id) return '';
-      const orderTime = new Date(orderTimestamp(order));
-      const diffMins = Math.max(0, Math.floor((Date.now() - orderTime.getTime()) / 60000));
-      const isDelayed = diffMins >= Number(state.sysSettings.warningTime || 15);
+      const delayStart = getOrderDelayStartTime(order);
+      const { minutes:diffMins, isDelayed } = getOrderDelayDisplayState(delayStart, getOrderDelayDisplayNow(), state.sysSettings.warningTime);
       const totalQty = Number(getOrderTotalQuantity(order) || 0);
       const receivedTime = formatDateTime(getOrderBusinessTimestamp(order) || orderTimestamp(order));
       const ready = isDeliveryDashboardOrderReady(order);
@@ -41357,7 +41459,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
       const deliveryLocation = String(order.deliveryLocation || '').trim();
       const deliveryLabel = `🚚 ${deliveryLocation ? escapeHtml(deliveryLocation) : '배달장소 확인 필요'}`;
       return `
-        <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}">
+        <div class="order-row-large order-work-card ${isDelayed ? 'delayed' : ''}" data-order-delay-start="${delayStart == null ? '' : delayStart}">
           <div class="order-work-left">
             <div class="order-work-seq order-work-left-seq">#${Number(order.seq || 0)}</div>
             <div class="order-work-name">${escapeHtml(order.userNameDisplay || order.userName)}<span class="dept">(${escapeHtml(order.userDept || '소속없음')})</span></div>
@@ -47611,6 +47713,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     window.OrderModule = {
       state,
       render,
+      syncDelayClock:syncOrderDelayClock,
       refreshFromShared,
     resumeDeferredFullBackupAfterReconnect:flushDeferredOrderFullBackupSave,
       // Cloud truth is independent of local carryover detach provenance.
@@ -52528,7 +52631,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         : connectionError === 'live-order-list-partial'
           ? '서버 목록이 조회 한도 300건에 닿아 전체 목록을 확인하지 못했습니다. 주문이 없는 뜻은 아닙니다. ' + (saving ? '원래 저장 결과는 별도로 확인 중입니다. ' : '')
           : connectionError === 'connection/wait-timeout'
-            ? stage + ' 확인이 15초 이상 지연되어 대기를 마쳤습니다. ' + (connectionRun && connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) ? '현재 주문 수신은 확인했습니다. ' : '최신 목록은 아직 미확인입니다. ') + (saving ? '원래 저장 결과는 미확정이며 재발행하지 않았습니다. ' : '') + '다시 연결하여 확인할 수 있습니다. '
+            ? '전체 연결 대기 기준(15초)이 지나 앱의 대기를 마쳤습니다. 마지막 확인 단계는 ' + stage + '입니다. ' + (connectionRun && connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) ? '현재 주문 수신은 확인했습니다. ' : '최신 목록은 아직 미확인입니다. ') + (saving ? '원래 저장 결과는 미확정이며 재발행하지 않았습니다. ' : '') + '다시 연결하여 확인할 수 있습니다. '
             : '연결 또는 인증 확인을 완료하지 못했습니다 (' + connectionError + '). 주문이 0건이라는 뜻은 아닙니다. ';
     reconnectButton.disabled = !!connectionTask || !!(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped());
   }

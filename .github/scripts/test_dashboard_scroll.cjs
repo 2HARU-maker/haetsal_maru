@@ -25,6 +25,7 @@ context.isOperatorDashboardViewForArchiveAuto=()=>false;context.renderModals=()=
 // This model exercises full-render restoration; native DOM patching is checked in the browser.
 context.patchDashboardOrdersView=()=>false;context.dashboardOrdersRenderKey=()=>'';context.renderedDashboardOrdersKey='';
 context.prepareDashboardOrderCards=()=>{};context.rememberDashboardOrderCards=()=>{};
+context.getOrderDelayClockScope=()=>'';context.stopOrderDelayClock=()=>{};context.syncOrderDelayClock=()=>{};context.orderDelayRenderedScope='';
 vm.createContext(context);
 vm.runInContext(`let orderLifecycleScrollSnapshot=null,lastDashboardScrollSnapshot=null,orderScrollRestoreGeneration=0,orderLifecycleRenderQueued=false,orderLifecycleRenderGeneration=0,dashboardTouchInteraction=null,dashboardTouchScrollObserved=false,dashboardTouchRenderDeferred=false,dashboardTouchRenderFlushTimer=null,adminUserSearchRemoteRenderPending=false,preserveOrderScrollOnNextRender=false,preserveOrderEditModalScrollOnNextRender=false,orderEditModalScrollSnapshot=null,deferredOrderSearchRemoteRender=false,adminUserSearchIsComposing=false;\n${options.scrollCode || scroll}\n${render}\nthis.inspect=()=>({top:getDashboardScrollTop(getDashboardScrollOwner()),active:dashboardTouchInteraction,deferred:dashboardTouchRenderDeferred,lifecycle:orderLifecycleScrollSnapshot&&orderLifecycleScrollSnapshot.dashboardTop});`,context);
 return {ctx:context,emit(type,target=cardTarget,extra={}){for(const fn of listeners.get(type)||[])fn({type,target,...extra});},touchStart(){this.emit('pointerdown',cardTarget,{pointerType:'touch',pointerId:1});this.emit('touchstart',cardTarget,{touches:[{identifier:1}]});},touchEnd(){this.emit('touchend',cardTarget,{changedTouches:[{identifier:1}]});},scroll(top){owner.scrollTop=top;this.emit('scroll',owner);},advance(delta){const end=now+delta;while(true){let pair=[...timers].filter(([,x])=>x.time<=end).sort((a,b)=>a[1].time-b[1].time)[0];if(!pair)break;now=pair[1].time;timers.delete(pair[0]);pair[1].fn();}now=end;},replacements:()=>replacementCount,owner:()=>owner,setTop:(top)=>{owner.scrollTop=top;},replaceOwner:()=>{owner=makeOwner();},cardTarget,headerTarget};
@@ -90,4 +91,18 @@ check('disabled automatic archive skips diagnostics but preserves check state',(
  vm.runInContext(extract('    function shouldRunAutomaticOrderArchive(diagnostics){','    async function runAutomaticOrderArchiveIfNeeded(reason){'),context);
  assert.equal(context.scheduleAutomaticOrderArchive('synthetic'),false);assert.equal(checks,1);
 });
-console.log(JSON.stringify({scope:'Source-function synthetic model, not native browser/device verification',source:sourcePath,tests:results.length,results},null,2));
+const delayContext={Date,Intl,Number,Math,JSON,String};vm.createContext(delayContext);
+const zone=source.match(/const ORDER_TIME_ZONE = '([^']+)';/);assert(zone);
+vm.runInContext("const ORDER_TIME_ZONE="+JSON.stringify(zone[1])+";"+extract('    const ORDER_SEOUL_DATE_TIME_FORMATTER =','\n    });')+'\n    });',delayContext);
+for(const name of ['toOrderDate','getOrderSeoulDateTimeParts','isReceiptStatisticsDay','getOrderDelayStartTime','getOrderDelayDisplayState']){
+ const start=source.indexOf('    function '+name+'('),end=source.indexOf('\n    }',start);assert(start>=0&&end>start,name);
+ vm.runInContext(source.slice(start,end+6),delayContext);
+}
+const delayResults=[];
+for(const [received,at,minutes]of [['08:00','08:59',0],['08:00','09:00',0],['08:00','09:05',5],['08:00','09:15',15],['09:12','09:20',8]]){
+ const start=delayContext.getOrderDelayStartTime({timestamp:'2026-11-15T'+received+':00+09:00'}),display=delayContext.getOrderDelayDisplayState(start,Date.parse('2026-11-15T'+at+':00+09:00'),15);
+ assert.equal(display.minutes,minutes);assert.equal(display.isDelayed,minutes>=15);delayResults.push({received,at,minutes,result:'PASS_CODE_MODEL'});
+}
+assert.equal(delayContext.getOrderDelayStartTime({timestamp:'invalid'}),null);delayResults.push({name:'invalid receipt is unknown',result:'PASS_CODE_MODEL'});
+assert.equal(delayContext.getOrderDelayDisplayState(delayContext.getOrderDelayStartTime({timestamp:'2026-11-14T08:00:00+09:00'}),Date.parse('2026-11-15T09:05:00+09:00'),15).minutes,1445);delayResults.push({name:'previous receipt day retains its own opening time',result:'PASS_CODE_MODEL'});
+console.log(JSON.stringify({scope:'Source-function synthetic model, not native browser/device verification',source:sourcePath,tests:results.length,results,orderDelay:{tests:delayResults.length,results:delayResults}},null,2));
