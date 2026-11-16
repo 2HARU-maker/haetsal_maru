@@ -11471,8 +11471,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611150950;
-  const APP_BUILD_LABEL = '20261115_0950';
+  const APP_BUILD_NUMBER = 202611161940;
+  const APP_BUILD_LABEL = '20261116_1940';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -52441,6 +52441,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(!user || user.isAnonymous){
       verifiedAdminUid = '';
       verifiedManagerUid = '';
+      if(user && window.HaetsalRealtimeScope && window.HaetsalRealtimeScope.authRecovered){
+        const generation = operatorAuthGeneration;
+        const result = await getIdTokenResult(user, forceRefresh === true);
+        const tokenGeneration = operatorTokenGeneration;
+        const token = await getIdToken(user, false);
+        if(user !== auth.currentUser || generation !== operatorAuthGeneration || tokenGeneration !== operatorTokenGeneration || result.token !== token) throw Object.assign(new Error('인증 사용자가 변경되었습니다.'), { code:'auth/session-changed' });
+        window.HaetsalRealtimeScope.authRecovered(user, generation, tokenGeneration);
+      }
       return { admin:false, manager:false };
     }
     const generation = operatorAuthGeneration;
@@ -52467,7 +52475,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     verifiedAdminUid = admin ? uid : '';
     verifiedManagerUid = manager ? uid : '';
     restrictUnverifiedOperatorViews();
-    if(window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.sync();
+    if(window.HaetsalRealtimeScope){
+      window.HaetsalRealtimeScope.sync();
+      if((admin || manager) && window.HaetsalRealtimeScope.authRecovered) window.HaetsalRealtimeScope.authRecovered(user, generation, tokenGeneration);
+    }
     return { admin, manager };
   }
 
@@ -52580,8 +52591,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       observedAuthUser = user;
       resolve(user);
-      if(!identityChanged && connectionState === 'ready' && user && !user.isAnonymous){
-        verifyFirebaseOperatorUser(user, false).catch(error => console.warn('갱신된 인증 권한 확인 실패:', error));
+      if(!identityChanged && user && !isConnectionStopped()){
+        verifyFirebaseOperatorUser(user, false).then(() => { if(!window.HaetsalRealtimeScope) requestConnectionRecovery('token-verified', true); }).catch(error => console.warn('갱신된 인증 권한 확인 실패:', error));
       }
     }, reject);
   });
@@ -52592,6 +52603,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
   let connectionTimer = null;
   let connectionState = 'starting';
   let connectionError = '';
+  let connectionRecoveryQueued = false;
+  let connectionRecoveryAfterTask = false;
+  let connectionRecoveryTransitionPending = false;
+  let connectionRecoveryReceiptPending = false;
+  let connectionRecoveryEpochs = 0;
+  let connectionRecoverySignalAt = -Infinity;
+  let connectionAuthRefreshGeneration = -1;
+  let connectionRecoveryReason = '';
   // Match the existing 15s server-read wait; expiry never cancels an SDK operation.
   const CONNECTION_WAIT_TIMEOUT_MS = 15000;
   const connectionPendingSteps = new Map();
@@ -52619,19 +52638,59 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     return /^(auth\/network-request-failed|auth\/session-changed|unavailable|firestore\/unavailable|deadline-exceeded|auth\/timeout|runtime-policy-unconfirmed)$/.test(String(error && error.code || ''));
   }
 
+  function isOriginalOrderSaveUnknown(){
+    return !!(window.HaetsalCloudStore && window.HaetsalCloudStore.getSyncStatus('order').phase === 'unknown');
+  }
+
+  function reconcileOriginalOrderSave(){
+    connectionRecoveryTransitionPending = false;
+    connectionRecoveryReceiptPending = false;
+    return window.HaetsalCloudStore.reconcileOrderSave();
+  }
+
+  function requestConnectionRecovery(reason, transition=false, receiptSignal=false){
+    if(isConnectionStopped() || (typeof navigator !== 'undefined' && navigator.onLine === false) || document.hidden) return Promise.resolve(false);
+    const scope = window.HaetsalRealtimeScope;
+    const health = scope && scope.getRecoveryState ? scope.getRecoveryState() : null;
+    if(transition && ['online','foreground','authenticated-scopes'].includes(reason) && scope && scope.recoverySignal) scope.recoverySignal();
+    const receiptRecovery = isOriginalOrderSaveUnknown() && (transition || receiptSignal || reason === 'token-verified');
+    if(connectionState === 'ready' && !(health && (health.confirmationDue || health.unauthenticated)) && !receiptRecovery) return Promise.resolve(true);
+    if(connectionState === 'blocked' || (connectionState === 'failed' && !isTransientConnectionError({ code:connectionError })
+      && !['connection/wait-timeout','unauthenticated','firestore/unauthenticated'].includes(connectionError))) return Promise.resolve(false);
+    if(transition && !connectionTask && connectionAttempt >= 6 && connectionRecoveryEpochs < 2 && Date.now() - connectionRecoverySignalAt >= 30000){
+      connectionRecoveryEpochs += 1;
+      connectionRecoverySignalAt = Date.now();
+      connectionAttempt = 5;
+    }
+    if(connectionTask){ connectionRecoveryAfterTask = true; connectionRecoveryTransitionPending = connectionRecoveryTransitionPending || transition; connectionRecoveryReceiptPending = connectionRecoveryReceiptPending || receiptRecovery; return connectionTask; }
+    if(connectionRecoveryQueued){ connectionRecoveryTransitionPending = connectionRecoveryTransitionPending || transition; connectionRecoveryReceiptPending = connectionRecoveryReceiptPending || receiptRecovery; return Promise.resolve(false); }
+    connectionRecoveryQueued = true;
+    connectionRecoveryReason = /^(stalled-live-scope|token-verified|live-server-snapshot|server-scope-snapshot|original-save-status|authenticated-scopes|listener-authentication|late-settlement|online|foreground|late-(auth|persistence|login|permission|policy|permission-recheck|snapshot|save))$/.test(reason) ? reason : 'scope-recovery';
+    return Promise.resolve().then(() => {
+      connectionRecoveryQueued = false;
+      if(isConnectionStopped()) return false;
+      const receipt = receiptRecovery || connectionRecoveryReceiptPending;
+      connectionRecoveryReceiptPending = false;
+      connectionRecoveryTransitionPending = false;
+      return startConnectionAttempt(false, true, receipt);
+    });
+  }
+
   function renderConnectionNotice(){
     const saving = window.HaetsalCloudStore && ['saving','unknown'].includes(window.HaetsalCloudStore.getSyncStatus('order').phase);
     const stages = { auth:'인증 상태', persistence:'로그인 저장소', login:'로그인', permission:'권한', policy:'실행 정책', 'permission-recheck':'현재 권한', snapshot:'서버의 현재 주문 목록', save:'원래 저장 결과' };
     const stage = stages[connectionRun && connectionRun.stage] || '연결';
     connectionNotice.hidden = connectionState === 'ready' && connectionFailures.size === 0 && !saving && !isConnectionStopped();
     connectionText.textContent = isConnectionStopped() ? '안전 조건에 따라 동기화가 중지되었습니다. 상태를 확인하세요. ' : connectionState === 'ready'
-      ? (saving ? '수신 연결과 별개로 원래 저장 결과를 기다리고 있습니다. 미확정 요청을 다시 처리하지 마세요. ' : '일부 실시간 연결을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. ')
+      ? (connectionTask && connectionRun && connectionRun.limited && !connectionRun.finished
+          ? stage + ' 확인 중입니다. 확인된 현재 작업 화면은 유지합니다. ' + (saving ? '원래 저장 결과는 별도로 미확정입니다. ' : '')
+          : saving ? '수신 연결과 별개로 원래 저장 결과를 기다리고 있습니다. 미확정 요청을 다시 처리하지 마세요. ' : '일부 실시간 연결을 확인하지 못했습니다. 주문이 0건이라는 뜻은 아닙니다. ')
       : connectionState === 'starting'
         ? stage + ' 확인 중입니다. ' + (saving ? '원래 저장 결과는 아직 미확정입니다. ' : '')
         : connectionError === 'live-order-list-partial'
           ? '서버 목록이 조회 한도 300건에 닿아 전체 목록을 확인하지 못했습니다. 주문이 없는 뜻은 아닙니다. ' + (saving ? '원래 저장 결과는 별도로 확인 중입니다. ' : '')
           : connectionError === 'connection/wait-timeout'
-            ? '전체 연결 대기 기준(15초)이 지나 앱의 대기를 마쳤습니다. 마지막 확인 단계는 ' + stage + '입니다. ' + (connectionRun && connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) ? '현재 주문 수신은 확인했습니다. ' : '최신 목록은 아직 미확인입니다. ') + (saving ? '원래 저장 결과는 미확정이며 재발행하지 않았습니다. ' : '') + '다시 연결하여 확인할 수 있습니다. '
+            ? '전체 연결 대기 기준(15초)이 지나 앱의 대기를 마쳤습니다. 마지막 확인 단계는 ' + stage + '입니다. ' + (connectionRun && connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) ? '현재 주문 수신은 확인했습니다. ' : '최신 목록은 아직 미확인입니다. ') + (saving ? '원래 저장 결과는 미확정이며 재발행하지 않았습니다. ' : '') + '연결이 회복되면 자동 확인하며, 다시 연결로도 확인할 수 있습니다. '
             : '연결 또는 인증 확인을 완료하지 못했습니다 (' + connectionError + '). 주문이 0건이라는 뜻은 아닙니다. ';
     reconnectButton.disabled = !!connectionTask || !!(window.HaetsalRuntimeGuard && window.HaetsalRuntimeGuard.isStopped());
   }
@@ -52660,6 +52719,10 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         task.then(release, release);
       }
     }
+    const pendingGeneration = operatorAuthGeneration;
+    task.then(() => {
+      if(connectionRun === run && run.expired && pendingGeneration === operatorAuthGeneration && connectionError === 'connection/wait-timeout') requestConnectionRecovery('late-' + stage);
+    }, () => {});
     const value = await task;
     if(!isCurrentConnectionRun(run)) throw Object.assign(new Error('connection-superseded'), { code:'auth/session-changed' });
     return value;
@@ -52678,7 +52741,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     else resume();
   }
 
-  function startConnectionAttempt(manual=false){
+  function startConnectionAttempt(manual=false, automatic=false, receiptSignal=false){
     if(connectionTask){
       if(manual && connectionRun && ['snapshot','save'].includes(connectionRun.stage) && isCurrentConnectionRun(connectionRun)
         && window.HaetsalViewRestore && window.HaetsalViewRestore.onConnectionReady) window.HaetsalViewRestore.onConnectionReady();
@@ -52689,17 +52752,21 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const quotaRecovery = !!(quotaGuard && quotaGuard.isBlocked());
     if(quotaRecovery && !(quotaGuard.canAttemptRecoveryProbe && quotaGuard.canAttemptRecoveryProbe())) return Promise.resolve(false);
     if(manual){ connectionAttempt = 0; if(connectionTimer) clearTimeout(connectionTimer); connectionTimer = null; }
-    if(connectionState === 'ready' && !manual){
+    if(connectionState === 'ready' && !manual && !automatic){
       return Promise.resolve(true);
     }
     if(connectionTimer || connectionAttempt >= 6) return Promise.resolve(false);
+    const scope = window.HaetsalRealtimeScope;
+    const healthAtStart = scope && scope.getRecoveryState ? scope.getRecoveryState() : null;
+    const liveAtStart = scope && scope.getLiveOrderSnapshot ? scope.getLiveOrderSnapshot() : null;
+    const limited = !!(automatic && connectionState === 'ready' && healthAtStart && healthAtStart.healthy
+      && (!healthAtStart.required || (liveAtStart && liveAtStart.ready)) && (healthAtStart.unauthenticated || isOriginalOrderSaveUnknown()));
     connectionAttempt += 1;
-    connectionState = 'starting';
-    connectionError = '';
+    if(!limited){ connectionState = 'starting'; connectionError = ''; }
     const restore = window.HaetsalViewRestore;
     const requestedRole = window.OrderModule && window.OrderModule.state && window.OrderModule.state.appRole !== 'GUEST'
       ? window.OrderModule.state.appRole : restore && restore.pending && restore.intent ? restore.intent.appRole : 'GUEST';
-    const run = { id:++connectionRunSequence, startedAt:Date.now(), stage:'auth', user:null, authGeneration:null, expired:false, finished:false, ordersConfirmed:false, cleanups:new Set() };
+    const run = { id:++connectionRunSequence, automatic, limited, reason:automatic ? connectionRecoveryReason : (manual ? 'manual' : 'initial'), startedAt:Date.now(), stage:'auth', user:null, authGeneration:null, expired:false, finished:false, ordersConfirmed:false, cleanups:new Set() };
     connectionRun = run;
     let waitTimer;
     const deadline = new Promise((resolve, reject) => {
@@ -52719,9 +52786,31 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       window.firebaseAuthUser = user;
       resolveFirebaseReady(user);
       let restoreRoleDenied = user.isAnonymous && ['ADMIN','MANAGER'].includes(requestedRole);
-      if(!user.isAnonymous){
-        const rights = await waitForConnectionStep(run, 'permission', () => verifyFirebaseOperatorUser(user, true));
+      const healthBeforePermission = window.HaetsalRealtimeScope && window.HaetsalRealtimeScope.getRecoveryState ? window.HaetsalRealtimeScope.getRecoveryState() : null;
+      let refreshedAuth = false;
+      if(!user.isAnonymous || (automatic && healthBeforePermission && healthBeforePermission.unauthenticated)){
+        const health = healthBeforePermission;
+        const refresh = !automatic || !!(health && health.unauthenticated && health.needsTokenRefresh !== false && connectionAuthRefreshGeneration !== currentGeneration);
+        if(automatic && refresh) connectionAuthRefreshGeneration = currentGeneration;
+        const tokenGenerationBeforeRefresh = operatorTokenGeneration;
+        let rights;
+        try{
+          rights = await waitForConnectionStep(run, 'permission', () => verifyFirebaseOperatorUser(user, refresh));
+          refreshedAuth = refresh;
+        }catch(error){
+          if(automatic && refresh && auth.currentUser === user && currentGeneration === operatorAuthGeneration && operatorTokenGeneration === tokenGenerationBeforeRefresh
+            && /^(auth\/network-request-failed|auth\/timeout|unavailable|deadline-exceeded)$/.test(String(error && error.code || ''))) connectionAuthRefreshGeneration = -1;
+          throw error;
+        }
         restoreRoleDenied = (requestedRole === 'ADMIN' && !rights.admin) || (requestedRole === 'MANAGER' && !rights.manager);
+      }
+      if(limited){
+        if(isConnectionStopped()) return false;
+        if(restoreRoleDenied) throw Object.assign(new Error('permission-denied'), { code:'permission-denied' });
+        if(isOriginalOrderSaveUnknown() && (receiptSignal || refreshedAuth) && window.HaetsalCloudStore.reconcileOrderSave){
+          await waitForConnectionStep(run, 'save', reconcileOriginalOrderSave);
+        }
+        return true;
       }
       const policy = await waitForConnectionStep(run, 'policy', () => loadRuntimePolicyOnce({ allowQuotaRecoveryProbe:quotaRecovery }));
       if(isConnectionStopped()) return false;
@@ -52738,7 +52827,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       if(manual && window.HaetsalRealtimeScope) window.HaetsalRealtimeScope.reconnect();
       // Verify the original receipt even when the independent current-list query is partial or stalled.
       const saveCheck = (window.HaetsalCloudStore.reconcileOrderSave
-        ? waitForConnectionStep(run, 'save', () => window.HaetsalCloudStore.reconcileOrderSave()) : Promise.resolve())
+        ? waitForConnectionStep(run, 'save', reconcileOriginalOrderSave) : Promise.resolve())
         .then(() => ({ failed:false }), error => ({ failed:true, error }));
       let snapshotFailure = null;
       try{
@@ -52767,18 +52856,20 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       }
       connectionState = 'ready';
       connectionError = '';
+      const health = window.HaetsalRealtimeScope && window.HaetsalRealtimeScope.getRecoveryState ? window.HaetsalRealtimeScope.getRecoveryState() : null;
+      if(health && health.healthy && !health.unauthenticated && !isOriginalOrderSaveUnknown()){ connectionAttempt = 0; connectionRecoveryEpochs = 0; connectionAuthRefreshGeneration = -1; }
       return true;
     })();
     connectionTask = Promise.race([work, deadline]).catch(error => {
       if(connectionRun !== run) return false;
-      connectionState = 'failed';
-      connectionError = String(error.code || 'connection-failed');
+      run.error = String(error.code || 'connection-failed');
+      if(!limited){ connectionState = 'failed'; connectionError = run.error; }
       console.error('Firebase 연결 준비 실패:', error);
-      if(connectionError !== 'connection/wait-timeout' && !['snapshot','save'].includes(run.stage)
+      if(!limited && connectionError !== 'connection/wait-timeout' && !['snapshot','save'].includes(run.stage)
         && !['saving','unknown'].includes(window.HaetsalCloudStore.getSyncStatus('order').phase)) window.HaetsalCloudStore.markAllConnectionErrors('클라우드 연결 실패 (' + connectionError + ')');
       if(isTransientConnectionError(error) && connectionAttempt < 6 && !isConnectionStopped()){
         const delay = Math.min(30000, 1000 * Math.pow(2, connectionAttempt - 1)) * (0.8 + Math.random() * 0.4);
-        connectionTimer = setTimeout(() => { connectionTimer = null; startConnectionAttempt(); }, delay);
+        connectionTimer = setTimeout(() => { connectionTimer = null; startConnectionAttempt(false, automatic, receiptSignal); }, delay);
       }
       return false;
     }).finally(() => {
@@ -52787,7 +52878,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       run.finishedAt = Date.now();
       for(const cleanup of run.cleanups) cleanup();
       run.cleanups.clear();
-      if(connectionRun === run){ connectionTask = null; renderConnectionNotice(); }
+      if(connectionRun === run){
+        connectionTask = null;
+        renderConnectionNotice();
+        if(connectionRecoveryAfterTask){ const transition = connectionRecoveryTransitionPending, receipt = connectionRecoveryReceiptPending; connectionRecoveryAfterTask = false; connectionRecoveryTransitionPending = false; connectionRecoveryReceiptPending = false; requestConnectionRecovery('late-settlement', transition, receipt); }
+      }
     });
     renderConnectionNotice();
     return connectionTask;
@@ -52795,18 +52890,32 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
 
   window.HaetsalConnection = {
     reconnect:() => startConnectionAttempt(true),
-    getState:() => ({ state:connectionState, attempt:connectionAttempt, error:connectionError, scopes:Array.from(connectionFailures.entries()), run:connectionRun && { id:connectionRun.id, stage:connectionRun.stage, elapsedMs:(connectionRun.finishedAt || Date.now()) - connectionRun.startedAt, finished:connectionRun.finished, ordersConfirmed:connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) } }),
+    getState:() => ({ state:connectionState, attempt:connectionAttempt, error:connectionError, scopes:Array.from(connectionFailures.entries()), run:connectionRun && { id:connectionRun.id, automatic:connectionRun.automatic, limited:connectionRun.limited, reason:connectionRun.reason, error:connectionRun.error || '', stage:connectionRun.stage, elapsedMs:(connectionRun.finishedAt || Date.now()) - connectionRun.startedAt, finished:connectionRun.finished, ordersConfirmed:connectionRun.ordersConfirmed && (!connectionRun.isSnapshotCurrent || connectionRun.isSnapshotCurrent()) } }),
     scopeFailed:(key, code) => { connectionFailures.set(key, code); renderConnectionNotice(); },
-    scopeHealthy:key => { connectionFailures.delete(key); renderConnectionNotice(); },
+    recover:requestConnectionRecovery,
+    scopeHealthy:(key, recovered=false) => {
+      const scope = window.HaetsalRealtimeScope;
+      const health = scope && scope.getRecoveryState ? scope.getRecoveryState() : null;
+      const live = scope && scope.getLiveOrderSnapshot ? scope.getLiveOrderSnapshot() : null;
+      const serverReady = !(health && health.required) || !!(live && live.ready);
+      if(key !== 'live-order-query' || (serverReady && health && health.healthy)) connectionFailures.delete(key);
+      if(connectionState === 'ready' && health && health.healthy && !health.unauthenticated && serverReady && !isOriginalOrderSaveUnknown()){ connectionAuthRefreshGeneration = -1; connectionRecoveryEpochs = 0; connectionAttempt = 0; }
+      renderConnectionNotice();
+      if(key === 'live-order-query') requestConnectionRecovery('live-server-snapshot', recovered);
+      else if(recovered && connectionState !== 'ready') requestConnectionRecovery('server-scope-snapshot', true);
+    },
     scopeReleased:key => { connectionFailures.delete(key); renderConnectionNotice(); }
   };
   reconnectButton.addEventListener('click', () => startConnectionAttempt(true));
-  window.addEventListener('online', () => { if(connectionState !== 'ready') startConnectionAttempt(); });
-  document.addEventListener('visibilitychange', () => { if(!document.hidden && connectionState !== 'ready') startConnectionAttempt(); });
+  let connectionWasOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  let connectionWasHidden = !!document.hidden;
+  window.addEventListener('offline', () => { connectionWasOffline = true; });
+  window.addEventListener('online', event => { const changed = connectionWasOffline || event?.isTrusted === true; connectionWasOffline = false; requestConnectionRecovery('online', changed); });
+  document.addEventListener('visibilitychange', () => { const changed = connectionWasHidden && !document.hidden; connectionWasHidden = !!document.hidden; if(changed) requestConnectionRecovery('foreground', true); });
   window.addEventListener('haetsal:runtime-stopped', () => { if(connectionTimer) clearTimeout(connectionTimer); connectionTimer = null; if(connectionTask && connectionRun) connectionRun.cancel('runtime-stopped'); renderConnectionNotice(); });
 
   if(window.HaetsalCloudStore && typeof window.HaetsalCloudStore.subscribeSyncStatus === 'function'){
-    window.HaetsalCloudStore.subscribeSyncStatus('order', renderConnectionNotice);
+    window.HaetsalCloudStore.subscribeSyncStatus('order', () => { renderConnectionNotice(); requestConnectionRecovery('original-save-status'); });
   }
 
   window.firebaseApp = app;
@@ -63074,11 +63183,13 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         proof.ready = ready;
         proof.error = String(error || '');
         if(ready) proof.serverSequence = ++liveOrderServerConfirmationSequence;
+        if(ready && proof.isCurrent() && scopeInstance && scopeInstance.status === 'healthy') window.HaetsalConnection.scopeHealthy('live-order-query');
         if(window.HaetsalViewRestore && window.HaetsalViewRestore.onLiveSnapshot) window.HaetsalViewRestore.onLiveSnapshot();
       };
 
       const startCurrentDateQuery = function(compatibilityMode=false){
         if(stopped) return;
+        if(scopeInstance){ scopeInstance.status = 'starting'; scopeInstance.statusSince = Date.now(); scopeInstance.recoveryChecked = false; scopeInstance.confirmedTokenGeneration = null; scheduleScopedRealtimeStallCheck(scopeInstance); }
         for(const cancel of confirmationCleanups) cancel();
         window.HaetsalConnection.scopeFailed('live-order-query', 'live-order-unconfirmed');
         const currentQueryGeneration = ++queryGeneration;
@@ -63358,6 +63469,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         unsubscribeCurrentQuery = onSnapshot(activeQueryRef, { includeMetadataChanges:true }, applySnapshot, receiveError);
         if(scopeInstance) scopeInstance.confirmLatest = async function(isCurrent, registerCleanup){
           if(!isCurrent() || !restoreProof.isCurrent() || isScopedRealtimeGuardBlocked()) throw Object.assign(new Error('scope-changed'), { code:'auth/session-changed' });
+          const confirmationTokenGeneration = operatorTokenGeneration;
           const stalled = ['starting','cached'].includes(scopeInstance.status)
             && Date.now() - scopeInstance.statusSince >= CONNECTION_WAIT_TIMEOUT_MS;
           let received;
@@ -63394,7 +63506,14 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           // Cache age alone is not failure: first prove this exact query can reach the server.
           if(stalled && isCurrent()
             && ['starting','cached'].includes(scopeInstance.status) && snapshot.metadata.fromCache === false && snapshot.metadata.hasPendingWrites === false){
-            stopScopedRealtimeSubscription('live-order-query');
+            const retry = scopedRealtimeRetryStates.get('live-order-query');
+            const attempt = Number(retry && retry.attempt || 0) + 1;
+            if(attempt > SCOPED_REALTIME_RETRY_MAX_ATTEMPTS){
+              scopedRealtimeRetryStates.set('live-order-query', { ...retry, exhausted:true, ready:false });
+              throw Object.assign(new Error('scope-recovery-exhausted'), { code:'unavailable' });
+            }
+            stopScopedRealtimeSubscription('live-order-query', { preserveRetry:true });
+            scopedRealtimeRetryStates.set('live-order-query', { ...retry, attempt, ready:true, timer:null, waiting:false, exhausted:false });
             syncScopedRealtimeSubscriptions();
             const replacement = scopedRealtimeSubscriptions.get('live-order-query');
             if(!replacement || replacement === scopeInstance) throw Object.assign(new Error('scope-unavailable'), { code:'unavailable' });
@@ -63409,6 +63528,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           }while(isCurrent() && application !== snapshotApplication);
           if(!isCurrent() || !restoreProof.isCurrent()) throw Object.assign(new Error('scope-changed'), { code:'auth/session-changed' });
           if(!restoreProof.ready) throw Object.assign(new Error('live-order-list-unconfirmed'), { code:restoreProof.error || 'live-order-list-unconfirmed' });
+          scopeInstance.confirmedTokenGeneration = confirmationTokenGeneration;
           return { required:true, ready:true, isCurrent:() => restoreProof.isCurrent() && restoreProof.ready };
         };
         dateRolloverTimer = setTimeout(startCurrentDateQuery, getMillisUntilNextSeoulDate());
@@ -63497,6 +63617,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     const SCOPED_REALTIME_RETRY_MAX_MS = 30000;
     const SCOPED_REALTIME_RETRY_MAX_ATTEMPTS = 6;
     const SCOPED_REALTIME_RETRY_JITTER_RATIO = 0.2;
+    let lastScopedAuthRecovery = '';
 
     function isScopedRealtimeGuardBlocked(){
       const currentQuotaGuard = window.HaetsalFirestoreQuotaGuard;
@@ -63537,6 +63658,51 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       return Math.max(0, Math.round(baseDelay + jitter));
     }
 
+    function scheduleScopedRealtimeStallCheck(entry){
+      if(entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
+      entry.recoveryTimer = null;
+      if(entry.key !== 'live-order-query' || entry.recoveryChecked || !['starting','cached'].includes(entry.status)) return;
+      entry.recoveryTimer = setTimeout(() => {
+        entry.recoveryTimer = null;
+        if(scopedRealtimeSubscriptions.get(entry.key) !== entry || entry.released || !['starting','cached'].includes(entry.status)) return;
+        entry.recoveryChecked = true;
+        tabletRuntimeDiagnostics.observeRealtimeState({ scope:entry.key, state:'stalled-confirmation-request', restartCount:Number((scopedRealtimeRetryStates.get(entry.key) || {}).attempt || 0) });
+        if(isScopedRealtimeRecoveryAllowed()) window.HaetsalConnection.recover('stalled-live-scope');
+      }, Math.max(0, CONNECTION_WAIT_TIMEOUT_MS - (Date.now() - entry.statusSince)));
+    }
+
+    function resumeExhaustedScopedRealtimeSubscriptions(){
+      if(!isScopedRealtimeRecoveryAllowed()) return false;
+      scopedRealtimeRetryStates.forEach(retry => {
+        if(retry.terminal || !retry.exhausted || Number(retry.recoveryEpochs || 0) >= 2
+          || (retry.recoverySignalAt != null && Date.now() - retry.recoverySignalAt < 30000)) return;
+        retry.recoveryEpochs = Number(retry.recoveryEpochs || 0) + 1;
+        retry.recoverySignalAt = Date.now();
+        retry.attempt = SCOPED_REALTIME_RETRY_MAX_ATTEMPTS - 1;
+        retry.exhausted = false;
+        retry.ready = true;
+      });
+      return runScopedRealtimeHealthCheck();
+    }
+
+    function resumeAuthenticatedScopedRealtimeSubscriptions(user, generation, tokenGeneration){
+      if(!user || auth.currentUser !== user || generation !== operatorAuthGeneration || tokenGeneration !== operatorTokenGeneration || !isScopedRealtimeRecoveryAllowed()) return false;
+      const owner = String(user.uid || '') + ':' + generation + ':' + tokenGeneration;
+      const freshProof = lastScopedAuthRecovery !== owner;
+      lastScopedAuthRecovery = owner;
+      let changed = false;
+      scopedRealtimeRetryStates.forEach(retry => {
+        if(!retry.terminal || !/^(unauthenticated|firestore\/unauthenticated)$/.test(retry.lastErrorCode)
+          || retry.authGeneration !== generation || !(tokenGeneration > retry.tokenGeneration)) return;
+        retry.terminal = false;
+        retry.ready = true;
+        changed = true;
+      });
+      if(changed) syncScopedRealtimeSubscriptions();
+      if(freshProof || changed) window.HaetsalConnection.recover('authenticated-scopes', freshProof);
+      return changed;
+    }
+
     function markScopedRealtimeSubscriptionHealthy(key, scopeInstance, snapshot){
       const entry = scopedRealtimeSubscriptions.get(key);
       if(!entry || (scopeInstance && entry !== scopeInstance)) return false;
@@ -63545,13 +63711,18 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         const status = metadata && metadata.hasPendingWrites ? 'pending-write' : 'cached';
         if(entry.status !== status){
           entry.statusSince = Date.now();
+          entry.recoveryChecked = false;
+          entry.confirmedTokenGeneration = null;
           if(key === 'live-order-query') window.HaetsalConnection.scopeFailed(key, 'live-order-unconfirmed');
         }
         entry.status = status;
+        scheduleScopedRealtimeStallCheck(entry);
         return false;
       }
+      const recovered = entry.status !== 'healthy';
       entry.status = 'healthy';
-      window.HaetsalConnection.scopeHealthy(key);
+      entry.recoveryChecked = false;
+      scheduleScopedRealtimeStallCheck(entry);
       entry.lastHealthyAt = Date.now();
       tabletRuntimeDiagnostics.observeRealtimeState({
         scope:key,
@@ -63559,10 +63730,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         restartCount:Number((scopedRealtimeRetryStates.get(key) || {}).attempt || 0)
       });
       clearScopedRealtimeRetryState(key);
+      window.HaetsalConnection.scopeHealthy(key, recovered);
       return true;
     }
 
-    function scheduleScopedRealtimeSubscriptionRetry(key, label, error){
+    function scheduleScopedRealtimeSubscriptionRetry(key, label, error, owner){
       const normalizedKey = String(key || '');
       if(!normalizedKey || isScopedRealtimeGuardBlocked()) return false;
       const previous = scopedRealtimeRetryStates.get(normalizedKey) || null;
@@ -63572,11 +63744,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const lastErrorCode = getScopedRealtimeRetryErrorCode(error);
       const retryable = /^(unavailable|firestore\/unavailable|deadline-exceeded|aborted|internal)$/.test(lastErrorCode);
       if(!retryable){
-        scopedRealtimeRetryStates.set(normalizedKey, { key:normalizedKey, label, attempt:previousAttempt, generation, timer:null, ready:false, waiting:false, exhausted:false, terminal:true, lastErrorCode });
+        scopedRealtimeRetryStates.set(normalizedKey, { ...previous, key:normalizedKey, label, attempt:previousAttempt, generation, timer:null, ready:false, waiting:false, exhausted:false, terminal:true, lastErrorCode, authGeneration:owner ? owner.authGeneration : operatorAuthGeneration, tokenGeneration:owner ? owner.tokenGeneration : operatorTokenGeneration });
         return false;
       }
       if(!isScopedRealtimeOnline()){
         scopedRealtimeRetryStates.set(normalizedKey, {
+          ...previous,
           key:normalizedKey,
           label:String(label || normalizedKey),
           attempt:previousAttempt,
@@ -63592,6 +63765,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const attempt = previousAttempt + 1;
       if(attempt > SCOPED_REALTIME_RETRY_MAX_ATTEMPTS){
         scopedRealtimeRetryStates.set(normalizedKey, {
+          ...previous,
           key:normalizedKey,
           label:String(label || normalizedKey),
           attempt:SCOPED_REALTIME_RETRY_MAX_ATTEMPTS,
@@ -63605,6 +63779,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         return false;
       }
       const retryState = {
+        ...previous,
         key:normalizedKey,
         label:String(label || normalizedKey),
         attempt,
@@ -63646,7 +63821,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         error
       });
       stopScopedRealtimeSubscription(key, { preserveRetry:true });
-      return scheduleScopedRealtimeSubscriptionRetry(key, label, error);
+      const scheduled = scheduleScopedRealtimeSubscriptionRetry(key, label, error, entry);
+      if(/^(unauthenticated|firestore\/unauthenticated)$/.test(getScopedRealtimeRetryErrorCode(error))) window.HaetsalConnection.recover('listener-authentication');
+      return scheduled;
     }
 
     function startScopedRealtimeSubscription(key, label, factory){
@@ -63670,6 +63847,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         release:null,
         released:false,
         preserveRetry:false,
+        authGeneration:operatorAuthGeneration,
+        tokenGeneration:operatorTokenGeneration,
         status:'starting',
         statusSince:Date.now(),
         lastHealthyAt:0
@@ -63677,6 +63856,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       const managedUnsubscribe = function(){
         if(entry.released) return;
         entry.released = true;
+        if(entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
         if(scopedRealtimeSubscriptions.get(key) === entry) scopedRealtimeSubscriptions.delete(key);
         if(key === 'live-order-query' && !entry.preserveRetry) window.HaetsalConnection.scopeReleased(key);
         if(!entry.preserveRetry) clearScopedRealtimeRetryState(key);
@@ -63694,11 +63874,12 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
           return false;
         }
         entry.unsubscribe = unsubscribe;
+        scheduleScopedRealtimeStallCheck(entry);
         if(typeof entry.unsubscribe !== 'function'){
           const invalidFactoryError = new Error('실시간 구독 해제 함수를 만들지 못했습니다.');
           entry.preserveRetry = true;
           managedUnsubscribe();
-          scheduleScopedRealtimeSubscriptionRetry(key, label, invalidFactoryError);
+          scheduleScopedRealtimeSubscriptionRetry(key, label, invalidFactoryError, entry);
           return false;
         }
         entry.release = window.HaetsalRuntimeGuard && typeof window.HaetsalRuntimeGuard.registerRealtimeUnsubscribe === 'function'
@@ -63709,7 +63890,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         entry.preserveRetry = true;
         managedUnsubscribe();
         console.error(`Firestore ${label} 구독 시작 실패:`, error);
-        scheduleScopedRealtimeSubscriptionRetry(key, label, error);
+        scheduleScopedRealtimeSubscriptionRetry(key, label, error, entry);
         return false;
       }
     }
@@ -63732,6 +63913,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       if(typeof entry.release === 'function') entry.release();
       else{
         entry.released = true;
+        if(entry.recoveryTimer) clearTimeout(entry.recoveryTimer);
         scopedRealtimeSubscriptions.delete(key);
         if(!preserveRetry) clearScopedRealtimeRetryState(key);
         if(typeof entry.unsubscribe === 'function'){
@@ -63793,6 +63975,11 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       if(!isScopedRealtimeRecoveryAllowed()) return false;
       const guardVerificationGeneration = liveOrderQueryGuardVerificationGeneration;
       scopedRealtimeRetryStates.forEach((retryState, key) => {
+        const entry = scopedRealtimeSubscriptions.get(key);
+        if(manual === true && entry && retryState.exhausted && ['starting','cached'].includes(entry.status)){
+          scopedRealtimeRetryStates.set(key, { ...retryState, attempt:0, exhausted:false, recoveryEpochs:0, recoverySignalAt:null });
+          return;
+        }
         if(scopedRealtimeSubscriptions.has(key) || (retryState.terminal && !(manual === true && /^(unauthenticated|firestore\/unauthenticated)$/.test(retryState.lastErrorCode))) || (retryState.exhausted && manual !== true)) return;
         if(retryState.timer) clearTimeout(retryState.timer);
         scopedRealtimeRetryStates.set(key, {
@@ -63862,6 +64049,15 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
         return proof && proof.isCurrent() ? { scope:proof, uid:proof.uid, role:proof.role, businessDate:proof.businessDate, ready:proof.ready, error:proof.error } : null;
       },
       sync:syncScopedRealtimeSubscriptions,
+      authRecovered:resumeAuthenticatedScopedRealtimeSubscriptions,
+      recoverySignal:resumeExhaustedScopedRealtimeSubscriptions,
+      getRecoveryState:() => {
+        const required = getRealtimeScopeState().operatorDashboard;
+        const entry = scopedRealtimeSubscriptions.get('live-order-query');
+        const degraded = !!(required && (!entry || ['starting','cached'].includes(entry.status)));
+        const authenticationFailures = Array.from(scopedRealtimeRetryStates.values()).filter(retry => /^(unauthenticated|firestore\/unauthenticated)$/.test(retry.lastErrorCode));
+        return { required, healthy:required ? !!(entry && entry.status === 'healthy') : scopedRealtimeSubscriptions.size > 0 && Array.from(scopedRealtimeSubscriptions.values()).every(value => value.status === 'healthy'), degraded, confirmationDue:degraded && (!entry || entry.confirmedTokenGeneration !== operatorTokenGeneration || Date.now() - entry.statusSince >= CONNECTION_WAIT_TIMEOUT_MS), unauthenticated:authenticationFailures.length > 0, needsTokenRefresh:authenticationFailures.some(retry => retry.terminal && retry.authGeneration === operatorAuthGeneration && !(operatorTokenGeneration > retry.tokenGeneration)) };
+      },
       reconnect:() => runScopedRealtimeHealthCheck(true),
       confirmCurrent:async function(isCurrent, registerCleanup){
         while(window.HaetsalViewRestore && window.HaetsalViewRestore.pending && !getRealtimeScopeState().operatorDashboard){
@@ -63881,11 +64077,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       stopAll:stopAllScopedRealtimeSubscriptions
     };
     try{
-      window.addEventListener('online', () => runScopedRealtimeHealthCheck());
       window.addEventListener('haetsal:runtime-stopped', stopAllScopedRealtimeSubscriptions);
-      document.addEventListener('visibilitychange', function(){
-        if(!document.hidden) runScopedRealtimeHealthCheck();
-      });
     }catch(error){}
     syncScopedRealtimeSubscriptions();
   }).catch(error => {
