@@ -33,6 +33,8 @@ function scopeHarness({cached=false,serverError}={}){
   ctx.syncScopedRealtimeSubscriptions();
   return Object.assign(h,{subs,retries,metrics,confirmations,setBlocked:v=>blocked=v,setOnline:v=>online=v,reads:()=>confirmations.reduce((n,c)=>n+c.calls.read,0)});
 }
+let regressionSettled=false;
+process.once('beforeExit',()=>{if(!regressionSettled){console.error('Auto recovery regression did not complete');process.exitCode=1;}});
 (async()=>{
   {
     const h=setup(null,{writePhase:'unknown'});let unauthenticated=true,releaseToken;const lateToken=new Promise(resolve=>releaseToken=resolve);h.context.window.HaetsalRealtimeScope.getRecoveryState=()=>({required:true,healthy:true,unauthenticated});vm.runInContext("connectionState='ready'",h.context);
@@ -151,5 +153,5 @@ function scopeHarness({cached=false,serverError}={}){
     const h=scopeHarness({cached:true});h.setBlocked(true);if(option==='stopped')h.context.window.HaetsalRuntimeGuard.isStopped=()=>true;else h.context.window.HaetsalFirestoreQuotaGuard.isBlocked=()=>true;
     await h.advance(15000);assert.equal(h.reads(),0);assert.equal(h.metrics.starts,1);rows.push(option+' blocks automatic recovery');
   }
-  console.log(JSON.stringify({status:'PASS_CODE_MODEL',scope:'actual connection and scope functions; controlled clocks/auth/SDK only',n:rows.length,rows,SDK:false}));
-})().catch(e=>{console.error(e);process.exitCode=1;});
+  regressionSettled=true;console.log(JSON.stringify({status:'PASS_CODE_MODEL',scope:'actual connection and scope functions; controlled clocks/auth/SDK only',n:rows.length,rows,SDK:false}));
+})().catch(e=>{regressionSettled=true;console.error(e);process.exitCode=1;});
