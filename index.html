@@ -11471,8 +11471,8 @@ window.HaetsalFullscreen = (function(){
 </script>
 <script>
 window.HaetsalRuntimeGuard = (function(){
-  const APP_BUILD_NUMBER = 202611161940;
-  const APP_BUILD_LABEL = '20261116_1940';
+  const APP_BUILD_NUMBER = 202611261813;
+  const APP_BUILD_LABEL = '20261126_1813';
   const WRITE_SCHEMA_VERSION = 5;
   const IDLE_LIMIT_MS = 3 * 60 * 60 * 1000;
   const ACTIVITY_KEY = 'haetsalmaru_last_activity_at_v1';
@@ -15685,7 +15685,13 @@ window.HaetsalSharedStore = (function(){
         (Array.isArray(list) ? list : []).forEach((order, index) => {
           if(!order || typeof order !== 'object') return;
           const id = String(order.id || `coupon-history-order-${index}`);
-          byId.set(id, order);
+          const previous = byId.get(id);
+          if(!previous || String(previous.userId || '') !== String(order.userId || '')){ byId.set(id, order); return; }
+          const currentTime = getOrderHistoryTimeInfo(order);
+          const previousTime = previous && String(previous.userId || '') === String(order.userId || '') ? getOrderHistoryTimeInfo(previous) : null;
+          byId.set(id, previousTime && ((previousTime.evidenceRank > currentTime.evidenceRank && (previousTime.timestamp || previousTime.historyDateOnly)) || (previousTime.evidenceRank === currentTime.evidenceRank && !currentTime.timestamp && (previousTime.timestamp || (!currentTime.historyDateOnly && previousTime.historyDateOnly))))
+            ? { ...order, historyOriginalTimeResolved:true, historyOriginalTimestamp:previousTime.timestamp, historyOriginalDateOnly:previousTime.historyDateOnly, historyOriginalTimeRank:previousTime.evidenceRank }
+            : order);
         });
       });
       return Array.from(byId.values());
@@ -15706,7 +15712,8 @@ window.HaetsalSharedStore = (function(){
     function getCouponHistoryOrdersForUser(userId){
       const targetUserId = String(userId || '');
       return mergeOrdersByIdForCouponHistory(
-        getOrdersForStatsAndHistory(),
+        getEmergencyCompactHistoryOrdersForDisplay(targetUserId).filter(order => String(order && order.id || '').trim()),
+        (Array.isArray(state.orders) ? state.orders : []).filter(order => String(order && order.id || '').trim()),
         getUserCouponArchivedOrders(targetUserId)
       ).filter(order => String((order && order.userId) || '') === targetUserId);
     }
@@ -15762,6 +15769,186 @@ window.HaetsalSharedStore = (function(){
       return result;
     }
 
+    let couponHistoryRenderSnapshot = null;
+    let ownHistoryPageState = null;
+
+    function getOwnHistoryPage(userId){
+      const scope = JSON.stringify([String(userId || ''), window.firebaseAuthUser && window.firebaseAuthUser.uid || '', state.appRole, state.userCouponHistoryGeneration || 0]);
+      if(!ownHistoryPageState || ownHistoryPageState.scope !== scope){
+        if(ownHistoryPageState) state.ownHistoryVisibleCount = 5;
+        const count = Math.max(5, Number(state.ownHistoryVisibleCount || 5));
+        ownHistoryPageState = { scope, requestedCount:count, renderedCount:count, pinRequestedCount:count, pending:0, keys:null, rendered:false };
+      }
+      return ownHistoryPageState;
+    }
+
+    function getOwnHistoryVisibleRows(history, userId){
+      const page = getOwnHistoryPage(userId);
+      const count = Math.max(5, Number(state.ownHistoryVisibleCount || 5));
+      page.totalCount = history.length;
+      page.renderedCount = count;
+      page.rendered = true;
+      if(!Array.isArray(page.keys)){ page.pending = 0; page.pinRequestedCount = count; return history.slice(0, count); }
+      const wanted = new Set(page.keys);
+      let selected = history.filter(item => wanted.has(getHistoryItemAnchorKey(item))).slice(0, count);
+      if(!selected.length && page.keys.length){ page.keys = null; page.pending = 0; page.pinRequestedCount = count; return history.slice(0, count); }
+      const chosen = new Set(selected.map(getHistoryItemAnchorKey));
+      if(count < page.pinRequestedCount) page.pending = 0;
+      page.pending += Math.max(0, count - page.pinRequestedCount);
+      let remaining = Math.min(page.pending, Math.max(0, count - selected.length));
+      let last = -1;
+      history.forEach((item,index) => { if(chosen.has(getHistoryItemAnchorKey(item))) last = index; });
+      const add = item => { const key = getHistoryItemAnchorKey(item); if(remaining > 0 && !chosen.has(key)){ chosen.add(key); remaining -= 1; page.pending -= 1; } };
+      for(let index = last + 1; index < history.length && remaining > 0; index += 1) add(history[index]);
+      for(let index = 0; index <= last && remaining > 0; index += 1) add(history[index]);
+      selected = history.filter(item => chosen.has(getHistoryItemAnchorKey(item))).slice(0, count);
+      page.keys = selected.map(getHistoryItemAnchorKey);
+      page.pinRequestedCount = count;
+      return selected;
+    }
+
+
+    function hasEarlierHistoryRows(history, visibleRows){
+      const visibleKeys = new Set(visibleRows.map(getHistoryItemAnchorKey));
+      return history.slice(0, visibleRows.length).some(item => !visibleKeys.has(getHistoryItemAnchorKey(item)));
+    }
+
+    function showLatestOwnHistory(){
+      ownHistoryPageState = null;
+      state.ownHistoryVisibleCount = 5;
+      state.ownHistoryDetailOrderId = '';
+      render();
+      const list = modalRoot.querySelector('#ownHistoryList');
+      const modal = list && list.closest('.modal');
+      if(list) list.scrollTop = 0;
+      if(modal) modal.scrollTop = 0;
+      const close = modal && modal.querySelector('[data-action="close-own-history"]');
+      if(close){ try{ close.focus({ preventScroll:true }); }catch(error){ try{ close.focus(); }catch(innerError){} } }
+    }
+
+    function getCombinedHistoryForRender(userId){
+      const snapshot = couponHistoryRenderSnapshot;
+      if(snapshot && snapshot.userId === String(userId || '') && snapshot.matches()) return snapshot.rows;
+      return getCombinedHistory(userId, undefined, true);
+    }
+
+    function getCouponHistoryViewportScope(){
+      return JSON.stringify([state.userCouponHistoryGeneration || 0, state.appRole, window.firebaseAuthUser && window.firebaseAuthUser.uid || '', state.currentView, state.currentOrderId, state.selectedUserId, state.ocShowHistory, state.historyUserId, state.ownHistoryDetailOrderId, state.adminHistoryDetailOrderId]);
+    }
+
+    function renderCouponHistoryPreservingViewport(){
+      const scope = getCouponHistoryViewportScope;
+      const selector = '[data-own-history-id], [data-history-record-id]';
+      const root = (state.ocShowHistory || state.historyUserId) && modalRoot.querySelector('#ownHistoryList, #adminHistoryOrderList, .own-history-order-detail');
+      const modal = root && root.closest('.modal');
+      if(!modal){ render(); return; }
+      const identity = scope();
+      let historySnapshot = null;
+      let restorePage = true;
+      const active = document.activeElement;
+      const nodes = [modal, ...modal.querySelectorAll('.history-list, .coupon-ledger-list')];
+      const positions = nodes.map(node => {
+        let anchor = null;
+        if(node !== modal && typeof node.getBoundingClientRect === 'function'){
+          const focusedRow = active && node.contains(active) && active.closest ? active.closest(selector) : null;
+          if(Number(node.scrollTop || 0) > 0 || Number(modal.scrollTop || 0) > 0 || focusedRow){
+            const listBounds = node.getBoundingClientRect();
+            const modalBounds = typeof modal.getBoundingClientRect === 'function' ? modal.getBoundingClientRect() : listBounds;
+            const viewportBottom = Number(window.innerHeight) > 0 ? Number(window.innerHeight) : Infinity;
+            const bounds = { top:Math.max(0, listBounds.top, modalBounds.top), bottom:Math.min(viewportBottom, listBounds.bottom, modalBounds.bottom) };
+            const rows = Array.from(node.querySelectorAll(selector));
+            const visible = row => { const rect = row.getBoundingClientRect(); return bounds.bottom > bounds.top && rect.bottom > bounds.top && rect.top < bounds.bottom; };
+            const row = (focusedRow && rows.includes(focusedRow) && visible(focusedRow) ? focusedRow : null) || rows.find(visible);
+            if(row){
+              const attribute = row.hasAttribute('data-own-history-id') ? 'data-own-history-id' : 'data-history-record-id';
+              anchor = { attribute, id:row.getAttribute(attribute), top:row.getBoundingClientRect().top, visibleTop:Math.max(bounds.top, row.getBoundingClientRect().top), focused:row === focusedRow, visibleBelow:rows.filter(item => { const rect = item.getBoundingClientRect(); return rect.top >= row.getBoundingClientRect().bottom && rect.top < bounds.bottom; }).length, trailing:Math.max(0, rows.length - rows.indexOf(row) - 1) };
+            }
+          }
+        }
+        return { top:Number(node.scrollTop || 0), left:Number(node.scrollLeft || 0), anchor };
+      });
+      const rootTop = positions.some(position => position.top > 0 || position.anchor) && typeof root.getBoundingClientRect === 'function' ? root.getBoundingClientRect().top : null;
+      const focus = active && modal.contains(active) && /^(BUTTON|INPUT|SELECT|TEXTAREA)$/.test(active.tagName)
+        ? { tag:active.tagName, attributes:['id','name','type','data-action','data-order-id','data-user-id','data-value'].map(name => [name, active.getAttribute(name)]) }
+        : null;
+      if(state.ocShowHistory && !state.ownHistoryDetailOrderId){
+        const retainedRows = positions.filter(position => position.anchor && position.anchor.attribute === 'data-own-history-id').map(position => position.anchor);
+        if(retainedRows.length){
+          const order = getOrderById(state.currentOrderId);
+          const userId = order ? order.userId : state.selectedUserId;
+          const history = getCombinedHistory(userId, undefined, true);
+          historySnapshot = { userId:String(userId || ''), rows:history, matches:() => scope() === identity };
+          const needed = Math.min(history.length, Math.max(...retainedRows.map(anchor => { const index = history.findIndex(item => getHistoryItemAnchorKey(item) === anchor.id); return index < 0 ? 0 : index + 1 + anchor.trailing; })));
+          const focusedRow = active && modal.contains(active) && active.closest ? active.closest('[data-own-history-id]') : null;
+          const focusedIndex = focusedRow ? history.findIndex(item => getHistoryItemAnchorKey(item) === focusedRow.getAttribute('data-own-history-id')) : -1;
+          const currentCount = Math.max(5, Number(state.ownHistoryVisibleCount || 5));
+          const page = getOwnHistoryPage(userId);
+          const required = Math.max(needed, focusedIndex + 1);
+          if(!page.rendered){
+            restorePage = false;
+          }else if(Array.isArray(page.keys) || required > page.requestedCount + 15){
+            if(!Array.isArray(page.keys)){
+              page.keys = Array.from(root.querySelectorAll('[data-own-history-id]')).map(row => row.getAttribute('data-own-history-id'));
+              page.pinRequestedCount = page.renderedCount;
+            }
+            page.pending += Math.max(0, currentCount - page.pinRequestedCount);
+            page.pinRequestedCount = currentCount;
+            const keys = new Set(page.keys);
+            const selected = history.filter(item => keys.has(getHistoryItemAnchorKey(item)));
+            const anchor = retainedRows.find(item => item.focused) || retainedRows.reduce((best,item) => !best || item.visibleTop < best.visibleTop ? item : best, null);
+            const index = anchor ? selected.findIndex(item => getHistoryItemAnchorKey(item) === anchor.id) : -1;
+            // A single page of trailing space can be needed when an existing selected row moves to the end.
+            if(index >= 0 && selected.length - index - 1 < anchor.visibleBelow){
+              let allowance = Math.max(0, page.requestedCount + 15 - currentCount);
+              const globalIndex = history.findIndex(item => getHistoryItemAnchorKey(item) === anchor.id);
+              for(let next = globalIndex + 1; next < history.length && allowance > 0; next += 1){
+                const key = getHistoryItemAnchorKey(history[next]);
+                if(!keys.has(key)){ keys.add(key); allowance -= 1; }
+              }
+              page.keys = history.filter(item => keys.has(getHistoryItemAnchorKey(item))).map(getHistoryItemAnchorKey);
+              page.pending = Math.max(0, page.pending - Math.max(0, page.keys.length - selected.length));
+              state.ownHistoryVisibleCount = Math.max(currentCount, page.keys.length);
+              page.pinRequestedCount = state.ownHistoryVisibleCount;
+            }
+          }else{
+            state.ownHistoryVisibleCount = Math.max(currentCount, required);
+          }
+        }
+      }
+      const previousSnapshot = couponHistoryRenderSnapshot;
+      couponHistoryRenderSnapshot = historySnapshot;
+      try{ render(); }finally{ couponHistoryRenderSnapshot = previousSnapshot; }
+      if(!restorePage || scope() !== identity) return;
+      const nextRoot = modalRoot.querySelector('#ownHistoryList, #adminHistoryOrderList, .own-history-order-detail');
+      const nextModal = nextRoot && nextRoot.closest('.modal');
+      if(!nextModal) return;
+      if(focus){
+        const matches = Array.from(nextModal.querySelectorAll('button, input, select, textarea')).filter(node => !node.disabled && node.tagName === focus.tag && focus.attributes.every(([name,value]) => node.getAttribute(name) === value));
+        if(matches.length === 1){
+          try{ matches[0].focus({ preventScroll:true }); }catch(error){ try{ matches[0].focus(); }catch(innerError){} }
+        }
+      }
+      const nextNodes = [nextModal, ...nextModal.querySelectorAll('.history-list, .coupon-ledger-list')];
+      if(nextNodes.length !== positions.length) return;
+      nextNodes.forEach((node,index) => { node.scrollTop = positions[index].top; node.scrollLeft = positions[index].left; });
+      if(rootTop !== null && typeof nextRoot.getBoundingClientRect === 'function') nextModal.scrollTop += nextRoot.getBoundingClientRect().top - rootTop;
+      const restoredAnchors = [];
+      nextNodes.forEach((node,index) => {
+        const anchor = positions[index].anchor;
+        if(!anchor || typeof node.getBoundingClientRect !== 'function') return;
+        const rows = Array.from(node.querySelectorAll(selector)).filter(row => row.getAttribute(anchor.attribute) === anchor.id);
+        if(rows.length === 1){
+          node.scrollTop += rows[0].getBoundingClientRect().top - anchor.top;
+          restoredAnchors.push({ row:rows[0], anchor });
+        }
+      });
+      const primary = restoredAnchors.reduce((best, item) => !best || (item.anchor.focused && !best.anchor.focused) || (item.anchor.focused === best.anchor.focused && item.anchor.visibleTop < best.anchor.visibleTop) ? item : best, null);
+      if(primary){
+        const remaining = primary.row.getBoundingClientRect().top - primary.anchor.top;
+        if(Math.abs(remaining) > 1) nextModal.scrollTop += remaining;
+      }
+    }
+
     async function hydrateUserCouponHistorySources(userId, options){
       const targetUserId = String(userId || '').trim();
       if(!targetUserId) return false;
@@ -15781,7 +15968,7 @@ window.HaetsalSharedStore = (function(){
       const cacheMs = opts.force ? ORDER_USER_COUPON_HISTORY_FORCE_CACHE_MS : ORDER_USER_COUPON_HISTORY_CACHE_MS;
       if(previousLoadedAt && (paginated ? !opts.nextPage : Date.now() - previousLoadedAt < cacheMs)){
         if(opts.renderAfter){
-          try{ render(); }catch(error){ console.warn('쿠폰 전체 기록 캐시 화면 갱신 실패', error); }
+          try{ renderCouponHistoryPreservingViewport(); }catch(error){ console.warn('쿠폰 전체 기록 캐시 화면 갱신 실패', error); }
         }
         return true;
       }
@@ -15881,7 +16068,7 @@ window.HaetsalSharedStore = (function(){
           ...(paginated ? { nextCursor:cloudResult.nextCursor, hasMore:cloudResult.hasMore === true } : {})
         };
         if(opts.renderAfter){
-          try{ if(paginated) requestOrderScrollRestore(); render(); }catch(error){ console.warn('쿠폰 전체 기록 불러오기 후 화면 갱신 실패', error); }
+          try{ if(paginated) requestOrderScrollRestore(); renderCouponHistoryPreservingViewport(); }catch(error){ console.warn('쿠폰 전체 기록 불러오기 후 화면 갱신 실패', error); }
         }
         return true;
       }catch(error){
@@ -16665,6 +16852,33 @@ window.HaetsalSharedStore = (function(){
         isEmergencyCompactOrder: true,
         archivedSourceLabel: '긴급 정리 보존 기록'
       };
+    }
+
+    function expandEmergencyCompactHistoryOrderRecord(record){
+      const order = expandEmergencyCompactOrderRecord(record);
+      if(!order) return null;
+      const normalized = normalizeEmergencyCompactOrderRecord(record);
+      // t=p may be an original receipt or the legacy processing fallback; compact data cannot prove which.
+      let originalTime = normalized.t && normalized.t !== normalized.p ? getHistoryTimeInfo([normalized.t]) : getHistoryTimeInfo([]);
+      if(normalized.t !== normalized.p && !originalTime.timestamp && !originalTime.historyDateOnly && normalized.t.length === 40){
+        const partial = /^Timestamp\(seconds=(-?\d+), (.*)$/.exec(normalized.t);
+        if(partial && ('nanoseconds='.startsWith(partial[2]) || /^nanoseconds=\d+$/.test(partial[2]))){
+          const seconds = Number(partial[1]);
+          const startOfSecond = new Date(seconds * 1000);
+          if(Number.isSafeInteger(seconds) && Number.isFinite(startOfSecond.getTime()) && startOfSecond.getUTCFullYear() >= 1 && startOfSecond.getUTCFullYear() <= 9999){
+            // Fractional precision is gone, but every valid nanosecond in this second has the same Seoul date.
+            originalTime = getHistoryTimeInfo([], [normalizeHistoryDateOnly(getDateString(startOfSecond))]);
+          }
+        }
+      }
+      return { ...order, historyOriginalTimeResolved:true, historyOriginalTimestamp:originalTime.timestamp, historyOriginalDateOnly:originalTime.historyDateOnly };
+    }
+
+    function getEmergencyCompactHistoryOrdersForDisplay(userId, settings){
+      const targetUserId = String(userId || '');
+      return getEmergencyOrderCompactArchive(settings).records
+        .filter(record => String(record && record.u || '') === targetUserId)
+        .map(expandEmergencyCompactHistoryOrderRecord).filter(Boolean);
     }
 
     function getEmergencyCompactOrdersForDisplay(settings){
@@ -21205,7 +21419,142 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
     function normalizeArchivedCompletedPayloadToOrder(payload, sourceLabel='보관 완료문서'){
       const raw = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
       const source = raw && typeof raw === 'object' ? raw : {};
+      const provenance = Object.getOwnPropertyDescriptor(source, 'historyOriginalPayload');
+      const historySource = provenance && !provenance.enumerable && provenance.value && typeof provenance.value === 'object' ? provenance.value : source;
       const lite = source.orderLite && typeof source.orderLite === 'object' ? source.orderLite : source.order && typeof source.order === 'object' ? source.order : source;
+      const historyLite = historySource.orderLite && typeof historySource.orderLite === 'object' ? historySource.orderLite : historySource.order && typeof historySource.order === 'object' ? historySource.order : historySource;
+      // 중첩 원형의 명시적 빈값도 존중해 top의 처리일을 접수일로 되살리지 않는다.
+      const hasOriginal = key => Object.prototype.hasOwnProperty.call(historyLite, key);
+      const businessValues = hasOriginal('businessAt') ? [historyLite.businessAt] : [historySource.businessAt];
+      const createdValues = hasOriginal('createdAt') ? [historyLite.createdAt] : [historySource.createdAt];
+      const rawPresent = value => value !== undefined && value !== null && value !== '';
+      const receiptCompletion = hasOriginal('completedAt') ? historyLite.completedAt : historySource.completedAt;
+      // Bulk recovery historically filled both client receipt fields from completion. Genuine same-clock receipts produce identical stored JSON.
+      const recoveryReceiptAlias = historySource.reason === 'order-completed-bulk-recovery' && rawPresent(receiptCompletion)
+        && createdValues.some(rawPresent) && rawPresent(historyLite.timestamp)
+        && [...createdValues, historyLite.timestamp].every(value => value === receiptCompletion);
+      const clientReceiptValues = recoveryReceiptAlias ? [] : [...createdValues, historyLite.timestamp];
+      // Client receipt fields stop the legacy writer's completion fallback even when their format is invalid.
+      const hasClientReceipt = clientReceiptValues.some(rawPresent);
+      const inferredBusinessTime = !!(historySource.orderLite && typeof historySource.orderLite === 'object') && !hasClientReceipt
+        && rawPresent(businessValues[0]) && typeof businessValues[0] === 'string'
+        && businessValues[0] === (hasOriginal('completedAt') ? historyLite.completedAt : historySource.completedAt);
+      const legacyValue = (top, nested) => rawPresent(top) ? top : nested;
+      const preservedPrecedence = {
+        businessAtServer:historyLite.businessAtServer, businessAtServerIso:historyLite.businessAtServerIso,
+        createdAtServer:legacyValue(historySource.orderCreatedAtServer, historyLite.createdAtServer), createdAtServerIso:legacyValue(historySource.orderCreatedAtServerIso, historyLite.createdAtServerIso),
+        receivedAt:historyLite.receivedAt, processedAtServer:legacyValue(historySource.orderProcessedAtServer, historyLite.processedAtServer),
+        processedAtServerIso:legacyValue(historySource.orderProcessedAtServerIso, historyLite.processedAtServerIso), processedAt:historyLite.processedAt
+      };
+      const hasPreservedPrecedence = Object.values(preservedPrecedence).some(rawPresent);
+      const sdkProcessingDate = (seconds, nanoseconds) => {
+        if(!Number.isSafeInteger(seconds) || seconds < -62135596800 || seconds >= 253402300800 || !Number.isInteger(nanoseconds) || nanoseconds < 0 || nanoseconds >= 1000000000) return null;
+        const date = new Date(seconds * 1000 + nanoseconds / 1000000);
+        return Number.isFinite(date.getTime()) ? date : null;
+      };
+      const restoreProcessingTimestamp = value => {
+        if(typeof value !== 'string') return value;
+        const sdk = /^Timestamp\(seconds=(-?\d+), nanoseconds=(\d+)\)$/.exec(value);
+        if(sdk && String(Number(sdk[1])) === sdk[1] && String(Number(sdk[2])) === sdk[2]){
+          // Match the app Web SDK's toMillis arithmetic for legacy reporting-date hypotheses.
+          return sdkProcessingDate(Number(sdk[1]), Number(sdk[2])) || value;
+        }
+        // The legacy writer stringified true; false and zero were omitted by its falsy fallback.
+        if(value === 'true') return toOrderDate(true) || value;
+        const numeric = Number(value);
+        return numeric !== 0 && Number.isFinite(numeric) && String(numeric) === value ? toOrderDate(numeric) || value : value;
+      };
+      const restoreProcessingMap = value => {
+        if(!value || typeof value !== 'object' || value instanceof Date || typeof value.toDate === 'function') return value;
+        const seconds = value.seconds ?? value._seconds;
+        const nanoseconds = value.nanoseconds ?? value._nanoseconds ?? 0;
+        // JSON can erase a Timestamp prototype while preserving its numeric epoch fields. Retain the plain-map interpretation too.
+        return typeof seconds === 'number' && typeof nanoseconds === 'number' ? sdkProcessingDate(seconds, nanoseconds) || value : value;
+      };
+      // Raw server fields retain their type; only explicit String casts can hide a typed origin.
+      const stringifiedClockKeys = ['businessAtServerIso', 'createdAtServerIso', 'processedAtServerIso', 'processedAt'];
+      const restoredPrecedence = Object.fromEntries(Object.entries(preservedPrecedence).map(([key, value]) => [key, restoreProcessingMap(stringifiedClockKeys.includes(key) ? restoreProcessingTimestamp(value) : value)]));
+      const firstPreservedKey = Object.keys(preservedPrecedence).find(key => rawPresent(preservedPrecedence[key]));
+      // Persisted text cannot reveal which individual fields were typed clocks. Consider only the first value and its genuine fallback.
+      const processingClocks = [];
+      let unresolvedProcessingTime = false;
+      if(inferredBusinessTime && hasPreservedPrecedence){
+        // Earlier 0/false fields were erased by serialization, so the genuine business fallback remains possible even after a visible valid clock.
+        const fallback = [businessValues[0], restoreProcessingTimestamp(businessValues[0])];
+        if(fallback.includes('[object Object]')) unresolvedProcessingTime = true;
+        processingClocks.push(...fallback);
+        for(const precedence of [preservedPrecedence, restoredPrecedence]){
+          const selected = getOrderBusinessTimestamp(precedence);
+          if(firstPreservedKey && firstPreservedKey.startsWith('processedAt') && stringifiedClockKeys.includes(firstPreservedKey) && selected === '[object Object]') unresolvedProcessingTime = true;
+          if(firstPreservedKey && firstPreservedKey.startsWith('processedAt') && selected && getDateString(selected)) processingClocks.push(selected);
+        }
+      }
+      const processingFallbackDates = processingClocks.map(getDateString).filter(Boolean);
+      for(const value of processingClocks){
+        if((typeof value !== 'string' && !Array.isArray(value)) || !getDateString(value)) continue;
+        const clockText = String(value);
+        // NUL ends the legacy parser's input; parenthesized comments and leading zone words do not establish a timezone.
+        const nul = clockText.indexOf('\0');
+        const parserInput = nul < 0 ? clockText : clockText.slice(0, nul);
+        let zoneText = '', depth = 0;
+        for(const char of parserInput){
+          if(char === '('){ if(!depth) zoneText += ' '; depth += 1; }
+          else if(char === ')' && depth) depth -= 1;
+          else if(!depth) zoneText += char;
+        }
+        // Track timezone roles in already-valid legacy input. Day/month tokens consume adjacent date hyphens;
+        // a remaining sign needs an actual clock component, rather than a leading AM/PM word.
+        const tokens = zoneText.replace(/(\d)[Tt](?=\d)/, '$1 ').match(/\d+|(?:(?!\s)[A-\uffff])+|\s+|[^\s]/g) || [];
+        let seenNumber = false, timeParts = 0, explicitZone = false;
+        const expectsTime = number => timeParts === 1 || timeParts === 2 ? number <= 59 : timeParts === 3 && number <= 999;
+        for(let index = 0; index < tokens.length; index += 1){
+          const token = tokens[index], number = /^\d+$/.test(token) ? Number(token) : null;
+          if(number !== null){
+            seenNumber = true;
+            if(tokens[index + 1] === ':'){
+              index += 1;
+              if(tokens[index + 1] === ':'){ index += 1; timeParts = 2; }
+              else{ timeParts += 1; if(tokens[index + 1] === '.') index += 1; }
+            }else if(tokens[index + 1] === '.' && expectsTime(number)){
+              index += 1;
+              timeParts += 1;
+              if(/^\d+$/.test(tokens[index + 1] || '')){ index += 1; timeParts = 4; }
+            }else if(expectsTime(number)){
+              timeParts = 4;
+            }else if(tokens[index + 1] === '-'){
+              index += 1;
+            }
+          }else if(/^(?:UT|UTC|GMT|Z|CDT|CST|EDT|EST|MDT|MST|PDT|PST)$/i.test(token) && seenNumber){
+            explicitZone = true; break;
+          }else if(/^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(token)){
+            if(tokens[index + 1] === '-') index += 1;
+          }else if((token === '+' || token === '-') && timeParts > 0){
+            explicitZone = true; break;
+          }
+        }
+        const utcDateOnly = /^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/.test(parserInput);
+        if(explicitZone || utcDateOnly) continue;
+        // Probe two fixed suffixes to prove they were consumed, rather than inheriting the reader's timezone/DST.
+        const neutralText = zoneText.replace(/(\d)[Tt](?=\d)/, '$1 ');
+        const isoLocal = /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(zoneText);
+        const civil = new Date(isoLocal ? zoneText + 'Z' : neutralText + ' UTC');
+        const probe = new Date(isoLocal ? zoneText + '+01:00' : neutralText + ' GMT+0100');
+        if(!Number.isFinite(civil.getTime()) || !Number.isFinite(probe.getTime()) || civil.getTime() - probe.getTime() !== 3600000){ unresolvedProcessingTime = true; continue; }
+        for(const hours of [-5, 0, 21]){
+          const day = new Date(civil.getTime());
+          day.setUTCHours(day.getUTCHours() + hours);
+          if(!Number.isFinite(day.getTime())){ unresolvedProcessingTime = true; continue; }
+          processingFallbackDates.push(day.toISOString().slice(0, 10));
+        }
+      }
+      // With no preserved precedence, an original completedAt may have been lost: identical stored documents can have different origins.
+      const declaredDates = (hasOriginal('businessDate') ? [historyLite.businessDate] : [historySource.businessDate])
+        .filter(value => !inferredBusinessTime || (hasPreservedPrecedence && !unresolvedProcessingTime && !processingFallbackDates.includes(normalizeHistoryDateOnly(value))));
+      const originalTimeDescriptor = Object.getOwnPropertyDescriptor(source, 'historyOriginalTimeInfo');
+      const originalTime = originalTimeDescriptor && !originalTimeDescriptor.enumerable ? originalTimeDescriptor.value : getHistoryTimeInfo([
+        historyLite.businessAtServer, historySource.orderCreatedAtServer, historyLite.createdAtServer, historyLite.businessAtServerIso, historySource.orderCreatedAtServerIso, historyLite.createdAtServerIso,
+        ...(inferredBusinessTime ? [] : businessValues), ...clientReceiptValues, historyLite.receivedAt
+      ], [...declaredDates, String(historyLite.sequenceDate || '')], [historyLite.businessAtServer, historySource.orderCreatedAtServer, historyLite.createdAtServer, historyLite.businessAtServerIso, historySource.orderCreatedAtServerIso, historyLite.createdAtServerIso]);
       const orderId = String(source.orderId || lite.id || '').trim();
       if(!orderId) return null;
       const status = getNormalizedOrderStatus(lite.status || source.status || 'PICKUP_DONE', lite.deliveryType || source.deliveryType || 'PICKUP');
@@ -21233,6 +21582,10 @@ function createOrderSafetyBackupPayload(sourceData, reason='auto', prepared){
         ...lite,
         id: orderId,
         isArchivedCompletedView: true,
+        historyOriginalTimeResolved: true,
+        historyOriginalTimestamp: originalTime.timestamp,
+        historyOriginalDateOnly: originalTime.historyDateOnly,
+        historyOriginalTimeRank: originalTime.evidenceRank ?? (originalTime.timestamp || originalTime.historyDateOnly ? ([historyLite.businessAtServer, historySource.orderCreatedAtServer, historyLite.createdAtServer].includes(originalTime.value) ? 3 : [historyLite.businessAtServerIso, historySource.orderCreatedAtServerIso, historyLite.createdAtServerIso].includes(originalTime.value) ? 2 : originalTime.timestamp ? 1 : 0) : 0),
         archivedSourceLabel: sourceLabel,
         archivedDocKey: String(source.docId || source.completedDocKey || ''),
         archivedDocStorageLocation: String(source.storageLocation || source.completedDocStorageLocation || ''),
@@ -37395,6 +37748,13 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return amount === null ? (emptyText || '전후 잔액 기록 없음') : `${amount}장`;
     }
 
+    function formatUserCouponLedgerTimestamp(record, order){
+      const time = record && record.source === 'order-record' && order && String(order.id || '') === String(record.orderId || '') && String(order.userId || '') === String(record.userId || '')
+        ? getOrderHistoryTimeInfo(order) : getHistoryTimeInfo([record && record.timestamp]);
+      return time.timestamp ? formatDateTime(time.timestamp) : time.historyDateOnly ? time.historyDateOnly.replace(/-/g, '.') : formatHistoryTime(time);
+    }
+
+
     function formatCouponLedgerTimestamp(record){
       return getCouponHistorySortTime(record) === null ? '발생 시각 기록 없음' : formatDateTime(record.timestamp);
     }
@@ -37497,19 +37857,64 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return Array.from(recordsByKey.values()).sort(compareCouponHistoryRecordsByTimeDesc);
     }
 
-    function getUserCouponLedgerDisplayRecords(userId, limitCount, fullCouponHistory){
+    function getUserCouponLedgerDisplayRecords(userId, limitCount, fullCouponHistory, sourceOrders){
       const targetUserId = String(userId || '');
-      const records = buildCouponLedgerDisplayRecords(
-        getCouponHistoryOrdersForUser(targetUserId),
+      const historyOrders = Array.isArray(sourceOrders) ? sourceOrders : getCouponHistoryOrdersForUser(targetUserId);
+      let records = buildCouponLedgerDisplayRecords(
+        historyOrders,
         getCouponHistoryLogsForUser(targetUserId),
         targetUserId
       ).filter(record => String(record.userId || '') === targetUserId);
+      const orderById = new Map(historyOrders.map(order => [String(order.id || ''), order]));
+      const unchanged = [], moved = [];
+      const displayedTimes = new Map();
+      records.forEach((record,index) => {
+        const item = { record, index };
+        const order = record.source === 'order-record' ? orderById.get(String(record.orderId || '')) : null;
+        if(!order && typeof record.timestamp === 'string' && isHistoryTimestampString(record.timestamp)){
+          unchanged.push(item);
+          return;
+        }
+        const time = order && String(order.userId || '') === String(record.userId || '')
+          ? getOrderHistoryTimeInfo(order) : getHistoryTimeInfo([record.timestamp]);
+        displayedTimes.set(record, time);
+        const originalTime = getCouponHistorySortTime(record);
+        item.time = time;
+        const sameTime = time.timestamp ? time.timestamp.getTime() === originalTime : originalTime === null;
+        (sameTime && !time.historyDateOnly ? unchanged : moved).push(item);
+      });
+      if(moved.length){
+        const display = item => {
+          if(!item.display){
+            const time = item.time || getHistoryTimeInfo([item.record.timestamp]);
+            item.display = { id:'', timestamp:time.timestamp, historyDateOnly:time.historyDateOnly, historyDateKey:time.timestamp ? getDateString(time.timestamp) : time.historyDateOnly };
+          }
+          return item.display;
+        };
+        const compare = (a,b) => compareCombinedHistoryItemsByTimeDesc(display(a), display(b)) || a.index - b.index;
+        moved.sort(compare);
+        const merged = [];
+        let start = 0;
+        moved.forEach(item => {
+          let low = start, high = unchanged.length;
+          while(low < high){
+            const middle = Math.floor((low + high) / 2);
+            if(compare(unchanged[middle], item) <= 0) low = middle + 1;
+            else high = middle;
+          }
+          for(; start < low; start += 1) merged.push(unchanged[start].record);
+          merged.push(item.record);
+        });
+        for(; start < unchanged.length; start += 1) merged.push(unchanged[start].record);
+        records = merged;
+      }
       if(fullCouponHistory){
         const tiedCouponRows = new Map();
         records.forEach((record, index) => {
           if(!String(record.docId || '').startsWith('coupon_event_')) return;
-          const time = getCouponHistorySortTime(record);
-          if(time === null) return;
+          const displayTime = displayedTimes.get(record) || getHistoryTimeInfo([record.timestamp]);
+          const time = displayTime.timestamp ? displayTime.timestamp.getTime() : displayTime.historyDateOnly;
+          if(time === '') return;
           if(!tiedCouponRows.has(time)) tiedCouponRows.set(time, []);
           tiedCouponRows.get(time).push({ record, index });
         });
@@ -37524,7 +37929,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
     function renderUserCouponLedgerPanel(user, limitCount, options){
       if(!user) return '';
       const opts = options || {};
-      const records = getUserCouponLedgerDisplayRecords(user.id, limitCount, opts.fullCouponHistory);
+      const historyOrders = getCouponHistoryOrdersForUser(user.id);
+      const records = getUserCouponLedgerDisplayRecords(user.id, limitCount, opts.fullCouponHistory, historyOrders);
+      const historyOrderById = new Map(historyOrders.map(order => [String(order.id || ''), order]));
       const title = opts.title || '최근 쿠폰 변동 내역';
       const limitLabel = typeof limitCount === 'number' && limitCount > 0 ? `최근 ${limitCount}건` : '전체 내역';
       const panelHtml = `
@@ -37541,9 +37948,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
               const referenceText = getCouponLedgerReferenceText(record);
               const publicReasonText = getCouponLedgerPublicReasonText(record);
               return `
-                <div class="coupon-ledger-item">
+                <div class="coupon-ledger-item" data-history-record-id="${escapeHtml(getCouponHistoryDownloadEventKey(record))}">
                   <div>
-                    <div class="coupon-ledger-date">${escapeHtml(formatCouponLedgerTimestamp(record))}</div>
+                    <div class="coupon-ledger-date">${escapeHtml(formatUserCouponLedgerTimestamp(record, historyOrderById.get(String(record.orderId || ''))))}</div>
                     <div class="coupon-ledger-main">${escapeHtml(getCouponLedgerTypeLabel(record))} · 변경 후 ${escapeHtml(afterText)}</div>
                     ${opts.publicView ? [
                       String((record && record.orderNumber) || '').trim() ? `<div class="coupon-ledger-meta">${escapeHtml(referenceText)}</div>` : '',
@@ -37579,17 +37986,19 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(!user) return [];
       const targetUserId = String(user.id || '');
       const sourceData = state.couponRecalcSourceData;
+      const existingRecords = buildCouponLedgerDisplayRecords(getCouponHistoryOrdersForUser(targetUserId), getCouponHistoryLogsForUser(targetUserId), targetUserId)
+        .filter(record => String(record.userId || '') === targetUserId);
       if(sourceData){
         return mergeCouponHistoryRecords(
           buildCouponRecalcLedgerRecords(sourceData, targetUserId),
           Array.isArray(sourceData.localOnlyCouponRecords) ? sourceData.localOnlyCouponRecords : [],
-          getUserCouponLedgerDisplayRecords(targetUserId)
+          existingRecords
         )
           .map(record => normalizeCouponHistoryRecord(record))
           .filter(record => record && String(record.userId || '') === targetUserId)
           .sort(compareCouponHistoryRecordsByTimeDesc);
       }
-      return getUserCouponLedgerDisplayRecords(targetUserId);
+      return existingRecords;
     }
 
     function renderCouponRecalcExistingLedgerPanel(user){
@@ -38935,16 +39344,128 @@ body.mobile-tablet-device .pos-keyboard-btn{
       return `${[baseText, applyText].filter(Boolean).join(' · ')} · ${parts.length ? parts.join(' · ') : '이후 반영 내역 없음'}`;
     }
 
+    function normalizeHistoryDateOnly(value){
+      let text = typeof value === 'string' ? value.trim() : '';
+      if(/^\d{8}$/.test(text)) text = text.slice(0,4) + '-' + text.slice(4,6) + '-' + text.slice(6,8);
+      const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+      if(!parts) return '';
+      const year = Number(parts[1]), month = Number(parts[2]), day = Number(parts[3]);
+      const days = [31, (year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)) ? 29 : 28, 31,30,31,30,31,31,30,31,30,31];
+      return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1] ? text : '';
+    }
+
+    function isHistoryTimestampString(value){
+      const text = value.trim();
+      const iso = /^(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:Z|[+-]\d{2}:?\d{2})$/i.exec(text);
+      let year, month, day, hour, minute, second;
+      if(iso){
+        [, year, month, day, hour, minute, second] = iso;
+      }else{
+        const named = /^(?:[A-Za-z]{3},?\s+)?(?:(\d{1,2})\s+([A-Za-z]{3})|([A-Za-z]{3})\s+(\d{1,2}))\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s+(?:GMT|UTC)(?:[+-]\d{4})?(?:\s+\([^)]*\)?)?$/i.exec(text);
+        if(!named) return false;
+        day = named[1] || named[4];
+        month = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf((named[2] || named[3]).toLowerCase()) + 1;
+        [, , , , , year, hour, minute, second] = named;
+      }
+      const key = String(year) + '-' + String(month).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+      const midnightRollover = Number(hour) === 24 && Number(minute) === 0 && Number(second || 0) === 0 && (!iso || !iso[7] || /^0+$/.test(iso[7]));
+      return !!normalizeHistoryDateOnly(key) && (Number(hour) <= 23 || midnightRollover) && Number(minute) <= 59 && Number(second || 0) <= 59;
+    }
+
+    function getHistoryTimeInfo(values, dateOnlyValues=[], authoritativeDateValues=[]){
+      let dateOnly = '', dateOnlyValue = '';
+      for(const value of [...values, ...dateOnlyValues]){
+        if(value == null || value === '' || typeof value === 'boolean') continue;
+        if(typeof value === 'string' && (/^\d{4}-\d{2}-\d{2}$/.test(value.trim()) || /^\d{8}$/.test(value.trim()))){
+          const key = normalizeHistoryDateOnly(value);
+          if(key && authoritativeDateValues.includes(value)) return { timestamp:null, historyDateOnly:key, value };
+          if(key && !dateOnly){ dateOnly = key; dateOnlyValue = value; }
+          continue;
+        }
+        let parsed = value;
+        if(typeof value === 'string'){
+          const serialized = /^Timestamp\(seconds=(-?\d+), nanoseconds=(\d+)\)$/.exec(value.trim());
+          if(serialized){
+            parsed = { seconds:Number(serialized[1]), nanoseconds:Number(serialized[2]) };
+            if(!Number.isSafeInteger(parsed.seconds)) continue;
+          }else{
+            if(!isHistoryTimestampString(value)) continue;
+            parsed = value.replace(/\s+\([\s\S]*$/, '');
+          }
+        }
+        if(parsed && typeof parsed === 'object' && !(parsed instanceof Date)){
+          const hasSeconds = 'seconds' in parsed || '_seconds' in parsed;
+          const hasNanos = 'nanoseconds' in parsed || '_nanoseconds' in parsed;
+          const seconds = 'seconds' in parsed ? parsed.seconds : parsed._seconds;
+          const nanos = 'nanoseconds' in parsed ? parsed.nanoseconds : '_nanoseconds' in parsed ? parsed._nanoseconds : 0;
+          const decimalInteger = value => typeof value === 'number' || (typeof value === 'string' && /^[+-]?\d+$/.test(value.trim()));
+          const validSeconds = decimalInteger(seconds) && Number.isSafeInteger(Number(seconds)) && Number(seconds) >= -62135596800 && Number(seconds) < 253402300800;
+          const validNanos = decimalInteger(nanos) && Number.isInteger(Number(nanos)) && Number(nanos) >= 0 && Number(nanos) < 1000000000;
+          if((hasSeconds || hasNanos) && (!validSeconds || !validNanos)) continue;
+          if(hasSeconds && validSeconds && validNanos){
+            // Receipt display uses the exact epoch fields through the existing plain-map conversion, avoiding toDate's submillisecond rollover.
+            parsed = { seconds:Number(seconds), nanoseconds:Number(nanos ?? 0) };
+          }else if(typeof parsed.toDate !== 'function') continue;
+        }
+        let date = null;
+        try{ date = toOrderDate(parsed); }catch(error){ continue; }
+        if(date) return { timestamp:date, historyDateOnly:'', value };
+      }
+      return { timestamp:null, historyDateOnly:dateOnly, value:dateOnlyValue };
+    }
+
+
+
+
+
+    function getOrderHistoryTimeInfo(order){
+      const source = order && typeof order === 'object' ? order : {};
+      if(source.historyOriginalTimeResolved === true){
+        const time = getHistoryTimeInfo([source.historyOriginalTimestamp], [source.historyOriginalDateOnly]);
+        return { ...time, evidenceRank:time.timestamp || time.historyDateOnly ? Number(source.historyOriginalTimeRank ?? (time.timestamp ? 1 : 0)) : 0 };
+      }
+      const servers = [source.businessAtServer, source.createdAtServer];
+      const serverISO = [source.businessAtServerIso, source.createdAtServerIso];
+      const time = getHistoryTimeInfo([
+        ...servers, ...serverISO, source.businessAt, source.createdAt, source.timestamp, source.receivedAt, source.historyOriginalTimestamp
+      ], [source.businessDate, String(source.sequenceDate || ''), source.historyOriginalDateOnly], [...servers, ...serverISO]);
+      return { ...time, evidenceRank:time.timestamp || time.historyDateOnly ? (servers.includes(time.value) ? 3 : serverISO.includes(time.value) ? 2 : time.timestamp ? 1 : 0) : 0 };
+    }
+
+
+    function formatHistoryTime(item){
+      if(item && item.timestamp && toOrderDate(item.timestamp)) return formatMonthDay(item.timestamp) + ' ' + formatAMPM(item.timestamp);
+      const dateOnly = normalizeHistoryDateOnly(item && item.historyDateOnly);
+      return dateOnly ? Number(dateOnly.slice(5,7)) + '/' + Number(dateOnly.slice(8,10)) : '일시 확인 필요';
+    }
+
     function getCombinedHistoryItemTime(item){
       const value = item && item.timestamp;
-      const date = value instanceof Date ? value : new Date(value || '');
-      const time = date.getTime();
+      const date = toOrderDate(value);
+      const time = date ? date.getTime() : NaN;
       return Number.isFinite(time) ? time : null;
     }
 
     function compareCombinedHistoryItemsByTimeDesc(a, b){
       const aTime = getCombinedHistoryItemTime(a);
       const bTime = getCombinedHistoryItemTime(b);
+      const aDay = a && a.historyDateKey || (aTime !== null ? getDateString(a.timestamp) : normalizeHistoryDateOnly(a && a.historyDateOnly));
+      const bDay = b && b.historyDateKey || (bTime !== null ? getDateString(b.timestamp) : normalizeHistoryDateOnly(b && b.historyDateOnly));
+      const calendarKey = (value, time) => {
+        if(time !== null && time < 0){
+          const date = new Date(time);
+          if(date.getUTCFullYear() <= 1){
+            const formatter = new Intl.DateTimeFormat('en-US', { timeZone:'Asia/Seoul', era:'short', year:'numeric', month:'2-digit', day:'2-digit' });
+            const parts = Object.fromEntries(formatter.formatToParts(date).map(part => [part.type, part.value]));
+            const year = parts.era === 'BC' ? 1 - Number(parts.year) : Number(parts.year);
+            return year * 10000 + Number(parts.month) * 100 + Number(parts.day);
+          }
+        }
+        const match = /^([+-]?\d+)-(\d{2})-(\d{2})$/.exec(String(value || ''));
+        return match ? Number(match[1]) * 10000 + Number(match[2]) * 100 + Number(match[3]) : -Infinity;
+      };
+      const aCalendar = calendarKey(aDay, aTime), bCalendar = calendarKey(bDay, bTime);
+      if(aCalendar !== bCalendar) return aCalendar < bCalendar ? 1 : -1;
       if(aTime !== null && bTime !== null && aTime !== bTime) return bTime - aTime;
       if(aTime !== null && bTime === null) return -1;
       if(aTime === null && bTime !== null) return 1;
@@ -39041,25 +39562,35 @@ body.mobile-tablet-device .pos-keyboard-btn{
       };
     }
 
+    function getHistoryItemAnchorKey(item){
+      return String(item && (item.historyAnchorKey || item.id) || '');
+    }
+
     function getCombinedHistory(userId, limitCount, fullCouponHistory){
       const targetUserId = String(userId || '');
       const sourceOrders = getCouponHistoryOrdersForUser(targetUserId);
       const orderItems = sourceOrders
         .filter(order => String(order.userId || '') === targetUserId)
-        .map(order => ({
+        .map(order => {
+          const historyTime = getOrderHistoryTimeInfo(order);
+          return {
           id: order.id,
           orderId: order.id,
           userId: targetUserId,
           type: 'ORDER',
-          timestamp: new Date(getOrderProcessedTimestamp(order) || order.timestamp),
+          timestamp: historyTime.timestamp,
+          historyDateOnly: historyTime.historyDateOnly,
+          historyDateKey: historyTime.timestamp ? getDateString(historyTime.timestamp) : historyTime.historyDateOnly,
           qty: getOrderTotalQuantity(order),
           remainingCoupons: normalizeHistoryRemainingCoupons(order.remainingCoupons),
           status: order.status,
           deliveryType: order.deliveryType || 'PICKUP',
           cancelReason: order.cancelReason || '',
           sourceOrderRevision:String(order.statusUpdatedAt || order.updatedAt || order.processedAt || order.timestamp || order.createdAt || '')
-        }));
+        };
+        });
       const fullLogs = getCouponHistoryLogsForUser(targetUserId);
+      const sourceOrderById = new Map(sourceOrders.map(order => [String(order.id || ''), order]));
       const protectedCouponItems = buildCouponLedgerDisplayRecords(
         sourceOrders,
         fullLogs,
@@ -39068,12 +39599,18 @@ body.mobile-tablet-device .pos-keyboard-btn{
         .filter(record => String(record.userId || '') === targetUserId)
         .map(record => {
           const latestTimelineResult = getLatestCouponRecalcTimelineResult(targetUserId, record.id);
+          const order = record.source === 'order-record' ? sourceOrderById.get(String(record.orderId || '')) : null;
+          const historyTime = order && String(order.userId || '') === String(record.userId || '') ? getOrderHistoryTimeInfo(order) : getHistoryTimeInfo([record.timestamp]);
           return {
           id: record.id,
           docId: record.docId,
+          historyAnchorKey:getCouponHistoryDownloadEventKey(record),
+          historyAccountingTimestamp: new Date(record.timestamp),
           userId: record.userId,
           type: record.type,
-          timestamp: new Date(record.timestamp),
+          timestamp: historyTime.timestamp,
+          historyDateOnly: historyTime.historyDateOnly,
+          historyDateKey: historyTime.timestamp ? getDateString(historyTime.timestamp) : historyTime.historyDateOnly,
           qty: record.amount,
           delta: record.delta,
           beforeCoupons: latestTimelineResult ? Number(latestTimelineResult.before) : normalizeHistoryRemainingCoupons(record.beforeCoupons),
@@ -39095,9 +39632,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
           status: 'DONE'
         };
         });
+      // 표시 정밀도와 별개로 기존 정산의 사건 시각 선택을 보존한다.
+      const accountingCouponItems = protectedCouponItems.map(item => ({ ...item, timestamp:item.historyAccountingTimestamp }));
       const consolidatedOrderIds = new Set();
       const consolidatedOrderItems = orderItems.map(orderItem => {
-        const summary = getCombinedOrderHistorySummary(orderItem, protectedCouponItems);
+        const summary = getCombinedOrderHistorySummary(orderItem, accountingCouponItems);
         if(!summary) return orderItem;
         consolidatedOrderIds.add(String(orderItem.orderId || ''));
         return {
@@ -39118,10 +39657,14 @@ body.mobile-tablet-device .pos-keyboard-btn{
       });
       const renameItems = fullLogs
         .filter(log => String(log.userId || '') === targetUserId && log.action === 'FORCE_RENAME')
-        .map(log => ({
+        .map(log => {
+          const historyTime = getHistoryTimeInfo([log.timestamp]);
+          return {
           id: log.id,
           type: 'RENAME',
-          timestamp: new Date(log.timestamp),
+          timestamp: historyTime.timestamp,
+          historyDateOnly: historyTime.historyDateOnly,
+          historyDateKey: historyTime.timestamp ? getDateString(historyTime.timestamp) : historyTime.historyDateOnly,
           qty: log.amount,
           remainingCoupons: normalizeHistoryRemainingCoupons(log.remainingCoupons),
           reason: log.reason,
@@ -39129,7 +39672,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
           oldName: log.oldName || '',
           newName: log.newName || '',
           status: 'DONE'
-        }));
+        };
+        });
       const items = [
         ...consolidatedOrderItems,
         ...visibleCouponItems,
@@ -39139,8 +39683,8 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const tiedCouponRows = new Map();
         items.forEach((item, index) => {
           if(!String(item.docId || '').startsWith('coupon_event_')) return;
-          const time = getCombinedHistoryItemTime(item);
-          if(time === null) return;
+          const time = getCombinedHistoryItemTime(item) ?? normalizeHistoryDateOnly(item.historyDateOnly);
+          if(time === '') return;
           if(!tiedCouponRows.has(time)) tiedCouponRows.set(time, []);
           tiedCouponRows.get(time).push({ item, index });
         });
@@ -44269,9 +44813,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
       if(state.ocShowHistory){
         const order = getOrderById(state.currentOrderId);
         const historyUserId = order ? order.userId : state.selectedUserId;
-        const fullHistory = historyUserId ? getCombinedHistory(historyUserId, undefined, true) : [];
-        const visibleCount = Math.max(5, Number(state.ownHistoryVisibleCount || 5));
-        const history = fullHistory.slice(0, visibleCount);
+        const fullHistory = historyUserId ? getCombinedHistoryForRender(historyUserId) : [];
+        const history = getOwnHistoryVisibleRows(fullHistory, historyUserId);
+        const hasEarlierHistory = hasEarlierHistoryRows(fullHistory, history);
         const historyLoadState = historyUserId && state.userCouponHistoryPageStateByUserId
           ? (state.userCouponHistoryPageStateByUserId[String(historyUserId)] || {})
           : {};
@@ -44285,9 +44829,9 @@ body.mobile-tablet-device .pos-keyboard-btn{
           ${historyLoadState.error ? '<div class="help-note" style="margin-bottom:10px;color:#be123c">일부 과거 기록을 불러오지 못했습니다. 잠시 후 다시 시도해주세요.</div>' : ''}
           <div class="history-list" id="ownHistoryList">
             ${history.length === 0 ? `<div class="center muted" style="padding:30px 10px">${historyLoadState.loading ? '기록을 확인하고 있습니다.' : '기록이 없습니다.'}</div>` : history.map(item => `
-              <div class="history-item" data-own-history-id="${escapeHtml(String(item.id || ''))}">
+              <div class="history-item" data-own-history-id="${escapeHtml(getHistoryItemAnchorKey(item))}">
                 <div>
-                  <div class="history-date">${formatMonthDay(item.timestamp)} ${formatAMPM(item.timestamp)}</div>
+                  <div class="history-date">${escapeHtml(formatHistoryTime(item))}</div>
                   <div class="history-main" style="color:${getHistoryTextColor(item)}">
                     ${renderHistoryMainText(item, 'own')}
                     ${item.reason ? `<span class="table-sub">(${escapeHtml(item.reason)})</span>` : ''}
@@ -44298,7 +44842,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
               </div>
             `).join('')}
           </div>
-          ${history.length < fullHistory.length || historyLoadState.hasMore ? `<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="show-more-own-history" ${historyLoadState.loading ? 'disabled' : ''}>이전 기록 15건 더보기</button>` : (history.length ? '<div class="center muted" style="padding:12px 4px 0;font-size:12px;font-weight:800">전체 기록을 모두 불러왔습니다.</div>' : '')}
+          ${history.length < fullHistory.length || historyLoadState.hasMore ? (hasEarlierHistory ? `<span style="display:inline-flex;flex-wrap:wrap;width:100%;gap:8px;margin-top:12px"><button class="btn btn-outline" style="flex:1 0 auto;max-width:100%" data-action="show-more-own-history" ${historyLoadState.loading ? 'disabled' : ''}>이전 기록 15건 더보기</button><button class="btn btn-outline" data-action="show-latest-own-history" aria-label="최신 기록 보기">최신</button></span>` : `<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="show-more-own-history" ${historyLoadState.loading ? 'disabled' : ''}>이전 기록 15건 더보기</button>`) : (history.length ? '<div class="center muted" style="padding:12px 4px 0;font-size:12px;font-weight:800">전체 기록을 모두 불러왔습니다.</div>' : '')}
           `}
         `, 'large tall');
       }
@@ -44382,11 +44926,11 @@ body.mobile-tablet-device .pos-keyboard-btn{
             <div class="help-note" style="margin-bottom:12px">${escapeHtml(user.name)}${user.dept ? ` (${escapeHtml(user.dept)})` : ''} 사용자의 주문 및 쿠폰 기록입니다.</div>
             ${historyDetailOrder ? `${renderOwnHistoryOrderDetail(historyDetailOrder)}<button class="btn btn-outline" style="width:100%;margin-top:12px" data-action="close-admin-history-order-detail">전체 기록으로 돌아가기</button>` : `
             ${renderUserCouponLedgerPanel(user, undefined, { title:'전체 쿠폰 변동 내역', tall:true, fullCouponHistory:true })}
-            <div class="history-list">
+            <div class="history-list" id="adminHistoryOrderList">
               ${history.length === 0 ? `<div class="center muted" style="padding:30px 10px">기록이 없습니다.</div>` : history.map(item => `
-                <div class="history-item">
+                <div class="history-item" data-own-history-id="${escapeHtml(String(item.id || ''))}">
                   <div>
-                    <div class="history-date">${formatMonthDay(item.timestamp)} ${formatAMPM(item.timestamp)}</div>
+                    <div class="history-date">${escapeHtml(formatHistoryTime(item))}</div>
                     <div class="history-main" style="color:${getHistoryTextColor(item)}">
                       ${renderHistoryMainText(item)}
                     </div>
@@ -46632,6 +47176,7 @@ body.mobile-tablet-device .pos-keyboard-btn{
         handleSaveOwnSettings();
       }
       else if(action === 'open-own-history'){
+        ownHistoryPageState = null;
         state.ocShowHistory = true;
         state.ownHistoryVisibleCount = 5;
         state.ownHistoryDetailOrderId = '';
@@ -46652,15 +47197,27 @@ body.mobile-tablet-device .pos-keyboard-btn{
         const modal = btn.closest('.modal');
         const previousScrollTop = modal ? modal.scrollTop : 0;
         state.ownHistoryVisibleCount = Math.max(5, Number(state.ownHistoryVisibleCount || 5)) + 15;
+        const ownPage = getOwnHistoryPage(historyUserId);
+        ownPage.requestedCount = state.ownHistoryVisibleCount;
+        const restoreScope = getCouponHistoryViewportScope();
         requestOrderScrollRestore();
-        render();
-        window.requestAnimationFrame(() => {
-          const nextModal = app.querySelector('.modal-backdrop .modal');
-          if(nextModal) nextModal.scrollTop = previousScrollTop;
-        });
-        if(pageState.hasMore && (state.historyUserId || state.ownHistoryVisibleCount > getCombinedHistory(historyUserId).length)){
+        if(Array.isArray(ownPage.keys)){
+          renderCouponHistoryPreservingViewport();
+        }else{
+          render();
+          window.requestAnimationFrame(() => {
+            if(ownHistoryPageState !== ownPage || getCouponHistoryViewportScope() !== restoreScope) return;
+            const list = modalRoot.querySelector('#ownHistoryList');
+            const nextModal = list && list.closest('.modal');
+            if(nextModal) nextModal.scrollTop = previousScrollTop;
+          });
+        }
+        if(pageState.hasMore && (state.historyUserId || state.ownHistoryVisibleCount > Number(ownPage.totalCount || 0))){
           hydrateUserCouponHistorySources(historyUserId, { renderAfter:true, backfill:false, paginate:true, nextPage:true });
         }
+      }
+      else if(action === 'show-latest-own-history'){
+        showLatestOwnHistory();
       }
       else if(action === 'open-own-history-detail'){
         const modal = btn.closest('.modal');
@@ -46672,14 +47229,19 @@ body.mobile-tablet-device .pos-keyboard-btn{
       else if(action === 'close-own-history-detail'){
         const previousScrollTop = Number(state.ownHistoryListScrollTop || 0);
         state.ownHistoryDetailOrderId = '';
+        const ownPage = ownHistoryPageState;
+        const restoreScope = getCouponHistoryViewportScope();
         requestOrderScrollRestore();
         render();
         window.requestAnimationFrame(() => {
-          const nextModal = app.querySelector('.modal-backdrop .modal');
+          if(ownHistoryPageState !== ownPage || getCouponHistoryViewportScope() !== restoreScope) return;
+          const list = modalRoot.querySelector('#ownHistoryList');
+          const nextModal = list && list.closest('.modal');
           if(nextModal) nextModal.scrollTop = previousScrollTop;
         });
       }
       else if(action === 'close-own-history'){
+        ownHistoryPageState = null;
         state.ocShowHistory = false;
         state.ownHistoryDetailOrderId = '';
         render();
@@ -47711,6 +48273,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     };
 
     window.OrderModule = {
+      getHistoryTimeInfoForOrder:getOrderHistoryTimeInfo,
       state,
       render,
       syncDelayClock:syncOrderDelayClock,
@@ -57106,7 +57669,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
     if(!data || typeof data !== 'object') return null;
     if(data.payloadKind && data.payloadKind !== 'lightweight-completed-order') return null;
     if(!data.orderLite && !data.orderId) return null;
-    return {
+    const payload = {
       ...data,
       orderCreatedAtServer:raw && raw.orderCreatedAtServer || data.orderCreatedAtServer || '',
       orderCreatedAtServerIso:String(raw && raw.orderCreatedAtServerIso || data.orderCreatedAtServerIso || ''),
@@ -57123,6 +57686,9 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       docId: data.docId || docSnap.id,
       storageLocation: data.storageLocation || storageLocation || ''
     };
+    // Envelope clocks describe archive storage; the original payload alone supplies receipt-date provenance.
+    Object.defineProperty(payload, 'historyOriginalPayload', { value:data, enumerable:false });
+    return payload;
   }
 
   function getCompletedLiveOrderDateKey(order, targetDate){
@@ -57194,7 +57760,7 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       isGroupOrder:order.isGroupOrder === true,
       items
     };
-    return {
+    const payload = {
       version:2,
       appVersion:String(window.OrderModule && window.OrderModule.state && window.OrderModule.state.orderAppVersion || ''),
       storageMode:'completed-order-live-recovery-read',
@@ -57215,6 +57781,8 @@ ${formatByteSize(preview.beforeBytes)} → ${formatByteSize(preview.estimatedAft
       storageLocation:'haetsalCombinedApp/live_order-readonly',
       orderLite
     };
+    Object.defineProperty(payload, 'historyOriginalTimeInfo', { value:window.OrderModule.getHistoryTimeInfoForOrder(order), enumerable:false });
+    return payload;
   }
 
   async function readCompletedOrderPayloadsFromLiveOrdersByDate(dateKey, payloadMap, onProgress){
